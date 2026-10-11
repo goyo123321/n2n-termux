@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -208,6 +209,8 @@ func (e *Edge) cancelFallbackTimer(peerID string) {
 // ============ 主函数 ============
 
 func main() {
+	setupResolver()
+
 	signalingURL := getEnv("SIGNALING_URL", DefaultSignalingURL)
 	roomId := getEnv("ROOM_ID", "default-room")
 	clientId := getEnv("CLIENT_ID", "")
@@ -315,7 +318,6 @@ func main() {
 		if !ok {
 			return
 		}
-		// N2NS 帧优先（P2P 可靠流）
 		if isP2PFrame(data) {
 			edge.handleP2PFrame(ua, true, data)
 			return
@@ -325,7 +327,6 @@ func main() {
 			edge.notePeerProbeTURN(ua)
 			return
 		}
-		// proxy 模式：忽略 IPv4 包（不写 TUN）
 	}
 
 	// 三级降级管理器
@@ -1156,4 +1157,97 @@ func splitCSV(s string) []string {
 		out = append(out, cur)
 	}
 	return out
+}
+
+// ============ DNS 修复（Termux 专用） ============
+
+// setupResolver 修复 Termux 环境下 Go 静态二进制读不到 /etc/resolv.conf 的问题。
+//
+// 背景：
+//   - Termux 的 /etc 是指向 /system/etc 的软链（Android 只读，里面没有 resolv.conf）
+//   - 真正的 DNS 配置在 $PREFIX/etc/resolv.conf
+//   - Go 静态二进制（CGO_ENABLED=0）不经过 libc，termux-exec 也拦不到
+//   - 结果：Go 硬编码读 /etc/resolv.conf 失败 → fallback 到 [::1]:53 → connection refused
+//
+// 解法：启动时主动读 $PREFIX/etc/resolv.conf，覆盖 net.DefaultResolver。
+func setupResolver() {
+	prefix := os.Getenv("PREFIX")
+	if prefix == "" {
+		prefix = os.Getenv("TERMUX_PREFIX")
+	}
+
+	candidates := []string{}
+	if prefix != "" {
+		candidates = append(candidates, filepath.Join(prefix, "etc", "resolv.conf"))
+	}
+	candidates = append(candidates,
+		"/data/data/com.termux/files/usr/etc/resolv.conf",
+		"/etc/resolv.conf",
+	)
+
+	var nameservers []string
+	var source string
+	for _, p := range candidates {
+		nss := readNameservers(p)
+		if len(nss) > 0 {
+			nameservers = nss
+			source = p
+			break
+		}
+	}
+
+	if len(nameservers) == 0 {
+		nameservers = []string{"8.8.8.8:53", "1.1.1.1:53", "114.114.114.114:53"}
+		source = "<fallback>"
+	}
+
+	log.Printf("[DNS] 使用 %s 的 %d 个 nameserver: %v", source, len(nameservers), nameservers)
+
+	var idx uint32
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			n := atomic.AddUint32(&idx, 1)
+			ns := nameservers[int(n)%len(nameservers)]
+
+			netProto := "udp"
+			if strings.HasPrefix(network, "tcp") {
+				netProto = "tcp"
+			}
+			d := net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, netProto, ns)
+		},
+	}
+}
+
+// readNameservers 从 resolv.conf 读 nameserver 列表，返回 "addr:port" 形式。
+func readNameservers(path string) []string {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var result []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "nameserver" {
+			ns := fields[1]
+			if strings.Contains(ns, ":") {
+				if !strings.HasPrefix(ns, "[") {
+					ns = "[" + ns + "]"
+				}
+				ns += ":53"
+			} else {
+				ns += ":53"
+			}
+			result = append(result, ns)
+		}
+	}
+	return result
 }
