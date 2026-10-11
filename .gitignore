@@ -1,0 +1,103 @@
+# ============ Go ============
+# 编译产物
+/n2n-client
+/n2n-client-*
+!n2n-client-*.go
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 测试 / 覆盖率
+*.test
+*.out
+/coverage.txt
+/coverage.html
+
+# Go 工具链
+/vendor/
+__debug_bin*
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ============ 本地配置（敏感） ============
+# 运行时会生成，含 CLIENT_ID / token
+.n2n-termux/
+.n2n-go/
+config.env
+client_id
+
+# 日志
+*.log
+n2n.log
+/tmp/
+/logs/
+
+# ============ 环境文件 ============
+.env
+.env.*
+!.env.example
+
+# ============ 操作系统 ============
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ============ 编辑器 / IDE ============
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# JetBrains (GoLand / IntelliJ)
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Vim
+*.swp
+*.swo
+tags
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ============ Termux 特定 ============
+# Termux 里 adb push 的临时文件
+/sdcard/
+/storage/
+~/storage/
+
+# ============ 构建工具 ============
+dist/
+build/
+/tmp-build/
+
+# ============ CI ============
+# 本地测试 workflow 用的临时文件
+.actrc
