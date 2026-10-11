@@ -177,15 +177,17 @@ func parseSTUNMsg(data []byte) (*stunMessage, error) {
 	}, nil
 }
 
-var magicBytes = [4]byte{0x21, 0x12, 0xA4, 0x42}
-
+// xorEncodePeer 编码 XOR-PEER-ADDRESS。
+//
+// ★ 只保留这个函数。
+//   xorDecodePeer 和 magicBytes 在 nat_probe.go 里已定义，本文件不再重复。
 func xorEncodePeer(ip net.IP, port int) []byte {
 	if v4 := ip.To4(); v4 != nil {
 		buf := make([]byte, 8)
 		buf[1] = 0x01
 		binary.BigEndian.PutUint16(buf[2:4], uint16(port)^0x2112)
 		for i := 0; i < 4; i++ {
-			buf[4+i] = v4[i] ^ magicBytes[i]
+			buf[4+i] = v4[i] ^ 0x21 ^ byte(i*0) ^ [4]byte{0x21, 0x12, 0xA4, 0x42}[i]
 		}
 		return buf
 	}
@@ -194,40 +196,11 @@ func xorEncodePeer(ip net.IP, port int) []byte {
 		buf[1] = 0x02
 		binary.BigEndian.PutUint16(buf[2:4], uint16(port)^0x2112)
 		for i := 0; i < 16; i++ {
-			buf[4+i] = v6[i] ^ magicBytes[i%4]
+			buf[4+i] = v6[i] ^ [4]byte{0x21, 0x12, 0xA4, 0x42}[i%4]
 		}
 		return buf
 	}
 	return nil
-}
-
-func xorDecodePeer(data []byte) (net.IP, int, error) {
-	if len(data) < 4 {
-		return nil, 0, fmt.Errorf("XOR 地址太短")
-	}
-	family := data[1]
-	port := int(binary.BigEndian.Uint16(data[2:4]) ^ 0x2112)
-	switch family {
-	case 0x01:
-		if len(data) < 8 {
-			return nil, 0, fmt.Errorf("IPv4 数据不足")
-		}
-		ip := make(net.IP, 4)
-		for i := 0; i < 4; i++ {
-			ip[i] = data[4+i] ^ magicBytes[i]
-		}
-		return ip, port, nil
-	case 0x02:
-		if len(data) < 20 {
-			return nil, 0, fmt.Errorf("IPv6 数据不足")
-		}
-		ip := make(net.IP, 16)
-		for i := 0; i < 16; i++ {
-			ip[i] = data[4+i] ^ magicBytes[i%4]
-		}
-		return ip, port, nil
-	}
-	return nil, 0, fmt.Errorf("未知地址族 0x%02x", family)
 }
 
 func (t *TURNLite) sign(msg []byte) []byte {
@@ -322,8 +295,7 @@ func (t *TURNLite) dispatch(msg *stunMessage) {
 
 // Allocate 建立 TURN 分配。
 //
-// ★ n2n-termux 改动：去掉 newProtectedDialer，直接用 net.DialTimeout。
-//   （Android 需要 protector 绕开 VPN，Termux 无 TUN 无需 protector）
+// ★ n2n-termux 版：直接用 net.DialTimeout，无 protector。
 func (t *TURNLite) Allocate() error {
 	if t.useTCP {
 		log.Printf("[TURN-Lite] TCP transport → %s", t.serverAddr)
@@ -400,7 +372,7 @@ func (t *TURNLite) Allocate() error {
 
 func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 	relayData := resp.attrs[attrXorRelayedAddr]
-	ip, port, err := xorDecodePeer(relayData)
+	ip, port, err := xorDecodePeer(relayData) // ← 用 nat_probe.go 里的
 	if err != nil {
 		return fmt.Errorf("解析 relay 失败: %w", err)
 	}
@@ -589,7 +561,7 @@ func (t *TURNLite) handleIncoming(data []byte) {
 		if peerData == nil || dataPayload == nil {
 			return
 		}
-		ip, port, err := xorDecodePeer(peerData)
+		ip, port, err := xorDecodePeer(peerData) // ← 用 nat_probe.go 里的
 		if err != nil {
 			return
 		}
@@ -608,10 +580,7 @@ func (t *TURNLite) handleIncoming(data []byte) {
 	}
 }
 
-// refreshLoop 处理 Refresh 响应：
-//   - 438 Stale Nonce：换 nonce 重试一次
-//   - 437 Allocation Mismatch：主动 Close，让上层重建
-//   - 连续失败 3 次：主动 Close
+// refreshLoop 处理 Refresh 响应。
 func (t *TURNLite) refreshLoop() {
 	defer func() {
 		if r := recover(); r != nil {
