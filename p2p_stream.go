@@ -86,6 +86,8 @@ func isP2PFrame(data []byte) bool {
 	return len(data) >= 4 && data[0] == 'N' && data[1] == '2' && data[2] == 'N' && data[3] == 'S'
 }
 
+// ============ 流 ============
+
 type p2pSeg struct {
 	seq      uint32
 	data     []byte
@@ -111,13 +113,15 @@ type P2PStream struct {
 	recvBuf  map[uint32][]byte
 
 	localConn net.Conn
-	ownsConn  bool // ★ 是否拥有 localConn 的所有权（只有 established 后才 true）
+	ownsConn  bool
 
 	closed        bool
 	closeCh       chan struct{}
 	establishedCh chan bool
 	lastAct       time.Time
 }
+
+// ============ Manager ============
 
 type P2PStreamManager struct {
 	mu   sync.RWMutex
@@ -200,9 +204,12 @@ func (m *P2PStreamManager) reaper() {
 	}
 }
 
+// ============ 发送 ============
+
 // sendP2PFrame 发送一帧到对端。
 //
-// ★ 关键修复：走 TURN 中继时，目标必须是对方的 relay 地址。
+// 走 TURN 时目标是对端 relay 地址（避免 CGNAT hairpin）。
+// 走 P2P 时目标是对方公网地址。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	addr := s.peerAddr
@@ -243,6 +250,8 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	return err
 }
 
+// ============ 帧分发 ============
+
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -258,14 +267,29 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 	e.p2pStreams.handleFrame(peerID, peerAddr, viaTURN, f)
 }
 
+// findPeerIDByAddr 按对端地址查 peerID。
+//
+// ★ 修复：对称 NAT 场景下，对端发到不同目标时 CGNAT 会分配不同端口，
+//   导致 IP+Port 精确匹配失败。放宽到仅 IP 匹配。
+//
+//   n2n 虚拟网场景下一个 IP 一般只有一个 peer，IP 匹配足够。
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
 	}
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
+
+	// 优先 IP + Port 精确匹配
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) && p.UDPAddr.Port == addr.Port {
+			return id
+		}
+	}
+
+	// 退而求其次：仅 IP 匹配
+	for id, p := range e.peers {
+		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) {
 			return id
 		}
 	}
@@ -288,11 +312,10 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // ============ 建流（同步） ============
 
-// OpenP2PStream 尝试建立 P2P stream，同步等待 SYNACK（或超时）。
+// OpenP2PStream 尝试建立 P2P stream，同步等 SYNACK（或超时）。
 //
-// ★ 失败时**不关闭** localConn（它属于调用方/SOCKS5），
-//   让调用方能在失败后继续用同一 conn 走 WS 回落。
-//   只有成功建立后，stream 才接管 conn 的所有权。
+// 失败时不关闭 localConn（它属于调用方/SOCKS5），
+// 让调用方能在失败后继续用同一 conn 走 WS 回落。
 func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localConn net.Conn, timeout time.Duration) (*P2PStream, error) {
 	addr, viaTURN := m.edge.peerAddrAndMode(peerID)
 	if addr == nil {
@@ -306,7 +329,7 @@ func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localCon
 		segments:      make(map[uint32]*p2pSeg),
 		recvBuf:       make(map[uint32][]byte),
 		localConn:     localConn,
-		ownsConn:      false, // ★ 未建立前不拥有
+		ownsConn:      false,
 		closeCh:       make(chan struct{}),
 		establishedCh: make(chan bool, 1),
 		lastAct:       time.Now(),
@@ -337,7 +360,6 @@ func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localCon
 			s.abortNoConn()
 			return nil, errors.New("peer rejected")
 		}
-		// ★ 成功：stream 现在拥有 conn
 		s.mu.Lock()
 		s.ownsConn = true
 		s.mu.Unlock()
@@ -352,7 +374,6 @@ func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localCon
 
 	case <-s.closeCh:
 		m.remove(s.ID)
-		// conn 已经由别处 close 了，不重复处理
 		s.mu.Lock()
 		s.localConn = nil
 		s.closed = true
@@ -369,7 +390,7 @@ func (s *P2PStream) abortNoConn() {
 		return
 	}
 	s.closed = true
-	s.localConn = nil // ★ 断开引用，后续 close() 不会关它
+	s.localConn = nil
 	s.mu.Unlock()
 	close(s.closeCh)
 }
@@ -404,7 +425,7 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 		segments:      make(map[uint32]*p2pSeg),
 		recvBuf:       make(map[uint32][]byte),
 		localConn:     localConn,
-		ownsConn:      true, // ★ accept 端一建立就拥有 conn
+		ownsConn:      true,
 		closeCh:       make(chan struct{}),
 		establishedCh: make(chan bool, 1),
 		lastAct:       time.Now(),
@@ -426,6 +447,8 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 	safeGo("p2p-rtx", func() { s.retransmitLoop(m.edge) })
 	safeGo("p2p-tx", func() { s.readLocalAndSend(m.edge) })
 }
+
+// ============ 帧处理 ============
 
 func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	s := m.get(f.StreamID)
@@ -509,6 +532,8 @@ func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
 	})
 }
 
+// ============ 发数据 ============
+
 func (s *P2PStream) readLocalAndSend(e *Edge) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -574,6 +599,8 @@ func (s *P2PStream) readLocalAndSend(e *Edge) {
 		}
 	}
 }
+
+// ============ 重传 ============
 
 func (s *P2PStream) retransmitLoop(e *Edge) {
 	defer func() {
@@ -641,6 +668,8 @@ func (s *P2PStream) retransmitLoop(e *Edge) {
 	}
 }
 
+// ============ 关闭 ============
+
 // close 关闭 stream。只有 ownsConn 为 true 时才关闭 localConn。
 func (s *P2PStream) close(reason string) {
 	s.mu.Lock()
@@ -655,7 +684,6 @@ func (s *P2PStream) close(reason string) {
 	s.mu.Unlock()
 
 	close(s.closeCh)
-	// ★ 只有 stream 拥有 conn 时才关它
 	if local != nil && owns {
 		_ = local.Close()
 	}
