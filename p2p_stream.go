@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -204,20 +205,43 @@ func (m *P2PStreamManager) reaper() {
 
 // ============ 发送 ============
 
+// sendP2PFrame 发送一帧到对端。
+//
+// ★ 关键修复：走 TURN 中继时，目标必须是对方的 relay 地址，不是公网地址。
+//   发到公网地址需要 CGNAT hairpin，通常不支持。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	addr := s.peerAddr
 	viaTURN := s.viaTURN
+	peerID := s.PeerID
 	s.mu.Unlock()
-	if addr == nil {
-		return errors.New("no addr")
-	}
+
 	buf := encodeP2PFrame(f)
+
 	if viaTURN {
 		if e.turnClient == nil || !e.turnClient.IsReady() {
 			return errors.New("turn down")
 		}
-		return e.turnClient.Send(buf, addr)
+		// ★ 走 TURN 时目标必须是对方的 relay 地址
+		e.peersMu.RLock()
+		var relayAddr string
+		if p := e.peers[peerID]; p != nil {
+			relayAddr = p.TurnRelayAddr
+		}
+		e.peersMu.RUnlock()
+
+		if relayAddr == "" {
+			return errors.New("peer turn relay unknown")
+		}
+		ra, err := net.ResolveUDPAddr("udp", relayAddr)
+		if err != nil {
+			return fmt.Errorf("bad relay addr %q: %w", relayAddr, err)
+		}
+		return e.turnClient.Send(buf, ra)
+	}
+
+	if addr == nil {
+		return errors.New("no addr")
 	}
 	if e.udpConn == nil {
 		return errors.New("no udp")
