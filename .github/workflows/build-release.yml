@@ -1,0 +1,272 @@
+name: Build n2n-termux
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 v1.0.0）'
+        required: true
+        type: string
+        default: 'v1.0.0'
+      publish:
+        description: '发布 Release（false = 仅测试 + 构建，不发布）'
+        required: false
+        type: boolean
+        default: false
+      go_version:
+        description: 'Go 版本'
+        required: false
+        type: string
+        default: '1.21'
+
+jobs:
+  # ============================================================
+  # 1. 测试：全跑，失败则 job 失败（下游 build 自动跳过），
+  #    错误全文写入 step summary
+  # ============================================================
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+
+      - name: Show Go version
+        run: go version
+
+      - name: Tidy & verify
+        run: |
+          go mod tidy
+          go mod verify
+
+      - name: Run tests
+        id: test
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /tmp/logs
+          # -count=1 禁用测试缓存，保证每次真跑
+          # -v 详细输出，便于定位失败用例
+          # go test 默认就会跑完所有包（无 fail-fast）
+          go test ./... -v -count=1 2>&1 | tee /tmp/logs/test.log
+          EXIT=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          echo "测试退出码: $EXIT"
+          # 让 step 失败 → job 失败 → build job 被 needs 依赖跳过
+          exit $EXIT
+
+      - name: Test summary
+        if: always()
+        shell: bash
+        run: |
+          EXIT="${{ steps.test.outputs.exit_code }}"
+          {
+            echo "## 🧪 测试结果"
+            echo ""
+            if [ "$EXIT" = "0" ]; then
+              echo "✅ **全部测试通过**"
+            else
+              echo "❌ **测试失败**（退出码 \`${EXIT:-unknown}\`）"
+              echo ""
+              echo "> ⏭️ 后续构建步骤已跳过。"
+              echo ""
+              echo "<details><summary>点击查看测试完整输出</summary>"
+              echo ""
+              echo '```'
+              if [ -f /tmp/logs/test.log ]; then
+                MAX=500
+                if [ "$(wc -l < /tmp/logs/test.log)" -gt "$MAX" ]; then
+                  echo "(日志过长，仅显示最后 $MAX 行)"
+                  tail -n "$MAX" /tmp/logs/test.log
+                else
+                  cat /tmp/logs/test.log
+                fi
+              else
+                echo "(测试日志文件不存在)"
+              fi
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================
+  # 2. 构建：needs test（test 失败则自动 skip），
+  #    三个架构并行，任一失败不影响其他，
+  #    每个架构独立写 summary
+  # ============================================================
+  build:
+    name: Build ${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch:
+          - arm64
+          - armv7
+          - amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+
+      - name: Build linux/${{ matrix.goarch }}
+        id: build
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /tmp/logs
+          ARCH="${{ matrix.goarch }}"
+          OUT="n2n-client-linux-$ARCH"
+          LOG="/tmp/logs/build-$ARCH.log"
+
+          {
+            echo "GOOS=linux GOARCH=$ARCH CGO_ENABLED=0"
+            echo "out=$OUT"
+            echo "---"
+          } | tee "$LOG"
+
+          GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w" -o "$OUT" . 2>&1 | tee -a "$LOG"
+          EXIT=${PIPESTATUS[0]}
+
+          if [ $EXIT -ne 0 ]; then
+            echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+            echo "❌ 构建失败，退出码 $EXIT"
+            exit $EXIT
+          fi
+
+          ls -lh "$OUT" | tee -a "$LOG"
+          file "$OUT" | tee -a "$LOG"
+
+          if ! file "$OUT" | grep -q "ELF"; then
+            echo "非 ELF，构建异常" | tee -a "$LOG"
+            echo "exit_code=2" >> "$GITHUB_OUTPUT"
+            exit 2
+          fi
+
+          sha256sum "$OUT" > "$OUT.sha256"
+          cat "$OUT.sha256" | tee -a "$LOG"
+          echo "exit_code=0" >> "$GITHUB_OUTPUT"
+          echo "✅ $ARCH 构建成功"
+
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          EXIT="${{ steps.build.outputs.exit_code }}"
+          ARCH="${{ matrix.goarch }}"
+          LOG="/tmp/logs/build-$ARCH.log"
+
+          {
+            echo "## 🔨 构建结果：linux/$ARCH"
+            echo ""
+            if [ "$EXIT" = "0" ]; then
+              echo "✅ **构建成功**"
+              if [ -f "n2n-client-linux-$ARCH" ]; then
+                SIZE=$(du -h "n2n-client-linux-$ARCH" | cut -f1)
+                echo ""
+                echo "- 文件: \`n2n-client-linux-$ARCH\`"
+                echo "- 大小: \`$SIZE\`"
+              fi
+            else
+              echo "❌ **构建失败**（退出码 \`${EXIT:-unknown}\`）"
+              echo ""
+              echo "<details><summary>点击查看构建完整输出</summary>"
+              echo ""
+              echo '```'
+              if [ -f "$LOG" ]; then
+                MAX=300
+                if [ "$(wc -l < "$LOG")" -gt "$MAX" ]; then
+                  echo "(日志过长，仅显示最后 $MAX 行)"
+                  tail -n "$MAX" "$LOG"
+                else
+                  cat "$LOG"
+                fi
+              else
+                echo "(构建日志文件不存在)"
+              fi
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        if: steps.build.outputs.exit_code == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: n2n-client-linux-${{ matrix.goarch }}
+          path: |
+            n2n-client-linux-${{ matrix.goarch }}
+            n2n-client-linux-${{ matrix.goarch }}.sha256
+
+  # ============================================================
+  # 3. 发布：只有勾了 publish=true 且 build 全过才跑
+  # ============================================================
+  release:
+    name: Release
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List files
+        run: ls -lh dist/
+
+      - name: Create Release
+        id: rel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: n2n-termux ${{ inputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/n2n-client-linux-arm64
+            dist/n2n-client-linux-arm64.sha256
+            dist/n2n-client-linux-armv7
+            dist/n2n-client-linux-armv7.sha256
+            dist/n2n-client-linux-amd64
+            dist/n2n-client-linux-amd64.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release summary
+        if: always()
+        shell: bash
+        run: |
+          OUTCOME="${{ steps.rel.outcome }}"
+          {
+            echo "## 📦 发布结果"
+            echo ""
+            if [ "$OUTCOME" = "success" ]; then
+              echo "✅ **已发布**"
+              echo ""
+              echo "- 版本: \`${{ inputs.version }}\`"
+              echo "- Tag: \`${{ inputs.version }}\`"
+              echo "- URL: https://github.com/${{ github.repository }}/releases/tag/${{ inputs.version }}"
+            else
+              echo "❌ **发布失败**（outcome=\`${OUTCOME:-unknown}\`）"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
