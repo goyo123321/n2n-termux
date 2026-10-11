@@ -86,8 +86,6 @@ func isP2PFrame(data []byte) bool {
 	return len(data) >= 4 && data[0] == 'N' && data[1] == '2' && data[2] == 'N' && data[3] == 'S'
 }
 
-// ============ 流 ============
-
 type p2pSeg struct {
 	seq      uint32
 	data     []byte
@@ -113,14 +111,13 @@ type P2PStream struct {
 	recvBuf  map[uint32][]byte
 
 	localConn net.Conn
+	ownsConn  bool // ★ 是否拥有 localConn 的所有权（只有 established 后才 true）
 
 	closed        bool
 	closeCh       chan struct{}
 	establishedCh chan bool
 	lastAct       time.Time
 }
-
-// ============ Manager ============
 
 type P2PStreamManager struct {
 	mu   sync.RWMutex
@@ -203,12 +200,9 @@ func (m *P2PStreamManager) reaper() {
 	}
 }
 
-// ============ 发送 ============
-
 // sendP2PFrame 发送一帧到对端。
 //
-// ★ 关键修复：走 TURN 中继时，目标必须是对方的 relay 地址，不是公网地址。
-//   发到公网地址需要 CGNAT hairpin，通常不支持。
+// ★ 关键修复：走 TURN 中继时，目标必须是对方的 relay 地址。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	addr := s.peerAddr
@@ -222,7 +216,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		if e.turnClient == nil || !e.turnClient.IsReady() {
 			return errors.New("turn down")
 		}
-		// ★ 走 TURN 时目标必须是对方的 relay 地址
 		e.peersMu.RLock()
 		var relayAddr string
 		if p := e.peers[peerID]; p != nil {
@@ -249,8 +242,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	_, err := e.udpConn.WriteToUDP(buf, addr)
 	return err
 }
-
-// ============ 帧分发 ============
 
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
@@ -297,6 +288,11 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // ============ 建流（同步） ============
 
+// OpenP2PStream 尝试建立 P2P stream，同步等待 SYNACK（或超时）。
+//
+// ★ 失败时**不关闭** localConn（它属于调用方/SOCKS5），
+//   让调用方能在失败后继续用同一 conn 走 WS 回落。
+//   只有成功建立后，stream 才接管 conn 的所有权。
 func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localConn net.Conn, timeout time.Duration) (*P2PStream, error) {
 	addr, viaTURN := m.edge.peerAddrAndMode(peerID)
 	if addr == nil {
@@ -310,6 +306,7 @@ func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localCon
 		segments:      make(map[uint32]*p2pSeg),
 		recvBuf:       make(map[uint32][]byte),
 		localConn:     localConn,
+		ownsConn:      false, // ★ 未建立前不拥有
 		closeCh:       make(chan struct{}),
 		establishedCh: make(chan bool, 1),
 		lastAct:       time.Now(),
@@ -327,7 +324,7 @@ func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localCon
 
 	if err := m.edge.sendP2PFrame(s, syn); err != nil {
 		m.remove(s.ID)
-		close(s.closeCh)
+		s.abortNoConn()
 		return nil, err
 	}
 
@@ -337,19 +334,44 @@ func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localCon
 	case ok := <-s.establishedCh:
 		if !ok {
 			m.remove(s.ID)
-			s.close("rejected")
+			s.abortNoConn()
 			return nil, errors.New("peer rejected")
 		}
+		// ★ 成功：stream 现在拥有 conn
+		s.mu.Lock()
+		s.ownsConn = true
+		s.mu.Unlock()
 		safeGo("p2p-tx", func() { s.readLocalAndSend(m.edge) })
 		return s, nil
+
 	case <-time.After(timeout):
 		m.remove(s.ID)
-		s.close("syn-timeout")
+		log.Printf("[P2P-STREAM] %d 建流超时（%v），保留 conn 让调用方回落", s.ID, timeout)
+		s.abortNoConn()
 		return nil, errors.New("syn timeout")
+
 	case <-s.closeCh:
 		m.remove(s.ID)
+		// conn 已经由别处 close 了，不重复处理
+		s.mu.Lock()
+		s.localConn = nil
+		s.closed = true
+		s.mu.Unlock()
 		return nil, errors.New("closed")
 	}
+}
+
+// abortNoConn 中止 stream，但不关闭 localConn（所有权还在调用方）。
+func (s *P2PStream) abortNoConn() {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	s.localConn = nil // ★ 断开引用，后续 close() 不会关它
+	s.mu.Unlock()
+	close(s.closeCh)
 }
 
 func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
@@ -382,6 +404,7 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 		segments:      make(map[uint32]*p2pSeg),
 		recvBuf:       make(map[uint32][]byte),
 		localConn:     localConn,
+		ownsConn:      true, // ★ accept 端一建立就拥有 conn
 		closeCh:       make(chan struct{}),
 		establishedCh: make(chan bool, 1),
 		lastAct:       time.Now(),
@@ -403,8 +426,6 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 	safeGo("p2p-rtx", func() { s.retransmitLoop(m.edge) })
 	safeGo("p2p-tx", func() { s.readLocalAndSend(m.edge) })
 }
-
-// ============ 帧处理 ============
 
 func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	s := m.get(f.StreamID)
@@ -439,7 +460,6 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 	case p2pTypeDATA:
 		s.handleData(m.edge, f)
 	case p2pTypeACK:
-		// ack 已处理
 	case p2pTypeFIN, p2pTypeRST:
 		s.close("peer-close")
 	}
@@ -489,8 +509,6 @@ func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
 	})
 }
 
-// ============ 发数据 ============
-
 func (s *P2PStream) readLocalAndSend(e *Edge) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -502,8 +520,9 @@ func (s *P2PStream) readLocalAndSend(e *Edge) {
 	for {
 		s.mu.Lock()
 		closed := s.closed
+		local := s.localConn
 		s.mu.Unlock()
-		if closed {
+		if closed || local == nil {
 			return
 		}
 
@@ -522,7 +541,7 @@ func (s *P2PStream) readLocalAndSend(e *Edge) {
 			}
 		}
 
-		n, err := s.localConn.Read(buf)
+		n, err := local.Read(buf)
 		if n > 0 {
 			s.mu.Lock()
 			seq := s.sendNext
@@ -555,8 +574,6 @@ func (s *P2PStream) readLocalAndSend(e *Edge) {
 		}
 	}
 }
-
-// ============ 重传 ============
 
 func (s *P2PStream) retransmitLoop(e *Edge) {
 	defer func() {
@@ -624,8 +641,7 @@ func (s *P2PStream) retransmitLoop(e *Edge) {
 	}
 }
 
-// ============ 关闭 ============
-
+// close 关闭 stream。只有 ownsConn 为 true 时才关闭 localConn。
 func (s *P2PStream) close(reason string) {
 	s.mu.Lock()
 	if s.closed {
@@ -634,10 +650,13 @@ func (s *P2PStream) close(reason string) {
 	}
 	s.closed = true
 	local := s.localConn
+	owns := s.ownsConn
+	s.localConn = nil
 	s.mu.Unlock()
 
 	close(s.closeCh)
-	if local != nil {
+	// ★ 只有 stream 拥有 conn 时才关它
+	if local != nil && owns {
 		_ = local.Close()
 	}
 	log.Printf("[P2P-STREAM] %d 关闭 (%s)", s.ID, reason)
