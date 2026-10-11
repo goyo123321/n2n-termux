@@ -11,16 +11,16 @@ import (
 )
 
 const (
-	socks5Version                = 0x05
-	socks5NoAuth                 = 0x00
-	socks5CmdConnect             = 0x01
-	socks5AtypIPv4               = 0x01
-	socks5AtypDomain             = 0x03
-	socks5AtypIPv6               = 0x04
-	socks5RepSuccess             = 0x00
-	socks5RepGeneralFailure      = 0x01
-	socks5RepHostUnreachable     = 0x04
-	socks5RepCommandNotSupported = 0x07
+	socks5Version                 = 0x05
+	socks5NoAuth                  = 0x00
+	socks5CmdConnect              = 0x01
+	socks5AtypIPv4                = 0x01
+	socks5AtypDomain              = 0x03
+	socks5AtypIPv6                = 0x04
+	socks5RepSuccess              = 0x00
+	socks5RepGeneralFailure       = 0x01
+	socks5RepHostUnreachable      = 0x04
+	socks5RepCommandNotSupported  = 0x07
 	socks5RepAddrTypeNotSupported = 0x08
 )
 
@@ -169,7 +169,8 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 		(s.edge.relayMgr.IsP2P(peerID) || s.edge.relayMgr.IsTURN(peerID))
 
 	if useP2P {
-		p2s, err := s.edge.p2pStreams.OpenP2PStream(peerID, int(dstPort), conn, 5*time.Second)
+		// ★ 建流超时 5s → 2s，避免 P2P 失败时白等太久
+		p2s, err := s.edge.p2pStreams.OpenP2PStream(peerID, int(dstPort), conn, 2*time.Second)
 		if err == nil {
 			log.Printf("[SOCKS5] CONNECT %s:%d → P2P 直连 (stream=%d)", dstIP, dstPort, p2s.ID)
 			if werr := writeSocks5Reply(conn, socks5RepSuccess); werr != nil {
