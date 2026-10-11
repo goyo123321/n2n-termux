@@ -44,7 +44,7 @@ type TURNClient struct {
 	stopOnce     sync.Once
 	alive        bool
 
-	// ★ 新增：连续失败计数，避免无限重试刷屏
+	// 连续失败计数，避免无限重试刷屏
 	consecutiveFails int
 }
 
@@ -70,6 +70,91 @@ func (tc *TURNClient) IsReady() bool {
 		return true
 	}
 	return false
+}
+
+// ============ TURN URL 解析 ============
+
+// turnEndpoint 描述一个解析好的 TURN 服务端地址。
+type turnEndpoint struct {
+	Addr      string // host:port
+	Scheme    string // "turn" 或 "turns"
+	Transport string // "udp" / "tcp" / "tls"
+	HasCreds  bool   // URL 里是否内嵌了 user:pass@
+}
+
+// parseTURLEndpoint 解析 TURN URL。
+//
+// 输入示例（可能来自服务端 /api/turn-credentials 的 url 字段）：
+//   turn:47.76.28.111:3478
+//   turn:111.171.194.230:3478?transport=udp
+//   turns:secure.example.com:5349
+//   turn://user:pass@host:3478?transport=tcp
+//   turn:1.2.3.4                （无端口，用默认）
+func parseTURLEndpoint(raw string) turnEndpoint {
+	s := strings.TrimSpace(raw)
+	scheme := "turn"
+
+	switch {
+	case strings.HasPrefix(s, "turns://"):
+		scheme = "turns"
+		s = s[len("turns://"):]
+	case strings.HasPrefix(s, "turn://"):
+		scheme = "turn"
+		s = s[len("turn://"):]
+	case strings.HasPrefix(s, "turns:"):
+		scheme = "turns"
+		s = s[len("turns:"):]
+	case strings.HasPrefix(s, "turn:"):
+		scheme = "turn"
+		s = s[len("turn:"):]
+	}
+	if strings.HasPrefix(s, "//") {
+		s = s[2:]
+	}
+
+	// 剥 ?transport=xxx 后缀
+	transport := ""
+	if i := strings.Index(s, "?"); i >= 0 {
+		query := s[i+1:]
+		s = s[:i]
+		for _, kv := range strings.Split(query, "&") {
+			if strings.HasPrefix(kv, "transport=") {
+				transport = strings.TrimPrefix(kv, "transport=")
+			}
+		}
+	}
+
+	// 剥 user:pass@ 前缀
+	hasCreds := false
+	if at := strings.LastIndex(s, "@"); at >= 0 {
+		hasCreds = true
+		s = s[at+1:]
+	}
+
+	// 无端口补默认
+	if !strings.Contains(s, ":") {
+		if scheme == "turns" {
+			s += ":5349"
+		} else {
+			s += ":3478"
+		}
+	}
+
+	// 未指定 transport 时按 scheme 推断
+	if transport == "" {
+		if scheme == "turns" {
+			transport = "tcp"
+		} else {
+			transport = "udp"
+		}
+	}
+
+	return turnEndpoint{
+		Addr:      s,
+		Scheme:    scheme,
+		Transport: transport,
+		HasCreds:  hasCreds,
+	}
 }
 
 // ============ 请求凭证 + 建立分配 ============
@@ -145,60 +230,92 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 		return fmt.Errorf("TURN server not set")
 	}
 
-	turnAddr := srv.URL
-	if i := strings.Index(turnAddr, "?"); i >= 0 {
-		turnAddr = turnAddr[:i]
+	ep := parseTURLEndpoint(srv.URL)
+	log.Printf("[TURN] endpoint: %s (scheme=%s transport=%s)",
+		ep.Addr, ep.Scheme, ep.Transport)
+
+	if srv.Username == "" && srv.Password == "" {
+		log.Printf("[TURN] ⚠️ 服务端未提供 username/password（若 TURN 需要认证将失败）")
 	}
-	turnAddr = strings.TrimPrefix(turnAddr, "turn://")
-	turnAddr = strings.TrimPrefix(turnAddr, "turns://")
-	turnAddr = strings.TrimPrefix(turnAddr, "turn:")
-	turnAddr = strings.TrimPrefix(turnAddr, "turns:")
-	turnAddr = strings.TrimPrefix(turnAddr, "//")
 
-	log.Printf("[TURN] 尝试 UDP transport: %s", turnAddr)
-
-	lite := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, false)
-	lite.onMessage = tc.wrapOnMessage()
-
-	if err := lite.Allocate(); err != nil {
-		log.Printf("[TURN] UDP transport 失败: %v，尝试 TCP transport", err)
-
-		lite2 := NewTURNLiteWithTCP(turnAddr, srv.Username, srv.Password, true)
-		lite2.onMessage = tc.wrapOnMessage()
-		if err2 := lite2.Allocate(); err2 != nil {
-			log.Printf("[TURN] TURN over TCP 失败: %v，尝试 RFC 6062 TCP allocation", err2)
-
-			tcpAlloc := NewTURNTCPAllocation(turnAddr, srv.Username, srv.Password)
-			tcpAlloc.onMessage = tc.wrapOnMessage()
-			if err3 := tcpAlloc.Allocate(); err3 != nil {
-				log.Printf("[TURN] RFC 6062 TCP allocation 也失败: %v", err3)
-				return fmt.Errorf("TURN 完全不可用: %v", err3)
-			}
-
-			tc.mu.Lock()
-			tc.tcpAlloc = tcpAlloc
-			tc.relayAddr = tcpAlloc.relayAddr
-			tc.alive = true
-			tc.mu.Unlock()
-
-			log.Printf("[TURN] ✅ RFC 6062 TCP allocation 就绪: %s", tcpAlloc.GetRelayAddr())
-			return nil
+	tryUDP := func() error {
+		lite := NewTURNLiteWithTCP(ep.Addr, srv.Username, srv.Password, false)
+		lite.onMessage = tc.wrapOnMessage()
+		if err := lite.Allocate(); err != nil {
+			return err
 		}
-		lite = lite2
-	}
-
-	tc.mu.Lock()
-	tc.lite = lite
-	tc.relayAddr = lite.relayAddr
-	tc.alive = true
-	tc.mu.Unlock()
-
-	if lite.useTCP {
-		log.Printf("[TURN] ✅ TURN over TCP 就绪: %s", tc.relayAddr)
-	} else {
+		tc.mu.Lock()
+		tc.lite = lite
+		tc.relayAddr = lite.relayAddr
+		tc.alive = true
+		tc.mu.Unlock()
 		log.Printf("[TURN] ✅ UDP transport 就绪: %s", tc.relayAddr)
+		return nil
 	}
-	return nil
+
+	tryTCP := func() error {
+		lite := NewTURNLiteWithTCP(ep.Addr, srv.Username, srv.Password, true)
+		lite.onMessage = tc.wrapOnMessage()
+		if err := lite.Allocate(); err != nil {
+			return err
+		}
+		tc.mu.Lock()
+		tc.lite = lite
+		tc.relayAddr = lite.relayAddr
+		tc.alive = true
+		tc.mu.Unlock()
+		log.Printf("[TURN] ✅ TURN over TCP 就绪: %s", tc.relayAddr)
+		return nil
+	}
+
+	tryRFC6062 := func() error {
+		tcpAlloc := NewTURNTCPAllocation(ep.Addr, srv.Username, srv.Password)
+		tcpAlloc.onMessage = tc.wrapOnMessage()
+		if err := tcpAlloc.Allocate(); err != nil {
+			return err
+		}
+		tc.mu.Lock()
+		tc.tcpAlloc = tcpAlloc
+		tc.relayAddr = tcpAlloc.relayAddr
+		tc.alive = true
+		tc.mu.Unlock()
+		log.Printf("[TURN] ✅ RFC 6062 TCP allocation 就绪: %s", tcpAlloc.GetRelayAddr())
+		return nil
+	}
+
+	type attempt struct {
+		name string
+		run  func() error
+	}
+	var order []attempt
+
+	switch ep.Transport {
+	case "tcp", "tls":
+		order = []attempt{
+			{"TURN over TCP", tryTCP},
+			{"RFC 6062 TCP allocation", tryRFC6062},
+			{"UDP transport（回退）", tryUDP},
+		}
+	default:
+		order = []attempt{
+			{"UDP transport", tryUDP},
+			{"TURN over TCP", tryTCP},
+			{"RFC 6062 TCP allocation", tryRFC6062},
+		}
+	}
+
+	var lastErr error
+	for _, a := range order {
+		log.Printf("[TURN] 尝试 %s", a.name)
+		if err := a.run(); err != nil {
+			lastErr = err
+			log.Printf("[TURN] %s 失败: %v", a.name, err)
+			continue
+		}
+		return nil
+	}
+
+	return fmt.Errorf("TURN 完全不可用: %w", lastErr)
 }
 
 func (tc *TURNClient) wrapOnMessage() func([]byte, net.Addr) {
@@ -239,7 +356,6 @@ func (tc *TURNClient) StartReconnectLoop() {
 				fails := tc.consecutiveFails
 				tc.mu.RUnlock()
 
-				// ★ 连续失败 N 次后永久放弃，避免无限重试
 				if fails >= maxFails {
 					continue
 				}
@@ -252,8 +368,12 @@ func (tc *TURNClient) StartReconnectLoop() {
 				tc.mu.Lock()
 				if err != nil {
 					tc.consecutiveFails++
+					fc := tc.consecutiveFails
 					tc.mu.Unlock()
-					log.Printf("[TURN] 重建失败 (%d/%d): %v", fails+1, maxFails, err)
+					log.Printf("[TURN] 重建失败 (%d/%d): %v", fc, maxFails, err)
+					if fc >= maxFails {
+						log.Printf("[TURN] 连续失败 %d 次，放弃重试（WS 中继兜底）", maxFails)
+					}
 					continue
 				}
 				tc.consecutiveFails = 0
