@@ -20,13 +20,9 @@ on:
         default: '1.21'
 
 jobs:
-  # ============================================================
-  # 1. 测试：全跑，失败则 job 失败（下游 build 自动跳过），
-  #    错误全文写入 step summary
-  # ============================================================
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,14 +47,10 @@ jobs:
         run: |
           set +e
           mkdir -p /tmp/logs
-          # -count=1 禁用测试缓存，保证每次真跑
-          # -v 详细输出，便于定位失败用例
-          # go test 默认就会跑完所有包（无 fail-fast）
           go test ./... -v -count=1 2>&1 | tee /tmp/logs/test.log
           EXIT=${PIPESTATUS[0]}
           echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
           echo "测试退出码: $EXIT"
-          # 让 step 失败 → job 失败 → build job 被 needs 依赖跳过
           exit $EXIT
 
       - name: Test summary
@@ -96,22 +88,23 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ============================================================
-  # 2. 构建：needs test（test 失败则自动 skip），
-  #    三个架构并行，任一失败不影响其他，
-  #    每个架构独立写 summary
-  # ============================================================
   build:
-    name: Build ${{ matrix.goarch }}
+    name: Build ${{ matrix.name }}
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        goarch:
-          - arm64
-          - armv7
-          - amd64
+        include:
+          - name: arm64
+            goarch: arm64
+            goarm: ''
+          - name: armv7
+            goarch: arm
+            goarm: '7'
+          - name: amd64
+            goarch: amd64
+            goarm: ''
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -122,25 +115,34 @@ jobs:
           go-version: ${{ inputs.go_version }}
           cache: true
 
-      - name: Build linux/${{ matrix.goarch }}
+      - name: Build linux/${{ matrix.name }}
         id: build
         shell: bash
+        env:
+          TARGET_GOARCH: ${{ matrix.goarch }}
+          TARGET_GOARM: ${{ matrix.goarm }}
+          NAME: ${{ matrix.name }}
         run: |
           set +e
           mkdir -p /tmp/logs
-          ARCH="${{ matrix.goarch }}"
-          OUT="n2n-client-linux-$ARCH"
-          LOG="/tmp/logs/build-$ARCH.log"
+          OUT="n2n-client-linux-$NAME"
+          LOG="/tmp/logs/build-$NAME.log"
 
           {
-            echo "GOOS=linux GOARCH=$ARCH CGO_ENABLED=0"
+            echo "GOOS=linux GOARCH=$TARGET_GOARCH GOARM=${TARGET_GOARM:-<unset>} CGO_ENABLED=0"
             echo "out=$OUT"
             echo "---"
           } | tee "$LOG"
 
-          GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 \
-            go build -trimpath -ldflags="-s -w" -o "$OUT" . 2>&1 | tee -a "$LOG"
-          EXIT=${PIPESTATUS[0]}
+          if [ -n "$TARGET_GOARM" ]; then
+            GOOS=linux GOARCH="$TARGET_GOARCH" GOARM="$TARGET_GOARM" CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" -o "$OUT" . 2>&1 | tee -a "$LOG"
+            EXIT=${PIPESTATUS[0]}
+          else
+            GOOS=linux GOARCH="$TARGET_GOARCH" CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" -o "$OUT" . 2>&1 | tee -a "$LOG"
+            EXIT=${PIPESTATUS[0]}
+          fi
 
           if [ $EXIT -ne 0 ]; then
             echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
@@ -160,25 +162,25 @@ jobs:
           sha256sum "$OUT" > "$OUT.sha256"
           cat "$OUT.sha256" | tee -a "$LOG"
           echo "exit_code=0" >> "$GITHUB_OUTPUT"
-          echo "✅ $ARCH 构建成功"
+          echo "✅ $NAME 构建成功"
 
       - name: Build summary
         if: always()
         shell: bash
         run: |
           EXIT="${{ steps.build.outputs.exit_code }}"
-          ARCH="${{ matrix.goarch }}"
-          LOG="/tmp/logs/build-$ARCH.log"
+          NAME="${{ matrix.name }}"
+          LOG="/tmp/logs/build-$NAME.log"
 
           {
-            echo "## 🔨 构建结果：linux/$ARCH"
+            echo "## 🔨 构建结果：linux/$NAME"
             echo ""
             if [ "$EXIT" = "0" ]; then
               echo "✅ **构建成功**"
-              if [ -f "n2n-client-linux-$ARCH" ]; then
-                SIZE=$(du -h "n2n-client-linux-$ARCH" | cut -f1)
+              if [ -f "n2n-client-linux-$NAME" ]; then
+                SIZE=$(du -h "n2n-client-linux-$NAME" | cut -f1)
                 echo ""
-                echo "- 文件: \`n2n-client-linux-$ARCH\`"
+                echo "- 文件: \`n2n-client-linux-$NAME\`"
                 echo "- 大小: \`$SIZE\`"
               fi
             else
@@ -208,19 +210,16 @@ jobs:
         if: steps.build.outputs.exit_code == '0'
         uses: actions/upload-artifact@v4
         with:
-          name: n2n-client-linux-${{ matrix.goarch }}
+          name: n2n-client-linux-${{ matrix.name }}
           path: |
-            n2n-client-linux-${{ matrix.goarch }}
-            n2n-client-linux-${{ matrix.goarch }}.sha256
+            n2n-client-linux-${{ matrix.name }}
+            n2n-client-linux-${{ matrix.name }}.sha256
 
-  # ============================================================
-  # 3. 发布：只有勾了 publish=true 且 build 全过才跑
-  # ============================================================
   release:
     name: Release
     needs: build
     if: inputs.publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
