@@ -216,7 +216,7 @@ func (e *Edge) sendP2PKeepalive() {
 	}
 }
 
-// getVirtualIPLocked 加锁读取虚拟 IP（无 GetVirtualIP 方法，用这个 helper）
+// getVirtualIPLocked 加锁读取虚拟 IP
 func (e *Edge) getVirtualIPLocked() string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
@@ -363,6 +363,11 @@ func main() {
 	log.Printf("已连接信令，Client ID: %s，节点名: %s", clientId, nodeName)
 	ws.StartHeartbeat(20 * time.Second)
 
+	// ★ WS 重连回调：清空所有连接状态 + 打洞失败计数
+	//
+	// 场景：连续失败 5 次后 failCounts[target]=5，后续 nat_hole_instruction
+	// 全被跳过，直到 5 分钟定期清理或进程重启。WS 重连通常意味着网络环境
+	// 已变化（换网/WiFi/DO 重启），旧的失败计数不再有意义。
 	ws.onReconnect = func() {
 		log.Printf("[信令] WebSocket 重连成功，清空所有连接状态")
 
@@ -371,6 +376,22 @@ func main() {
 		}
 		if edge.p2pStreams != nil {
 			edge.p2pStreams.closeAll()
+		}
+
+		// ★ 清空打洞失败计数（与 nathole_executor.go 的 failCounts/natHoleActive 共享）
+		natHoleActiveMu.Lock()
+		failCount := len(failCounts)
+		if failCount > 0 {
+			failCounts = make(map[string]int)
+		}
+		activeCount := len(natHoleActive)
+		if activeCount > 0 {
+			natHoleActive = make(map[string]bool)
+		}
+		natHoleActiveMu.Unlock()
+		if failCount > 0 || activeCount > 0 {
+			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个失败计数 / %d 个 in-flight 标记",
+				failCount, activeCount)
 		}
 
 		if edge.getVirtualIPLocked() != "" {
@@ -541,7 +562,6 @@ func (e *Edge) reportMetadata() {
 	}
 
 	// ★ 上报本机 LAN 地址（同 WiFi 直连用）
-	//   注意：直接用 e.getVirtualIPLocked() 而非 e.GetVirtualIP()（后者不存在）
 	vip := e.getVirtualIPLocked()
 	if lanEndpoints := collectLANEndpoints(e.udpPort, vip); len(lanEndpoints) > 0 {
 		metaPayload["lanEndpoints"] = lanEndpoints
@@ -927,7 +947,7 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
 	}
 
-	// 对 LAN 地址做同子网优先排序
+	// LAN 地址同子网优先排序
 	vip := e.getVirtualIPLocked()
 	prefixes := localPrefixes(vip)
 	sortedLAN := sortLANByAffinity(lanEndpoints, prefixes)
@@ -1324,13 +1344,6 @@ func readNameservers(path string) []string {
 // ============ LAN 地址探测（同 WiFi 直连用） ============
 
 // collectLANEndpoints 收集本机所有私有网段 IPv4 地址（每条配 P2P 端口）。
-//
-// 用于同一 WiFi 下的设备直接互连，绕过 NAT 打洞。
-//
-// 参考 n2n-go/pkg/p2p/affinity.go：
-//   - 排除 CGNAT 段（100.64.0.0/10）——n2n 虚拟 IP 自己就在这个段，不能当 LAN
-//   - 排除 loopback / link-local
-//   - 排除本机自己的虚拟 IP
 func collectLANEndpoints(port int, selfVIP string) []string {
 	var result []string
 	ifaces, err := net.Interfaces()
@@ -1400,8 +1413,6 @@ func isPrivateIPv4(ip net.IP) bool {
 }
 
 // isCGNATOverlay 判断是否在 100.64.0.0/10（RFC6598）段
-//
-// n2n / NetBird / WireGuard 都从这段分配虚拟 IP，不能当 LAN 地址用。
 func isCGNATOverlay(ip net.IP) bool {
 	ip4 := ip.To4()
 	if ip4 == nil {
@@ -1450,10 +1461,6 @@ func localPrefixes(selfVIP string) []*net.IPNet {
 }
 
 // sortLANByAffinity 同子网的 LAN 地址排前面
-//
-// 参考 n2n-go/pkg/p2p/affinity.go 的 SortAssistedByLocalAffinity：
-// 多网卡设备上报一堆地址，把和目标真正同段的排前面，
-// 避免"docker0 的 172.17.x.x"排在"真 LAN 的 192.168.x.x"前面。
 func sortLANByAffinity(lan []string, prefixes []*net.IPNet) []string {
 	if len(lan) < 2 || len(prefixes) == 0 {
 		return lan
