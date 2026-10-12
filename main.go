@@ -80,7 +80,7 @@ type Edge struct {
 
 func (e *Edge) Done() <-chan struct{} { return e.doneCh }
 
-// ============ UDP 保活 ============
+// ============ UDP 保活（STUN 侧） ============
 
 const keepaliveInterval = 5 * time.Second
 
@@ -158,6 +158,71 @@ func (e *Edge) startKeepalive() {
 			}
 		}
 	})
+}
+
+// ============ P2P 通道保活 ============
+
+// p2pKeepaliveInterval P2P 对端保活间隔。
+//
+// CGNAT 的 UDP 映射通常 30-120 秒不活动就回收。
+// 打洞成功后，双方必须定期互发 UDP 包维持映射，
+// 否则后续 N2NS 数据帧的源地址在 CGNAT 上找不到表项，被丢弃。
+//
+// 15 秒足够安全（小于大多数 CGNAT 的 30 秒超时）。
+const p2pKeepaliveInterval = 15 * time.Second
+
+func (e *Edge) startP2PKeepalive() {
+	log.Printf("[P2P-Keepalive] 启动，每 %v 刷新 P2P 通道", p2pKeepaliveInterval)
+
+	safeGo("p2p-keepalive", func() {
+		ticker := time.NewTicker(p2pKeepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-e.doneCh:
+				log.Printf("[P2P-Keepalive] 已停止")
+				return
+			case <-ticker.C:
+				e.sendP2PKeepalive()
+			}
+		}
+	})
+}
+
+// sendP2PKeepalive 向所有 P2P 状态的对端发一个 N2NP probe。
+//
+// probe 用现有的 buildPunchProbe 构造，长度 32 字节，
+// 对端收到后走 notePeerCommon 逻辑（会 MarkP2P，但已经是 P2P 就跳过）。
+func (e *Edge) sendP2PKeepalive() {
+	if e.relayMgr == nil || e.udpConn == nil {
+		return
+	}
+
+	e.peersMu.RLock()
+	type target struct {
+		id   string
+		addr *net.UDPAddr
+	}
+	var targets []target
+	for id, p := range e.peers {
+		if p.UDPAddr == nil {
+			continue
+		}
+		if !e.relayMgr.IsP2P(id) {
+			continue
+		}
+		targets = append(targets, target{id: id, addr: p.UDPAddr})
+	}
+	e.peersMu.RUnlock()
+
+	if len(targets) == 0 {
+		return
+	}
+
+	probe := buildPunchProbe(e.virtualIP)
+	for _, t := range targets {
+		_, _ = e.udpConn.WriteToUDP(probe, t.addr)
+	}
 }
 
 // ============ 超时降级 ============
@@ -300,14 +365,7 @@ func main() {
 	log.Printf("已连接信令，Client ID: %s，节点名: %s", clientId, nodeName)
 	ws.StartHeartbeat(20 * time.Second)
 
-	// ★ 修复：WS 重连时清空所有连接状态
-	//
-	// 之前只调 reportMetadata()，导致重连后 relayMgr.states[peer] 保留旧的
-	// "p2p" 状态。下次 SOCKS5 请求时认为走 P2P，但 UDP 通道可能已失效
-	// （CGNAT 端口漂移 / hairpin 单向），N2NS SYN 发不出去，2 秒超时才回落 WS。
-	//
-	// 修复后：WS 断开 → UDP 通道的 peer 状态不可信 → 清空所有状态，
-	// 等服务端重新下发打洞指令后再重新判定。
+	// WS 重连时清空所有连接状态
 	ws.onReconnect = func() {
 		log.Printf("[信令] WebSocket 重连成功，清空所有连接状态")
 
@@ -387,6 +445,7 @@ func main() {
 	})
 
 	edge.startKeepalive()
+	edge.startP2PKeepalive()
 
 	edge.socks5Srv = NewSocks5Server(edge, socks5Listen)
 	safeGo("socks5-server", func() { edge.socks5Srv.Serve() })
