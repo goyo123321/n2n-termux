@@ -86,8 +86,6 @@ func isP2PFrame(data []byte) bool {
 	return len(data) >= 4 && data[0] == 'N' && data[1] == '2' && data[2] == 'N' && data[3] == 'S'
 }
 
-// ============ 流 ============
-
 type p2pSeg struct {
 	seq      uint32
 	data     []byte
@@ -120,8 +118,6 @@ type P2PStream struct {
 	establishedCh chan bool
 	lastAct       time.Time
 }
-
-// ============ Manager ============
 
 type P2PStreamManager struct {
 	mu   sync.RWMutex
@@ -204,12 +200,15 @@ func (m *P2PStreamManager) reaper() {
 	}
 }
 
-// ============ 发送 ============
-
 // sendP2PFrame 发送一帧到对端。
 //
-// 走 TURN 时目标是对端 relay 地址（避免 CGNAT hairpin）。
-// 走 P2P 时目标是对方公网地址。
+// 优先级：
+//   1. LAN 地址（同 WiFi 直连，最低延迟，绕开 NAT）
+//   2. TURN relay（打洞失败时）
+//   3. P2P 公网地址（打洞成功时）
+//
+// ★ 新增 LAN：参考 n2n-go/pkg/p2p/affinity.go 的 sender assisted 逻辑，
+//   同 LAN 的两台设备直接内网 UDP 直发，无需打洞或 NAT 穿透。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	addr := s.peerAddr
@@ -219,9 +218,37 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 
 	buf := encodeP2PFrame(f)
 
+	// ★ 优先发 LAN 地址（广播给该 peer 的所有 LAN 地址）
+	e.peersMu.RLock()
+	var lanEndpoints []string
+	if p := e.peers[peerID]; p != nil {
+		lanEndpoints = p.LanEndpoints
+	}
+	e.peersMu.RUnlock()
+
+	lanSent := false
+	if e.udpConn != nil {
+		for _, lan := range lanEndpoints {
+			ra, err := net.ResolveUDPAddr("udp", lan)
+			if err != nil {
+				continue
+			}
+			if _, err := e.udpConn.WriteToUDP(buf, ra); err == nil {
+				lanSent = true
+			}
+		}
+	}
+	if lanSent {
+		// LAN 已发出，同时也继续走原有路径（保底）
+		// 不 return，因为同 LAN 时如果对端 LAN 地址不可达，还要回退到公网
+	}
+
 	if viaTURN {
 		if e.turnClient == nil || !e.turnClient.IsReady() {
-			return errors.New("turn down")
+			if lanSent {
+				return nil
+			}
+			return errors.New("turn down and no lan")
 		}
 		e.peersMu.RLock()
 		var relayAddr string
@@ -231,26 +258,42 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		e.peersMu.RUnlock()
 
 		if relayAddr == "" {
-			return errors.New("peer turn relay unknown")
+			if lanSent {
+				return nil
+			}
+			return errors.New("peer turn relay unknown and no lan")
 		}
 		ra, err := net.ResolveUDPAddr("udp", relayAddr)
 		if err != nil {
+			if lanSent {
+				return nil
+			}
 			return fmt.Errorf("bad relay addr %q: %w", relayAddr, err)
 		}
-		return e.turnClient.Send(buf, ra)
+		if err := e.turnClient.Send(buf, ra); err != nil {
+			if lanSent {
+				return nil
+			}
+			return err
+		}
+		return nil
 	}
 
 	if addr == nil {
-		return errors.New("no addr")
+		if lanSent {
+			return nil
+		}
+		return errors.New("no addr and no lan")
 	}
 	if e.udpConn == nil {
+		if lanSent {
+			return nil
+		}
 		return errors.New("no udp")
 	}
 	_, err := e.udpConn.WriteToUDP(buf, addr)
 	return err
 }
-
-// ============ 帧分发 ============
 
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
@@ -269,8 +312,10 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 
 // findPeerIDByAddr 按对端地址查 peerID。
 //
-// 对称 NAT 场景下，对端发到不同目标时 CGNAT 会分配不同端口，
-// 所以先 IP+Port 精确匹配，失败再退到仅 IP 匹配。
+// 匹配优先级：
+//   1. IP + Port 精确匹配（对端公网地址）
+//   2. LAN 地址匹配（同 WiFi 场景，源地址是 192.168.x.x）
+//   3. IP-only 匹配（对称 NAT 端口漂移）
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -278,12 +323,27 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
 
+	// 精确匹配
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) && p.UDPAddr.Port == addr.Port {
 			return id
 		}
 	}
 
+	// ★ LAN 地址匹配
+	for id, p := range e.peers {
+		for _, lan := range p.LanEndpoints {
+			la, err := net.ResolveUDPAddr("udp", lan)
+			if err != nil {
+				continue
+			}
+			if la.IP.Equal(addr.IP) && la.Port == addr.Port {
+				return id
+			}
+		}
+	}
+
+	// IP-only 匹配
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) {
 			return id
@@ -306,16 +366,6 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 	return p.UDPAddr, viaTURN
 }
 
-// ============ 建流（同步） ============
-
-// OpenP2PStream 尝试建立 P2P stream，同步等 SYNACK（或超时）。
-//
-// 失败时不关闭 localConn（它属于调用方/SOCKS5），
-// 让调用方能在失败后继续用同一 conn 走 WS 回落。
-//
-// ★ 修复 1：recvNext 初始化为 1。
-//   原因：SYN 占用序号 0，DATA 从 seq=1 开始，
-//   接收方的 recvNext 必须从 1 开始期待。
 func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localConn net.Conn, timeout time.Duration) (*P2PStream, error) {
 	addr, viaTURN := m.edge.peerAddrAndMode(peerID)
 	if addr == nil {
@@ -343,7 +393,7 @@ func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localCon
 	s.mu.Lock()
 	s.segments[0] = &p2pSeg{seq: 0, sentAt: time.Now(), isSyn: true}
 	s.sendNext = 1
-	s.recvNext = 1 // ★ 修复 1：SYN 占用 0，下一个 DATA 是 1
+	s.recvNext = 1
 	s.mu.Unlock()
 
 	if err := m.edge.sendP2PFrame(s, syn); err != nil {
@@ -383,7 +433,6 @@ func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localCon
 	}
 }
 
-// abortNoConn 中止 stream，但不关闭 localConn（所有权还在调用方）。
 func (s *P2PStream) abortNoConn() {
 	s.mu.Lock()
 	if s.closed {
@@ -396,10 +445,6 @@ func (s *P2PStream) abortNoConn() {
 	close(s.closeCh)
 }
 
-// acceptSYN 收到对端的 SYN，dial 本机端口，建流并回 SYNACK。
-//
-// ★ 修复 2：recvNext 初始化为 1。
-// ★ 修复 3：SYNACK 带 Ack=1，让对端推进 sendBase。
 func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	if len(f.Payload) < 4 {
 		return
@@ -441,10 +486,9 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 	s.mu.Lock()
 	s.segments[0] = &p2pSeg{seq: 0, sentAt: time.Now(), isSyn: true, isSynAck: true}
 	s.sendNext = 1
-	s.recvNext = 1 // ★ 修复 2：SYN 占用 0，下一个期待的 DATA 是 1
+	s.recvNext = 1
 	s.mu.Unlock()
 
-	// ★ 修复 3：SYNACK 带 Ack=1，让对端删掉 SYN 段、推进 sendBase
 	synack := &p2pFrame{
 		Type:     p2pTypeSYNACK,
 		StreamID: s.ID,
@@ -459,8 +503,6 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 	safeGo("p2p-rtx", func() { s.retransmitLoop(m.edge) })
 	safeGo("p2p-tx", func() { s.readLocalAndSend(m.edge) })
 }
-
-// ============ 帧处理 ============
 
 func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	s := m.get(f.StreamID)
@@ -488,7 +530,6 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 
 	switch f.Type {
 	case p2pTypeSYNACK:
-		// ★ 修复 4：回 ACK，让对端推进 sendBase（否则 SYNACK 会被对方一直重传）
 		_ = m.edge.sendP2PFrame(s, &p2pFrame{
 			Type:     p2pTypeACK,
 			StreamID: s.ID,
@@ -501,7 +542,7 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 	case p2pTypeDATA:
 		s.handleData(m.edge, f)
 	case p2pTypeACK:
-		// ack 已处理（sendBase 推进在上面）
+		// ack 已处理
 	case p2pTypeFIN, p2pTypeRST:
 		s.close("peer-close")
 	}
@@ -551,8 +592,6 @@ func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
 	})
 }
 
-// ============ 发数据 ============
-
 func (s *P2PStream) readLocalAndSend(e *Edge) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -570,7 +609,6 @@ func (s *P2PStream) readLocalAndSend(e *Edge) {
 			return
 		}
 
-		// 等窗口
 		for {
 			s.mu.Lock()
 			inflight := s.sendNext - s.sendBase
@@ -618,8 +656,6 @@ func (s *P2PStream) readLocalAndSend(e *Edge) {
 		}
 	}
 }
-
-// ============ 重传 ============
 
 func (s *P2PStream) retransmitLoop(e *Edge) {
 	defer func() {
@@ -687,9 +723,6 @@ func (s *P2PStream) retransmitLoop(e *Edge) {
 	}
 }
 
-// ============ 关闭 ============
-
-// close 关闭 stream。只有 ownsConn 为 true 时才关闭 localConn。
 func (s *P2PStream) close(reason string) {
 	s.mu.Lock()
 	if s.closed {
