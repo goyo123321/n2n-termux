@@ -55,7 +55,7 @@ const (
 
 const maxConsecutiveFails = 5
 
-var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50}
+var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50} // 保留向后兼容
 
 var (
 	natHoleActiveMu sync.Mutex
@@ -154,7 +154,6 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 		diff = -diff
 	}
 
-	// ★ 端口差 > 5000：放弃
 	if diff > 5000 {
 		return nil, true, diff, -1
 	}
@@ -248,7 +247,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 
 	tiers, sameStun, portDiff, halfWidth := e.chooseScanTiers(targetAddr)
 
-	// ★ 端口差过大，直接放弃
 	if sameStun && halfWidth < 0 {
 		res.State = PunchStateFailed
 		res.Detail = fmt.Sprintf("端口差过大 (%d)，放弃打洞", portDiff)
@@ -271,7 +269,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] 模式：不同 STUN IP，全端口扫描，分级 %v", tiers)
 	}
 
-	// ★ 优先扫描 assisted
 	if len(assistedTargets) > 0 {
 		log.Printf("[NAT-HOLE] 优先扫描 %d 个 assisted 端点", len(assistedTargets))
 		for _, t := range assistedTargets {
@@ -464,7 +461,30 @@ func parseSockAddr(s string) *net.UDPAddr {
 	return &net.UDPAddr{IP: ip, Port: port}
 }
 
+// resolveTarget 决定这次打洞往哪个地址发包。
+//
+// ★ 修复：优先使用本机观测过的 raddr。
+//
+// 优先级（对齐项目一/二的 ResolvePunchTarget）：
+//  1. 本机观测过的 raddr —— 对端的包实际从哪来，是唯一被证明可达的地址
+//  2. 指令声明的 TargetPubSocket —— 服务端从 STUN 反射地址组装
+//  3. 指令里的 SenderPubSocket / ReceiverPubSocket —— 兜底
+//
+// 观测 raddr 优先的原因：在 SNAT / 对称 NAT 下，对端宣告的地址可能
+// 是一个从我们这里完全不通的路由器 WAN 地址，而它真实的包正从一个
+// 我们刚刚见过的地址到达。项目一/二的经验：靠观测比靠宣告可靠。
 func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
+	// 1. 观测 raddr
+	e.peersMu.RLock()
+	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
+		raddr := &net.UDPAddr{IP: p.UDPAddr.IP, Port: p.UDPAddr.Port}
+		e.peersMu.RUnlock()
+		log.Printf("[NAT-HOLE] 优先使用观测 raddr %s（已被证明可达）", raddr.String())
+		return raddr
+	}
+	e.peersMu.RUnlock()
+
+	// 2. 指令声明的地址
 	sock := instr.TargetPubSocket
 	if sock == "" {
 		if instr.Role == 1 {
@@ -476,14 +496,11 @@ func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 	return parseSockAddr(sock)
 }
 
-func buildPunchProbe(virtualIP string) []byte {
-	buf := make([]byte, 32)
-	copy(buf[0:4], probePrefix)
-	if ip := net.ParseIP(virtualIP); ip != nil && ip.To4() != nil {
-		copy(buf[4:8], ip.To4())
-	}
-	return buf
-}
+// buildPunchProbe 生成打洞探测包（32 字节：punchPrefix + 虚拟 IP）。
+//
+// 与 punch.go 中的 buildPunchProbe 保持一致的语义，
+// 这里不重复定义，直接调用 punch.go 里的实现。
+// （两处定义会导致编译错误，因此保留 punch.go 的版本作为唯一实现。）
 
 // hasTrafficFromTarget 检查是否从指定 peer 收到过包。
 func (e *Edge) hasTrafficFromTarget(peerID string, since int64) bool {
