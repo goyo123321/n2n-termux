@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +41,7 @@ type PeerInfo struct {
 	hasRealData       bool
 	probeReplied      bool
 	AssistedEndpoints []string
+	LanEndpoints      []string // ★ 新增：对端上报的 LAN 地址（同子网优先排序）
 }
 
 type Edge struct {
@@ -162,13 +164,6 @@ func (e *Edge) startKeepalive() {
 
 // ============ P2P 通道保活 ============
 
-// p2pKeepaliveInterval P2P 对端保活间隔。
-//
-// CGNAT 的 UDP 映射通常 30-120 秒不活动就回收。
-// 打洞成功后，双方必须定期互发 UDP 包维持映射，
-// 否则后续 N2NS 数据帧的源地址在 CGNAT 上找不到表项，被丢弃。
-//
-// 15 秒足够安全（小于大多数 CGNAT 的 30 秒超时）。
 const p2pKeepaliveInterval = 15 * time.Second
 
 func (e *Edge) startP2PKeepalive() {
@@ -189,10 +184,6 @@ func (e *Edge) startP2PKeepalive() {
 	})
 }
 
-// sendP2PKeepalive 向所有 P2P 状态的对端发一个 N2NP probe。
-//
-// probe 用现有的 buildPunchProbe 构造，长度 32 字节，
-// 对端收到后走 notePeerCommon 逻辑（会 MarkP2P，但已经是 P2P 就跳过）。
 func (e *Edge) sendP2PKeepalive() {
 	if e.relayMgr == nil || e.udpConn == nil {
 		return
@@ -365,7 +356,6 @@ func main() {
 	log.Printf("已连接信令，Client ID: %s，节点名: %s", clientId, nodeName)
 	ws.StartHeartbeat(20 * time.Second)
 
-	// WS 重连时清空所有连接状态
 	ws.onReconnect = func() {
 		log.Printf("[信令] WebSocket 重连成功，清空所有连接状态")
 
@@ -543,6 +533,13 @@ func (e *Edge) reportMetadata() {
 		metaPayload["assistedEndpoints"] = nm.AllEndpoints
 	}
 
+	// ★ 新增：上报本机 LAN 地址（同 WiFi 直连用）
+	vip := e.GetVirtualIP()
+	if lanEndpoints := collectLANEndpoints(e.udpPort, vip); len(lanEndpoints) > 0 {
+		metaPayload["lanEndpoints"] = lanEndpoints
+		log.Printf("[NAT] 上报 LAN 地址: %v", lanEndpoints)
+	}
+
 	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d",
 		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints))
 
@@ -591,6 +588,7 @@ func (e *Edge) logPeerReady(peerID string) {
 	pubIP := p.PubIP
 	pubPort := p.PubPort
 	clientID := p.ClientID
+	lans := p.LanEndpoints
 	e.peersMu.Unlock()
 
 	log.Println("")
@@ -598,6 +596,9 @@ func (e *Edge) logPeerReady(peerID string) {
 	log.Printf("  虚拟 IP   : %s", vip)
 	if pubIP != "" && pubPort > 0 {
 		log.Printf("  公网地址  : %s:%d", pubIP, pubPort)
+	}
+	if len(lans) > 0 {
+		log.Printf("  LAN 地址  : %v", lans)
 	}
 	log.Println("==========================================")
 	log.Println("")
@@ -657,13 +658,23 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					}
 				}
 
+				// ★ 新增：解析对端 LAN 地址
+				var lanEndpoints []string
+				if raw, ok := pm["lanEndpoints"].([]interface{}); ok {
+					for _, v := range raw {
+						if s, ok := v.(string); ok && s != "" {
+							lanEndpoints = append(lanEndpoints, s)
+						}
+					}
+				}
+
 				if pid == "" || pip == "" {
 					continue
 				}
 
 				e.maybeResetFailCountForPeer(pid, pubIP, pubPort)
 
-				e.registerPeer(pid, pip, pubIP, pubPort, natType, assisted)
+				e.registerPeer(pid, pip, pubIP, pubPort, natType, assisted, lanEndpoints)
 				if relayAddr != "" {
 					e.peersMu.Lock()
 					if pi, ok := e.peers[pid]; ok {
@@ -700,6 +711,16 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			}
 		}
 
+		// ★ 新增：解析对端 LAN 地址
+		var lanEndpoints []string
+		if raw, ok := payload["lanEndpoints"].([]interface{}); ok {
+			for _, v := range raw {
+				if s, ok := v.(string); ok && s != "" {
+					lanEndpoints = append(lanEndpoints, s)
+				}
+			}
+		}
+
 		if from != "" && pip != "" {
 			e.peersMu.RLock()
 			p, exists := e.peers[from]
@@ -708,7 +729,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 
 			e.maybeResetFailCountForPeer(from, pubIP, pubPort)
 
-			e.registerPeer(from, pip, pubIP, pubPort, natType, assisted)
+			e.registerPeer(from, pip, pubIP, pubPort, natType, assisted, lanEndpoints)
 			if relayAddr != "" {
 				e.peersMu.Lock()
 				if pi, ok := e.peers[from]; ok {
@@ -890,11 +911,16 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
-func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted []string) {
+func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
 	}
+
+	// ★ 对 LAN 地址做同子网优先排序
+	prefixes := localPrefixes(e.GetVirtualIP())
+	sortedLAN := sortLANByAffinity(lanEndpoints, prefixes)
+
 	e.peersMu.Lock()
 	_, existed := e.peers[peerID]
 	if existed {
@@ -917,6 +943,9 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 		if len(assisted) > 0 {
 			p.AssistedEndpoints = assisted
 		}
+		if len(sortedLAN) > 0 {
+			p.LanEndpoints = sortedLAN
+		}
 	} else {
 		e.peers[peerID] = &PeerInfo{
 			ClientID:          peerID,
@@ -926,6 +955,7 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			UDPAddr:           udpAddr,
 			NATType:           natType,
 			AssistedEndpoints: assisted,
+			LanEndpoints:      sortedLAN,
 		}
 	}
 	e.peersMu.Unlock()
@@ -1278,4 +1308,178 @@ func readNameservers(path string) []string {
 		}
 	}
 	return result
+}
+
+// ============ LAN 地址探测（同 WiFi 直连用） ============
+
+// collectLANEndpoints 收集本机所有私有网段 IPv4 地址（每条配 P2P 端口）。
+//
+// 用于同一 WiFi 下的设备直接互连，绕过 NAT 打洞。
+//
+// 参考 n2n-go/pkg/p2p/affinity.go：
+//   - 排除 CGNAT 段（100.64.0.0/10）——n2n 虚拟 IP 自己就在这个段，不能当 LAN
+//   - 排除 loopback / link-local
+//   - 排除本机自己的虚拟 IP
+func collectLANEndpoints(port int, selfVIP string) []string {
+	var result []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.To4() == nil {
+				continue
+			}
+			ip4 := ip.To4()
+			if isCGNATOverlay(ip4) {
+				continue
+			}
+			if selfVIP != "" && ip4.String() == selfVIP {
+				continue
+			}
+			if !isPrivateIPv4(ip4) {
+				continue
+			}
+			if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			ep := net.JoinHostPort(ip4.String(), strconv.Itoa(port))
+			if seen[ep] {
+				continue
+			}
+			seen[ep] = true
+			result = append(result, ep)
+		}
+	}
+	return result
+}
+
+// isPrivateIPv4 RFC1918 私有段
+func isPrivateIPv4(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	if ip4[0] == 10 {
+		return true
+	}
+	if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+		return true
+	}
+	if ip4[0] == 192 && ip4[1] == 168 {
+		return true
+	}
+	return false
+}
+
+// isCGNATOverlay 判断是否在 100.64.0.0/10（RFC6598）段
+//
+// n2n / NetBird / WireGuard 都从这段分配虚拟 IP，不能当 LAN 地址用。
+func isCGNATOverlay(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
+}
+
+// localPrefixes 收集本机所有有效 IPv4 子网前缀（用于同子网优先级排序）
+//
+// 参考 n2n-go/pkg/p2p/affinity.go 的 LocalNATPunchPrefixes：
+// 排除 tap 自身、CGNAT 段、loopback、link-local。
+func localPrefixes(selfVIP string) []*net.IPNet {
+	var result []*net.IPNet
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok || ipnet.IP.To4() == nil {
+				continue
+			}
+			ip4 := ipnet.IP.To4()
+			if isCGNATOverlay(ip4) {
+				continue
+			}
+			if selfVIP != "" && ip4.String() == selfVIP {
+				continue
+			}
+			if !isPrivateIPv4(ip4) {
+				continue
+			}
+			if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			result = append(result, ipnet)
+		}
+	}
+	return result
+}
+
+// sortLANByAffinity 同子网的 LAN 地址排前面
+//
+// 参考 n2n-go/pkg/p2p/affinity.go 的 SortAssistedByLocalAffinity：
+// 多网卡设备上报一堆地址，把和目标真正同段的排前面，
+// 避免"docker0 的 172.17.x.x"排在"真 LAN 的 192.168.x.x"前面。
+func sortLANByAffinity(lan []string, prefixes []*net.IPNet) []string {
+	if len(lan) < 2 || len(prefixes) == 0 {
+		return lan
+	}
+	type entry struct {
+		ep    string
+		score int
+	}
+	scored := make([]entry, len(lan))
+	for i, ep := range lan {
+		host, _, err := net.SplitHostPort(ep)
+		if err != nil {
+			host = ep
+		}
+		ip := net.ParseIP(host)
+		score := 0
+		if ip != nil && !isCGNATOverlay(ip) {
+			for _, p := range prefixes {
+				if p.Contains(ip) {
+					ones, _ := p.Mask.Size()
+					if ones > score {
+						score = ones
+					}
+				}
+			}
+		}
+		scored[i] = entry{ep, score}
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+	out := make([]string, len(scored))
+	for i, s := range scored {
+		out[i] = s.ep
+	}
+	return out
 }
