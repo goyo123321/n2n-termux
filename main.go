@@ -41,7 +41,7 @@ type PeerInfo struct {
 	hasRealData       bool
 	probeReplied      bool
 	AssistedEndpoints []string
-	LanEndpoints      []string // ★ 对端上报的 LAN 地址（同子网优先排序）
+	LanEndpoints      []string // ★ 新增：对端上报的 LAN 地址（同子网优先排序）
 }
 
 type Edge struct {
@@ -210,17 +210,10 @@ func (e *Edge) sendP2PKeepalive() {
 		return
 	}
 
-	probe := buildPunchProbe(e.getVirtualIPLocked())
+	probe := buildPunchProbe(e.virtualIP)
 	for _, t := range targets {
 		_, _ = e.udpConn.WriteToUDP(probe, t.addr)
 	}
-}
-
-// getVirtualIPLocked 加锁读取虚拟 IP（无 GetVirtualIP 方法，用这个 helper）
-func (e *Edge) getVirtualIPLocked() string {
-	e.peersMu.RLock()
-	defer e.peersMu.RUnlock()
-	return e.virtualIP
 }
 
 // ============ 超时降级 ============
@@ -373,7 +366,7 @@ func main() {
 			edge.p2pStreams.closeAll()
 		}
 
-		if edge.getVirtualIPLocked() != "" {
+		if edge.virtualIP != "" {
 			edge.reportMetadata()
 		}
 	}
@@ -540,9 +533,8 @@ func (e *Edge) reportMetadata() {
 		metaPayload["assistedEndpoints"] = nm.AllEndpoints
 	}
 
-	// ★ 上报本机 LAN 地址（同 WiFi 直连用）
-	//   注意：直接用 e.getVirtualIPLocked() 而非 e.GetVirtualIP()（后者不存在）
-	vip := e.getVirtualIPLocked()
+	// ★ 新增：上报本机 LAN 地址（同 WiFi 直连用）
+	vip := e.GetVirtualIP()
 	if lanEndpoints := collectLANEndpoints(e.udpPort, vip); len(lanEndpoints) > 0 {
 		metaPayload["lanEndpoints"] = lanEndpoints
 		log.Printf("[NAT] 上报 LAN 地址: %v", lanEndpoints)
@@ -573,7 +565,7 @@ func (e *Edge) printNodeSummary() {
 	log.Println("================= 本机信息 =================")
 	log.Printf("  Client ID   : %s", e.clientId)
 	log.Printf("  节点名       : %s", e.nodeName)
-	log.Printf("  虚拟 IP     : %s", e.getVirtualIPLocked())
+	log.Printf("  虚拟 IP     : %s", e.virtualIP)
 	log.Printf("  虚拟网段    : %s", e.virtualCIDR)
 	log.Printf("  P2P 端口    : %d", e.udpPort)
 	log.Printf("  模式         : proxy (SOCKS5)")
@@ -626,15 +618,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	case "ready":
 		payload, _ := msg["payload"].(map[string]interface{})
 
-		e.peersMu.Lock()
 		e.virtualIP, _ = payload["virtualIp"].(string)
 		if cidr, ok := payload["virtualNetwork"].(string); ok && cidr != "" {
 			e.virtualCIDR = cidr
 		}
-		vip := e.virtualIP
-		cidr := e.virtualCIDR
-		e.peersMu.Unlock()
-		log.Printf("分配虚拟 IP: %s（网段 %s）", vip, cidr)
+		log.Printf("分配虚拟 IP: %s（网段 %s）", e.virtualIP, e.virtualCIDR)
 
 		if serverIP, ok := payload["yourPublicIp"].(string); ok && serverIP != "" {
 			e.mu.Lock()
@@ -670,6 +658,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					}
 				}
 
+				// ★ 新增：解析对端 LAN 地址
 				var lanEndpoints []string
 				if raw, ok := pm["lanEndpoints"].([]interface{}); ok {
 					for _, v := range raw {
@@ -722,6 +711,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			}
 		}
 
+		// ★ 新增：解析对端 LAN 地址
 		var lanEndpoints []string
 		if raw, ok := payload["lanEndpoints"].([]interface{}); ok {
 			for _, v := range raw {
@@ -927,9 +917,8 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
 	}
 
-	// 对 LAN 地址做同子网优先排序
-	vip := e.getVirtualIPLocked()
-	prefixes := localPrefixes(vip)
+	// ★ 对 LAN 地址做同子网优先排序
+	prefixes := localPrefixes(e.GetVirtualIP())
 	sortedLAN := sortLANByAffinity(lanEndpoints, prefixes)
 
 	e.peersMu.Lock()
@@ -1117,7 +1106,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) 
 	}
 
 	safeGo("probe-reply-5", func() {
-		probe := buildPunchProbe(e.getVirtualIPLocked())
+		probe := buildPunchProbe(e.virtualIP)
 		for i := 0; i < 5; i++ {
 			select {
 			case <-e.doneCh:
@@ -1153,7 +1142,7 @@ func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 	if e.udpConn == nil || addr == nil {
 		return
 	}
-	probe := buildPunchProbe(e.getVirtualIPLocked())
+	probe := buildPunchProbe(e.virtualIP)
 	e.writeProbe(addr, probe, false)
 }
 
@@ -1411,6 +1400,9 @@ func isCGNATOverlay(ip net.IP) bool {
 }
 
 // localPrefixes 收集本机所有有效 IPv4 子网前缀（用于同子网优先级排序）
+//
+// 参考 n2n-go/pkg/p2p/affinity.go 的 LocalNATPunchPrefixes：
+// 排除 tap 自身、CGNAT 段、loopback、link-local。
 func localPrefixes(selfVIP string) []*net.IPNet {
 	var result []*net.IPNet
 	ifaces, err := net.Interfaces()
