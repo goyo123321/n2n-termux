@@ -206,9 +206,6 @@ func (m *P2PStreamManager) reaper() {
 //   1. LAN 地址（同 WiFi 直连，最低延迟，绕开 NAT）
 //   2. TURN relay（打洞失败时）
 //   3. P2P 公网地址（打洞成功时）
-//
-// ★ 新增 LAN：参考 n2n-go/pkg/p2p/affinity.go 的 sender assisted 逻辑，
-//   同 LAN 的两台设备直接内网 UDP 直发，无需打洞或 NAT 穿透。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	addr := s.peerAddr
@@ -218,7 +215,7 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 
 	buf := encodeP2PFrame(f)
 
-	// ★ 优先发 LAN 地址（广播给该 peer 的所有 LAN 地址）
+	// 优先发 LAN 地址（广播给该 peer 的所有 LAN 地址）
 	e.peersMu.RLock()
 	var lanEndpoints []string
 	if p := e.peers[peerID]; p != nil {
@@ -240,7 +237,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	}
 	if lanSent {
 		// LAN 已发出，同时也继续走原有路径（保底）
-		// 不 return，因为同 LAN 时如果对端 LAN 地址不可达，还要回退到公网
 	}
 
 	if viaTURN {
@@ -295,6 +291,13 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	return err
 }
 
+// handleP2PFrame 收到 P2P 帧时的入口。
+//
+// ★ 修复：收到真实 P2P 数据帧后，升级 relayMgr 状态到 P2P。
+//
+// 这是项目一/二 HasVerifiedDataPath 的等价物：打洞握手（Punch/ACK）
+// 只能证明双方 NAT 映射已打开，但真实数据帧才能证明数据面可用。
+// 在收到第一个真实数据帧之前，状态是 P2PAvailable；收到后升级到 P2P。
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -307,6 +310,15 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 	if peerID == "" {
 		return
 	}
+
+	// ★ 收到真实 P2P 数据帧 → 升级到完全 P2P
+	if e.relayMgr != nil {
+		if e.relayMgr.GetState(peerID) != ConnP2P {
+			log.Printf("[P2P] 收到真实 P2P 数据帧（stream=%d）→ P2P 直连", f.StreamID)
+			e.relayMgr.MarkP2P(peerID)
+		}
+	}
+
 	e.p2pStreams.handleFrame(peerID, peerAddr, viaTURN, f)
 }
 
@@ -330,7 +342,7 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 		}
 	}
 
-	// ★ LAN 地址匹配
+	// LAN 地址匹配
 	for id, p := range e.peers {
 		for _, lan := range p.LanEndpoints {
 			la, err := net.ResolveUDPAddr("udp", lan)
@@ -361,7 +373,9 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 	}
 	viaTURN := true
 	if e.relayMgr != nil {
-		viaTURN = !e.relayMgr.IsP2P(peerID)
+		st := e.relayMgr.GetState(peerID)
+		// ★ P2P 和 P2PAvailable 都算"不走 TURN"
+		viaTURN = st != ConnP2P && st != ConnP2PAvailable
 	}
 	return p.UDPAddr, viaTURN
 }
