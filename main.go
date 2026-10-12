@@ -68,7 +68,6 @@ type Edge struct {
 
 	lastMetadataReportAt int64
 
-	// proxy 模式相关
 	streamMgr  *AppStreamManager
 	p2pStreams *P2PStreamManager
 	socks5Srv  *Socks5Server
@@ -268,7 +267,6 @@ func main() {
 		streamMgr:      NewAppStreamManager(),
 	}
 
-	// UDP socket
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: udpPort}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil && udpPort != 0 {
@@ -285,17 +283,14 @@ func main() {
 	edge.udpPort = actualPort
 	log.Printf("[P2P] UDP 监听端口 %d", actualPort)
 
-	// NAT 探测
 	servers := []string{}
 	if stunServers != "" {
 		servers = splitCSV(stunServers)
 	}
 	edge.natMeta = probeNAT(actualPort, servers)
 
-	// P2P stream manager
 	edge.p2pStreams = NewP2PStreamManager(edge)
 
-	// WebSocket
 	ws, err := NewWSTransport(signalingURL, roomId, clientId, connectToken)
 	if err != nil {
 		log.Fatalf("连接信令失败: %v", err)
@@ -305,13 +300,29 @@ func main() {
 	log.Printf("已连接信令，Client ID: %s，节点名: %s", clientId, nodeName)
 	ws.StartHeartbeat(20 * time.Second)
 
+	// ★ 修复：WS 重连时清空所有连接状态
+	//
+	// 之前只调 reportMetadata()，导致重连后 relayMgr.states[peer] 保留旧的
+	// "p2p" 状态。下次 SOCKS5 请求时认为走 P2P，但 UDP 通道可能已失效
+	// （CGNAT 端口漂移 / hairpin 单向），N2NS SYN 发不出去，2 秒超时才回落 WS。
+	//
+	// 修复后：WS 断开 → UDP 通道的 peer 状态不可信 → 清空所有状态，
+	// 等服务端重新下发打洞指令后再重新判定。
 	ws.onReconnect = func() {
+		log.Printf("[信令] WebSocket 重连成功，清空所有连接状态")
+
+		if edge.relayMgr != nil {
+			edge.relayMgr.ClearAll()
+		}
+		if edge.p2pStreams != nil {
+			edge.p2pStreams.closeAll()
+		}
+
 		if edge.virtualIP != "" {
 			edge.reportMetadata()
 		}
 	}
 
-	// TURN
 	edge.turnClient = NewTURNClient(signalingURL, connectToken, edge)
 	edge.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		ua, ok := addr.(*net.UDPAddr)
@@ -329,11 +340,9 @@ func main() {
 		}
 	}
 
-	// 三级降级管理器
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
 	edge.relayMgr.Report(10 * time.Second)
 
-	// 信令处理
 	ws.SetHandlers(
 		edge.handleSignaling,
 		func(data []byte) {
@@ -341,7 +350,6 @@ func main() {
 		},
 	)
 
-	// UDP 读循环（含 N2NS 分流）
 	safeGo("udpReadLoop", func() {
 		buf := make([]byte, 65535)
 		for {
@@ -359,7 +367,6 @@ func main() {
 				continue
 			}
 
-			// STUN 响应
 			if buf[0] == 0x01 && buf[1] == 0x01 {
 				if ip, port, ok := parseSTUNResponse(buf[:n]); ok {
 					edge.addAssistedEndpoint(ip, port)
@@ -367,29 +374,23 @@ func main() {
 				continue
 			}
 
-			// N2NS 帧优先
 			if isP2PFrame(buf[:n]) {
 				edge.handleP2PFrame(addr, false, buf[:n])
 				continue
 			}
 
-			// N2NP probe（打洞用）
 			if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
 				edge.notePeerProbe(addr)
 				continue
 			}
-
-			// 忽略 IPv4 包（proxy 模式无 TUN）
 		}
 	})
 
 	edge.startKeepalive()
 
-	// SOCKS5
 	edge.socks5Srv = NewSocks5Server(edge, socks5Listen)
 	safeGo("socks5-server", func() { edge.socks5Srv.Serve() })
 
-	// TURN 初始化
 	safeGo("turn-init", func() {
 		time.Sleep(2 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -552,27 +553,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 
 	t, _ := msg["type"].(string)
 	from, _ := msg["from"].(string)
-
-	if t == "_reconnected" {
-		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
-
-		natHoleActiveMu.Lock()
-		count := len(failCounts)
-		if count > 0 {
-			failCounts = make(map[string]int)
-		}
-		natHoleActiveMu.Unlock()
-		if count > 0 {
-			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个 peer 的失败计数", count)
-		}
-
-		if e.relayMgr != nil {
-			e.relayMgr.ClearAll()
-		}
-
-		e.reportMetadata()
-		return
-	}
 
 	switch t {
 	case "ready":
@@ -737,7 +717,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[TURN] 记录 %s 的中继地址: %s", edgeMac, relayAddr)
 		}
 
-	// app_stream 消息
 	case "app_stream_open":
 		safeGo("app-stream-open", func() { e.onRemoteStreamOpen(msg) })
 	case "app_stream_open_ack":
@@ -1161,15 +1140,6 @@ func splitCSV(s string) []string {
 
 // ============ DNS 修复（Termux 专用） ============
 
-// setupResolver 修复 Termux 环境下 Go 静态二进制读不到 /etc/resolv.conf 的问题。
-//
-// 背景：
-//   - Termux 的 /etc 是指向 /system/etc 的软链（Android 只读，里面没有 resolv.conf）
-//   - 真正的 DNS 配置在 $PREFIX/etc/resolv.conf
-//   - Go 静态二进制（CGO_ENABLED=0）不经过 libc，termux-exec 也拦不到
-//   - 结果：Go 硬编码读 /etc/resolv.conf 失败 → fallback 到 [::1]:53 → connection refused
-//
-// 解法：启动时主动读 $PREFIX/etc/resolv.conf，覆盖 net.DefaultResolver。
 func setupResolver() {
 	prefix := os.Getenv("PREFIX")
 	if prefix == "" {
@@ -1220,7 +1190,6 @@ func setupResolver() {
 	}
 }
 
-// readNameservers 从 resolv.conf 读 nameserver 列表，返回 "addr:port" 形式。
 func readNameservers(path string) []string {
 	f, err := os.Open(path)
 	if err != nil {
