@@ -269,10 +269,8 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 
 // findPeerIDByAddr 按对端地址查 peerID。
 //
-// ★ 修复：对称 NAT 场景下，对端发到不同目标时 CGNAT 会分配不同端口，
-//   导致 IP+Port 精确匹配失败。放宽到仅 IP 匹配。
-//
-//   n2n 虚拟网场景下一个 IP 一般只有一个 peer，IP 匹配足够。
+// 对称 NAT 场景下，对端发到不同目标时 CGNAT 会分配不同端口，
+// 所以先 IP+Port 精确匹配，失败再退到仅 IP 匹配。
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -280,14 +278,12 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
 
-	// 优先 IP + Port 精确匹配
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) && p.UDPAddr.Port == addr.Port {
 			return id
 		}
 	}
 
-	// 退而求其次：仅 IP 匹配
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) {
 			return id
@@ -316,6 +312,10 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 //
 // 失败时不关闭 localConn（它属于调用方/SOCKS5），
 // 让调用方能在失败后继续用同一 conn 走 WS 回落。
+//
+// ★ 修复 1：recvNext 初始化为 1。
+//   原因：SYN 占用序号 0，DATA 从 seq=1 开始，
+//   接收方的 recvNext 必须从 1 开始期待。
 func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localConn net.Conn, timeout time.Duration) (*P2PStream, error) {
 	addr, viaTURN := m.edge.peerAddrAndMode(peerID)
 	if addr == nil {
@@ -343,6 +343,7 @@ func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localCon
 	s.mu.Lock()
 	s.segments[0] = &p2pSeg{seq: 0, sentAt: time.Now(), isSyn: true}
 	s.sendNext = 1
+	s.recvNext = 1 // ★ 修复 1：SYN 占用 0，下一个 DATA 是 1
 	s.mu.Unlock()
 
 	if err := m.edge.sendP2PFrame(s, syn); err != nil {
@@ -395,6 +396,10 @@ func (s *P2PStream) abortNoConn() {
 	close(s.closeCh)
 }
 
+// acceptSYN 收到对端的 SYN，dial 本机端口，建流并回 SYNACK。
+//
+// ★ 修复 2：recvNext 初始化为 1。
+// ★ 修复 3：SYNACK 带 Ack=1，让对端推进 sendBase。
 func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	if len(f.Payload) < 4 {
 		return
@@ -436,9 +441,16 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 	s.mu.Lock()
 	s.segments[0] = &p2pSeg{seq: 0, sentAt: time.Now(), isSyn: true, isSynAck: true}
 	s.sendNext = 1
+	s.recvNext = 1 // ★ 修复 2：SYN 占用 0，下一个期待的 DATA 是 1
 	s.mu.Unlock()
 
-	synack := &p2pFrame{Type: p2pTypeSYNACK, StreamID: s.ID}
+	// ★ 修复 3：SYNACK 带 Ack=1，让对端删掉 SYN 段、推进 sendBase
+	synack := &p2pFrame{
+		Type:     p2pTypeSYNACK,
+		StreamID: s.ID,
+		Seq:      0,
+		Ack:      1,
+	}
 	_ = m.edge.sendP2PFrame(s, synack)
 
 	log.Printf("[P2P-STREAM] %d 收到 SYN from %s, 转发到 127.0.0.1:%d",
@@ -476,6 +488,12 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 
 	switch f.Type {
 	case p2pTypeSYNACK:
+		// ★ 修复 4：回 ACK，让对端推进 sendBase（否则 SYNACK 会被对方一直重传）
+		_ = m.edge.sendP2PFrame(s, &p2pFrame{
+			Type:     p2pTypeACK,
+			StreamID: s.ID,
+			Ack:      1,
+		})
 		select {
 		case s.establishedCh <- true:
 		default:
@@ -483,6 +501,7 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 	case p2pTypeDATA:
 		s.handleData(m.edge, f)
 	case p2pTypeACK:
+		// ack 已处理（sendBase 推进在上面）
 	case p2pTypeFIN, p2pTypeRST:
 		s.close("peer-close")
 	}
