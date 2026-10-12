@@ -41,7 +41,7 @@ type PeerInfo struct {
 	hasRealData       bool
 	probeReplied      bool
 	AssistedEndpoints []string
-	LanEndpoints      []string // ★ 对端上报的 LAN 地址（同子网优先排序）
+	LanEndpoints      []string
 }
 
 type Edge struct {
@@ -73,6 +73,9 @@ type Edge struct {
 	streamMgr  *AppStreamManager
 	p2pStreams *P2PStreamManager
 	socks5Srv  *Socks5Server
+
+	// ★ 新增：ACK 限流器（按 peer 500ms 一次）
+	punchAckLimiter *punchAckLimiter
 
 	doneCh  chan struct{}
 	closeMu sync.Mutex
@@ -199,7 +202,8 @@ func (e *Edge) sendP2PKeepalive() {
 		if p.UDPAddr == nil {
 			continue
 		}
-		if !e.relayMgr.IsP2P(id) {
+		st := e.relayMgr.GetState(id)
+		if st != ConnP2P && st != ConnP2PAvailable {
 			continue
 		}
 		targets = append(targets, target{id: id, addr: p.UDPAddr})
@@ -216,7 +220,6 @@ func (e *Edge) sendP2PKeepalive() {
 	}
 }
 
-// getVirtualIPLocked 加锁读取虚拟 IP
 func (e *Edge) getVirtualIPLocked() string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
@@ -329,6 +332,7 @@ func main() {
 		doneCh:         make(chan struct{}),
 		streamMgr:      NewAppStreamManager(),
 	}
+	edge.punchAckLimiter = newPunchAckLimiter() // ★ 新增
 
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: udpPort}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
@@ -363,11 +367,6 @@ func main() {
 	log.Printf("已连接信令，Client ID: %s，节点名: %s", clientId, nodeName)
 	ws.StartHeartbeat(20 * time.Second)
 
-	// ★ WS 重连回调：清空所有连接状态 + 打洞失败计数
-	//
-	// 场景：连续失败 5 次后 failCounts[target]=5，后续 nat_hole_instruction
-	// 全被跳过，直到 5 分钟定期清理或进程重启。WS 重连通常意味着网络环境
-	// 已变化（换网/WiFi/DO 重启），旧的失败计数不再有意义。
 	ws.onReconnect = func() {
 		log.Printf("[信令] WebSocket 重连成功，清空所有连接状态")
 
@@ -377,8 +376,10 @@ func main() {
 		if edge.p2pStreams != nil {
 			edge.p2pStreams.closeAll()
 		}
+		if edge.punchAckLimiter != nil { // ★ 新增
+			edge.punchAckLimiter.clear()
+		}
 
-		// ★ 清空打洞失败计数（与 nathole_executor.go 的 failCounts/natHoleActive 共享）
 		natHoleActiveMu.Lock()
 		failCount := len(failCounts)
 		if failCount > 0 {
@@ -409,9 +410,13 @@ func main() {
 			edge.handleP2PFrame(ua, true, data)
 			return
 		}
-		if len(data) >= 4 &&
-			data[0] == 'N' && data[1] == '2' && data[2] == 'N' && data[3] == 'P' {
+		// ★ Punch 和 ACK 分开处理
+		if isPunchProbe(data) {
 			edge.notePeerProbeTURN(ua)
+			return
+		}
+		if isPunchAck(data) {
+			edge.notePeerAck(ua)
 			return
 		}
 	}
@@ -455,8 +460,13 @@ func main() {
 				continue
 			}
 
-			if buf[0] == 'N' && buf[1] == '2' && buf[2] == 'N' && buf[3] == 'P' {
+			// ★ 打洞握手：Punch 和 ACK 分开处理，ACK 由 notePeerAck 消费后不再回复
+			if isPunchProbe(buf[:n]) {
 				edge.notePeerProbe(addr)
+				continue
+			}
+			if isPunchAck(buf[:n]) {
+				edge.notePeerAck(addr)
 				continue
 			}
 		}
@@ -561,7 +571,6 @@ func (e *Edge) reportMetadata() {
 		metaPayload["assistedEndpoints"] = nm.AllEndpoints
 	}
 
-	// ★ 上报本机 LAN 地址（同 WiFi 直连用）
 	vip := e.getVirtualIPLocked()
 	if lanEndpoints := collectLANEndpoints(e.udpPort, vip); len(lanEndpoints) > 0 {
 		metaPayload["lanEndpoints"] = lanEndpoints
@@ -846,6 +855,10 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			e.relayMgr.ClearPeer(from)
 		}
 
+		if e.punchAckLimiter != nil { // ★ 新增
+			e.punchAckLimiter.forget(from)
+		}
+
 		natHoleActiveMu.Lock()
 		delete(failCounts, from)
 		delete(natHoleActive, from)
@@ -947,7 +960,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
 	}
 
-	// LAN 地址同子网优先排序
 	vip := e.getVirtualIPLocked()
 	prefixes := localPrefixes(vip)
 	sortedLAN := sortLANByAffinity(lanEndpoints, prefixes)
@@ -1029,7 +1041,7 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	}
 
 	if res.State == PunchStateSucceeded {
-		e.relayMgr.MarkP2P(instr.TargetMac)
+		e.relayMgr.MarkP2PAvailable(instr.TargetMac)
 	} else if res.State == PunchStateFailed {
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
@@ -1038,6 +1050,8 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	switch e.relayMgr.GetState(instr.TargetMac) {
 	case ConnP2P:
 		p2pStatus = 3
+	case ConnP2PAvailable:
+		p2pStatus = 2
 	case ConnTURN, ConnRelay:
 		p2pStatus = 2
 	}
@@ -1058,25 +1072,35 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
-// ============ peer 探测处理 ============
+// ============ peer 探测处理（★ 全段重写） ============
 
 func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, false, false)
+	e.notePeerCommon(addr, false, false, false)
+}
+
+func (e *Edge) notePeerAck(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false, false, true)
 }
 
 func (e *Edge) notePeerProbeTURN(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, false, true)
+	e.notePeerCommon(addr, false, true, false)
 }
 
 func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, true, false)
+	e.notePeerCommon(addr, true, false, false)
 }
 
 func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, true, true)
+	e.notePeerCommon(addr, true, true, false)
 }
 
-func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) {
+// notePeerCommon 是打洞握手路径的统一入口。
+//
+// 与项目一/二的 punch.go 对齐三件事：
+//  1. Punch 与 ACK 分开处理，ACK **绝不回复**
+//  2. 收到 Punch 或 ACK 都升级到 P2PAvailable（打洞握手成功，未验证数据面）
+//  3. 只有收到真实 P2P 数据帧才升级到 P2P
+func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
 	e.peersMu.Lock()
@@ -1103,52 +1127,47 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool) 
 	if isRealData {
 		best.hasRealData = true
 	}
+	// 观测 raddr：无论 Punch 还是 ACK，都把对端实际源地址记下来。
 	best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
 	clientID := best.ClientID
 	ip := addr.IP.String()
-
-	needReply := false
-	if !isRealData && !best.probeReplied {
-		best.probeReplied = true
-		needReply = true
-	}
 	e.peersMu.Unlock()
 
 	if e.relayMgr == nil {
 		return
 	}
 
+	// ---- 1. 真实数据帧：直接升 P2P（最高优先级）----
 	if isRealData {
-		state := e.relayMgr.GetState(clientID)
-		if state != ConnP2P {
-			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧，升级为 P2P", clientID, ip)
+		if e.relayMgr.GetState(clientID) != ConnP2P {
+			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧 → P2P 直连", clientID, ip)
 			e.relayMgr.MarkP2P(clientID)
 		}
 		return
 	}
 
-	if !needReply {
+	// ---- 2. Punch / ACK：打洞握手成功，升级到 P2PAvailable ----
+	curState := e.relayMgr.GetState(clientID)
+	if curState != ConnP2P && curState != ConnP2PAvailable {
+		kind := "Punch"
+		if isAck {
+			kind = "ACK"
+		}
+		log.Printf("[P2P] 从 %s (%s) 收到 %s → P2PAvailable（等待数据帧验证）", clientID, ip, kind)
+		e.relayMgr.MarkP2PAvailable(clientID)
+	}
+
+	// ---- 3. ★ 只对 Punch 回 ACK，对 ACK 绝不回复 ----
+	if isAck {
+		return
+	}
+	if e.punchAckLimiter == nil || !e.punchAckLimiter.allow(clientID, time.Now()) {
 		return
 	}
 
-	if e.relayMgr.GetState(clientID) != ConnP2P {
-		log.Printf("[P2P] 从 %s (%s) 收到打洞探测，上报 P2P 并回 5 轮", clientID, ip)
-		e.relayMgr.MarkP2P(clientID)
-	}
-
-	safeGo("probe-reply-5", func() {
-		probe := buildPunchProbe(e.getVirtualIPLocked())
-		for i := 0; i < 5; i++ {
-			select {
-			case <-e.doneCh:
-				return
-			default:
-			}
-			e.writeProbe(addr, probe, viaTURN)
-			if i < 4 {
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
+	safeGo("punch-ack", func() {
+		ack := buildPunchAck()
+		e.writeProbe(addr, ack, viaTURN)
 	})
 }
 
@@ -1343,7 +1362,6 @@ func readNameservers(path string) []string {
 
 // ============ LAN 地址探测（同 WiFi 直连用） ============
 
-// collectLANEndpoints 收集本机所有私有网段 IPv4 地址（每条配 P2P 端口）。
 func collectLANEndpoints(port int, selfVIP string) []string {
 	var result []string
 	ifaces, err := net.Interfaces()
@@ -1394,7 +1412,6 @@ func collectLANEndpoints(port int, selfVIP string) []string {
 	return result
 }
 
-// isPrivateIPv4 RFC1918 私有段
 func isPrivateIPv4(ip net.IP) bool {
 	ip4 := ip.To4()
 	if ip4 == nil {
@@ -1412,7 +1429,6 @@ func isPrivateIPv4(ip net.IP) bool {
 	return false
 }
 
-// isCGNATOverlay 判断是否在 100.64.0.0/10（RFC6598）段
 func isCGNATOverlay(ip net.IP) bool {
 	ip4 := ip.To4()
 	if ip4 == nil {
@@ -1421,7 +1437,6 @@ func isCGNATOverlay(ip net.IP) bool {
 	return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
 }
 
-// localPrefixes 收集本机所有有效 IPv4 子网前缀（用于同子网优先级排序）
 func localPrefixes(selfVIP string) []*net.IPNet {
 	var result []*net.IPNet
 	ifaces, err := net.Interfaces()
@@ -1460,7 +1475,6 @@ func localPrefixes(selfVIP string) []*net.IPNet {
 	return result
 }
 
-// sortLANByAffinity 同子网的 LAN 地址排前面
 func sortLANByAffinity(lan []string, prefixes []*net.IPNet) []string {
 	if len(lan) < 2 || len(prefixes) == 0 {
 		return lan
