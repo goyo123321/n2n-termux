@@ -177,17 +177,22 @@ func parseSTUNMsg(data []byte) (*stunMessage, error) {
 	}, nil
 }
 
-// xorEncodePeer 编码 XOR-PEER-ADDRESS。
+// xorEncodePeer 编码 XOR-PEER-ADDRESS（RFC 5389 §15.2）。
 //
-// ★ 只保留这个函数。
-//   xorDecodePeer 和 magicBytes 在 nat_probe.go 里已定义，本文件不再重复。
+// IPv4：buf[4:8] = v4 ^ magicCookie
+// IPv6：buf[4:20] = v6 ^ magicCookie（循环 XOR）
+//
+// ★ 修复：早先的版本多 XOR 了一个 0x21，导致所有 XOR-PEER-ADDRESS
+// 属性的编码都是错的 —— TURN 服务器会往错误的地址发数据，
+// Send Indication 和 CreatePermission 全部失效，TURN 中继实际
+// 完全不可用。magicBytes 在 nat_probe.go 定义。
 func xorEncodePeer(ip net.IP, port int) []byte {
 	if v4 := ip.To4(); v4 != nil {
 		buf := make([]byte, 8)
 		buf[1] = 0x01
 		binary.BigEndian.PutUint16(buf[2:4], uint16(port)^0x2112)
 		for i := 0; i < 4; i++ {
-			buf[4+i] = v4[i] ^ 0x21 ^ byte(i*0) ^ [4]byte{0x21, 0x12, 0xA4, 0x42}[i]
+			buf[4+i] = v4[i] ^ magicBytes[i]
 		}
 		return buf
 	}
@@ -196,7 +201,7 @@ func xorEncodePeer(ip net.IP, port int) []byte {
 		buf[1] = 0x02
 		binary.BigEndian.PutUint16(buf[2:4], uint16(port)^0x2112)
 		for i := 0; i < 16; i++ {
-			buf[4+i] = v6[i] ^ [4]byte{0x21, 0x12, 0xA4, 0x42}[i%4]
+			buf[4+i] = v6[i] ^ magicBytes[i%4]
 		}
 		return buf
 	}
@@ -294,8 +299,6 @@ func (t *TURNLite) dispatch(msg *stunMessage) {
 }
 
 // Allocate 建立 TURN 分配。
-//
-// ★ n2n-termux 版：直接用 net.DialTimeout，无 protector。
 func (t *TURNLite) Allocate() error {
 	if t.useTCP {
 		log.Printf("[TURN-Lite] TCP transport → %s", t.serverAddr)
@@ -372,7 +375,7 @@ func (t *TURNLite) Allocate() error {
 
 func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 	relayData := resp.attrs[attrXorRelayedAddr]
-	ip, port, err := xorDecodePeer(relayData) // ← 用 nat_probe.go 里的
+	ip, port, err := xorDecodePeer(relayData)
 	if err != nil {
 		return fmt.Errorf("解析 relay 失败: %w", err)
 	}
@@ -561,7 +564,7 @@ func (t *TURNLite) handleIncoming(data []byte) {
 		if peerData == nil || dataPayload == nil {
 			return
 		}
-		ip, port, err := xorDecodePeer(peerData) // ← 用 nat_probe.go 里的
+		ip, port, err := xorDecodePeer(peerData)
 		if err != nil {
 			return
 		}
