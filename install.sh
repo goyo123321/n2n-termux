@@ -10,6 +10,9 @@
 #   SIGNALING_URL="wss://xxx" ROOM_ID="myroom" CLIENT_ID="termux-a" \
 #     AUTO_START=1 bash install.sh
 #
+# 指定版本（跳过 GitHub API）：
+#   VERSION=v1.1.10 bash install.sh
+#
 set -e
 
 # ============================================================
@@ -29,8 +32,8 @@ err()  { echo -e "${RED}[✗]${NC} $1" >&2; }
 # ============================================================
 # 配置
 # ============================================================
-REPO="${REPO:-goyo123321/n2n-termux}"     # ★ 改成你的 GitHub 用户名
-VERSION="${VERSION:-latest}"              # latest 或 v1.0.0
+REPO="${REPO:-goyo123321/n2n-termux}"
+VERSION="${VERSION:-latest}"
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.n2n-termux}"
 BIN_DIR="$INSTALL_DIR/bin"
@@ -82,7 +85,6 @@ detect_arch() {
             GOARCH="amd64"
             ;;
         armv8l)
-            # 32 位系统跑在 64 位 CPU 上
             GOARCH="armv7"
             ;;
         i686|i386)
@@ -199,17 +201,62 @@ resolve_version() {
     fi
 
     log "查询最新版本..."
-    local tag
-    tag=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" \
-        | grep '"tag_name"' | head -1 | sed 's/.*: "\(.*\)".*/\1/')
 
-    if [ -z "$tag" ]; then
-        err "无法获取最新版本号"
-        err "手动指定：VERSION=v1.0.0 bash install.sh"
+    local resp code body tag
+    # 抓 HTTP 状态码 + body
+    resp=$(curl -sSL -w "\n__HTTP_CODE__:%{http_code}" \
+        "https://api.github.com/repos/$REPO/releases/latest" 2>&1) || {
+        err "无法访问 GitHub API（网络问题？）"
+        err "  测试网络: curl -I https://api.github.com"
+        err "  手动指定：VERSION=v1.1.10 bash install.sh"
         exit 1
-    fi
+    }
 
-    echo "$tag"
+    code=$(echo "$resp" | grep -oE '__HTTP_CODE__:[0-9]+' | cut -d: -f2 | tail -1)
+    body=$(echo "$resp" | sed 's/__HTTP_CODE__:[0-9]*$//')
+
+    case "$code" in
+        200)
+            tag=$(echo "$body" | grep -m1 '"tag_name"' | sed 's/.*: "\(.*\)".*/\1/')
+            if [ -z "$tag" ]; then
+                err "GitHub API 返回 200 但解析不出 tag_name"
+                err "  响应前 200 字节："
+                echo "$body" | head -c 200
+                echo ""
+                err "  手动指定：VERSION=v1.1.10 bash install.sh"
+                exit 1
+            fi
+            echo "$tag"
+            ;;
+        404)
+            err "仓库 $REPO 没有任何 Release"
+            err ""
+            err "解决方法（三选一）："
+            err "  1. 去 GitHub 发布 Release："
+            err "     https://github.com/$REPO/releases/new"
+            err "     上传 Actions Artifact 里的二进制（n2n-client-linux-*）"
+            err "  2. 手动下载二进制放到 $BIN/n2n-client"
+            err "  3. 指定已有版本：VERSION=v1.1.10 bash install.sh"
+            exit 1
+            ;;
+        403)
+            err "GitHub API 限流（HTTP 403）"
+            err "  稍后重试，或指定版本：VERSION=v1.1.10 bash install.sh"
+            exit 1
+            ;;
+        000|"")
+            err "无法连接 GitHub API（网络不通）"
+            err "  测试：curl -I https://api.github.com"
+            err "  手动指定：VERSION=v1.1.10 bash install.sh"
+            exit 1
+            ;;
+        *)
+            err "GitHub API 请求失败（HTTP $code）"
+            echo "$body" | head -c 200
+            echo ""
+            exit 1
+            ;;
+    esac
 }
 
 # ============================================================
@@ -241,11 +288,26 @@ download_binary() {
         echo ""
         echo "可能原因："
         echo "  1. 版本号不存在: $tag"
-        echo "  2. Release 未发布（工作流里勾了 publish？）"
+        echo "  2. Release 未上传对应架构的二进制: $file"
         echo "  3. GitHub 网络问题"
         echo ""
-        echo "手动检查："
-        echo "  https://github.com/$REPO/releases"
+        echo "手动检查 Release Assets："
+        echo "  https://github.com/$REPO/releases/tag/$tag"
+        exit 1
+    fi
+
+    # ★ 校验是不是真 ELF（\x7fELF = 7f 45 4c 46）
+    local magic
+    magic=$(head -c 4 "$BIN" | od -An -tx1 | tr -d ' \n')
+    if [ "$magic" != "7f454c46" ]; then
+        err "下载的文件不是 ELF 二进制（可能是 HTML 错误页）"
+        echo "  文件头 64 字节："
+        head -c 64 "$BIN" | od -c
+        echo ""
+        echo "  文件实际内容前 200 字节："
+        head -c 200 "$BIN"
+        echo ""
+        rm -f "$BIN"
         exit 1
     fi
 
@@ -253,7 +315,7 @@ download_binary() {
 
     # 校验 sha256（可选，失败不阻断）
     local expected actual
-    if expected=$(curl -sSL --fail "$sha_url" 2>/dev/null | awk '{print $1}'); then
+    if expected=$(curl -sSL --fail "$sha_url" 2>/dev/null | awk '{print $1}') && [ -n "$expected" ]; then
         actual=$(sha256sum "$BIN" | awk '{print $1}')
         if [ "$expected" = "$actual" ]; then
             ok "sha256 校验通过"
@@ -324,8 +386,27 @@ main() {
     check_env
     detect_arch
 
-    # 配置：已有 → 询问是否重配；没有 → 交互输入
-    if [ -f "$CONFIG_FILE" ] && [ -z "$SIGNALING_URL" ]; then
+    # ★ 配置阶段：AUTO_START 优先级最高
+    if [ "$AUTO_START" = "1" ]; then
+        # 非交互模式
+        if [ -n "$SIGNALING_URL" ]; then
+            # 环境变量齐全 → 保存覆盖
+            log "非交互模式：使用环境变量配置"
+            save_config
+        elif [ -f "$CONFIG_FILE" ]; then
+            # 无环境变量但有配置文件 → 用现成的
+            log "非交互模式：使用已有配置 $CONFIG_FILE"
+            set -a
+            # shellcheck disable=SC1090
+            source "$CONFIG_FILE"
+            set +a
+        else
+            err "AUTO_START=1 但既没有 SIGNALING_URL 也没有配置文件"
+            err "  至少提供: SIGNALING_URL=wss://... AUTO_START=1 bash install.sh"
+            exit 1
+        fi
+    elif [ -f "$CONFIG_FILE" ] && [ -z "$SIGNALING_URL" ]; then
+        # 交互模式 + 已有配置
         warn "已存在配置: $CONFIG_FILE"
         read -rp "重新配置？(y/N): " input
         if [[ ! "$input" =~ ^[Yy]$ ]]; then
@@ -339,6 +420,7 @@ main() {
             save_config
         fi
     else
+        # 交互模式 + 没有配置 / 有环境变量
         ask_config
         save_config
     fi
