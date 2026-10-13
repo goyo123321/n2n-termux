@@ -74,7 +74,6 @@ type Edge struct {
 	p2pStreams *P2PStreamManager
 	socks5Srv  *Socks5Server
 
-	// ★ 新增：ACK 限流器（按 peer 500ms 一次）
 	punchAckLimiter *punchAckLimiter
 
 	doneCh  chan struct{}
@@ -332,7 +331,7 @@ func main() {
 		doneCh:         make(chan struct{}),
 		streamMgr:      NewAppStreamManager(),
 	}
-	edge.punchAckLimiter = newPunchAckLimiter() // ★ 新增
+	edge.punchAckLimiter = newPunchAckLimiter()
 
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: udpPort}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
@@ -376,7 +375,7 @@ func main() {
 		if edge.p2pStreams != nil {
 			edge.p2pStreams.closeAll()
 		}
-		if edge.punchAckLimiter != nil { // ★ 新增
+		if edge.punchAckLimiter != nil {
 			edge.punchAckLimiter.clear()
 		}
 
@@ -410,7 +409,6 @@ func main() {
 			edge.handleP2PFrame(ua, true, data)
 			return
 		}
-		// ★ Punch 和 ACK 分开处理
 		if isPunchProbe(data) {
 			edge.notePeerProbeTURN(ua)
 			return
@@ -460,7 +458,6 @@ func main() {
 				continue
 			}
 
-			// ★ 打洞握手：Punch 和 ACK 分开处理，ACK 由 notePeerAck 消费后不再回复
 			if isPunchProbe(buf[:n]) {
 				edge.notePeerProbe(addr)
 				continue
@@ -855,7 +852,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			e.relayMgr.ClearPeer(from)
 		}
 
-		if e.punchAckLimiter != nil { // ★ 新增
+		if e.punchAckLimiter != nil {
 			e.punchAckLimiter.forget(from)
 		}
 
@@ -1034,6 +1031,17 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	}
 }
 
+// runNatHole 执行一次打洞指令，并在成功时主动触发 P2P 数据面探针。
+//
+// ★ 修复：打洞成功后不等上层应用流量，立刻发一个 P2P PING 探针。
+//
+// 原因：打洞握手成功只证明 NAT 映射打开，状态升级到 P2PAvailable。
+// 要升级到 P2P（数据面验证），必须有真实 P2P 数据帧到达。
+// SOCKS5 只在应用发起连接时建 stream，如果双方都没流量，就永远不会
+// 升级，服务端会以为打洞没成而反复下发指令，形成死循环。
+//
+// 主动发 PING 探针：对端收到会走 handleP2PFrame → MarkP2P 并回 PONG；
+// 本端收到 PONG 也 MarkP2P。双方在 1 个 RTT 内完成 P2P 升级。
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
 	if res == nil {
@@ -1042,6 +1050,13 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 
 	if res.State == PunchStateSucceeded {
 		e.relayMgr.MarkP2PAvailable(instr.TargetMac)
+
+		// ★ 主动发 P2P PING 探针
+		if e.p2pStreams != nil {
+			safeGo("p2p-probe", func() {
+				e.p2pStreams.sendP2PProbe(instr.TargetMac)
+			})
+		}
 	} else if res.State == PunchStateFailed {
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
@@ -1072,7 +1087,7 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
-// ============ peer 探测处理（★ 全段重写） ============
+// ============ peer 探测处理 ============
 
 func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, false, false, false)
@@ -1096,10 +1111,11 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 是打洞握手路径的统一入口。
 //
-// 与项目一/二的 punch.go 对齐三件事：
+// 与项目一/二的 punch.go 对齐四件事：
 //  1. Punch 与 ACK 分开处理，ACK **绝不回复**
 //  2. 收到 Punch 或 ACK 都升级到 P2PAvailable（打洞握手成功，未验证数据面）
 //  3. 只有收到真实 P2P 数据帧才升级到 P2P
+//  4. ★ 首次进入 P2PAvailable 时主动发 P2P PING 探针
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1127,7 +1143,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	if isRealData {
 		best.hasRealData = true
 	}
-	// 观测 raddr：无论 Punch 还是 ACK，都把对端实际源地址记下来。
 	best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
 	clientID := best.ClientID
 	ip := addr.IP.String()
@@ -1148,6 +1163,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 
 	// ---- 2. Punch / ACK：打洞握手成功，升级到 P2PAvailable ----
 	curState := e.relayMgr.GetState(clientID)
+	justUpgraded := false
 	if curState != ConnP2P && curState != ConnP2PAvailable {
 		kind := "Punch"
 		if isAck {
@@ -1155,9 +1171,21 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		}
 		log.Printf("[P2P] 从 %s (%s) 收到 %s → P2PAvailable（等待数据帧验证）", clientID, ip, kind)
 		e.relayMgr.MarkP2PAvailable(clientID)
+		justUpgraded = true
 	}
 
-	// ---- 3. ★ 只对 Punch 回 ACK，对 ACK 绝不回复 ----
+	// ★ 首次进入 P2PAvailable：主动发 P2P PING 探针，触发数据面验证。
+	//
+	// 打洞握手成功只证明 NAT 映射打开，不证明数据面能过。
+	// 上层应用未必立刻有流量，所以需要客户端自己发一个探针帧来
+	// 触发双向 MarkP2P。
+	if justUpgraded && e.p2pStreams != nil {
+		safeGo("p2p-probe", func() {
+			e.p2pStreams.sendP2PProbe(clientID)
+		})
+	}
+
+	// ---- 3. 只对 Punch 回 ACK，对 ACK 绝不回复 ----
 	if isAck {
 		return
 	}
