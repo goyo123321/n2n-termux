@@ -98,7 +98,19 @@ Worker WSS 地址: wss://edge-signal.<你的子域>.workers.dev
 显示名 NODE_NAME: Termux-A
 SOCKS5 监听地址 (127.0.0.1:1080):     ← 直接回车
 ```
-非交互式部署（推荐）
+## install.sh 指定版本（推荐）
+
+```bash
+VERSION=v1.1.10 \
+SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
+ROOM_ID="myroom" \
+CLIENT_ID="termux-a" \
+NODE_NAME="Termux-A" \
+AUTO_START=1 \
+bash ~/install-n2n.sh
+```
+
+## 非交互式部署（推荐）
 
 ```bash
 SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
