@@ -177,15 +177,6 @@ func parseSTUNMsg(data []byte) (*stunMessage, error) {
 	}, nil
 }
 
-// xorEncodePeer 编码 XOR-PEER-ADDRESS（RFC 5389 §15.2）。
-//
-// IPv4：buf[4:8] = v4 ^ magicCookie
-// IPv6：buf[4:20] = v6 ^ magicCookie（循环 XOR）
-//
-// ★ 修复：早先的版本多 XOR 了一个 0x21，导致所有 XOR-PEER-ADDRESS
-// 属性的编码都是错的 —— TURN 服务器会往错误的地址发数据，
-// Send Indication 和 CreatePermission 全部失效，TURN 中继实际
-// 完全不可用。magicBytes 在 nat_probe.go 定义。
 func xorEncodePeer(ip net.IP, port int) []byte {
 	if v4 := ip.To4(); v4 != nil {
 		buf := make([]byte, 8)
@@ -298,7 +289,6 @@ func (t *TURNLite) dispatch(msg *stunMessage) {
 	}
 }
 
-// Allocate 建立 TURN 分配。
 func (t *TURNLite) Allocate() error {
 	if t.useTCP {
 		log.Printf("[TURN-Lite] TCP transport → %s", t.serverAddr)
@@ -393,7 +383,12 @@ func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 	return nil
 }
 
-func (t *TURNLite) ensurePermission(ip net.IP) error {
+// ★ 修复：ensurePermission 加 port 参数。
+//
+// 旧版传 port=0，coturn 对 XOR-PEER-ADDRESS 的 port 做合法性检查，
+// port=0 会被静默丢弃（不返回 error，直接不响应）→ CreatePermission
+// 请求超时 → TURN 中继实际不可用。
+func (t *TURNLite) ensurePermission(ip net.IP, port int) error {
 	key := ip.String()
 	t.permMu.Lock()
 	last, exists := t.permissions[key]
@@ -403,7 +398,8 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 		return nil
 	}
 
-	peerData := xorEncodePeer(ip, 0)
+	// ★ 用真实端口，coturn 拒绝 port=0
+	peerData := xorEncodePeer(ip, port)
 
 	resp, err := t.sendRequest(msgCreatePermissionReq, []stunAttr{
 		{typ: attrXorPeerAddress, value: peerData},
@@ -447,6 +443,7 @@ func (t *TURNLite) ensurePermission(ip net.IP) error {
 	return nil
 }
 
+// ★ 修复：SendTo 传真实端口给 ensurePermission。
 func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if t.conn == nil {
 		return fmt.Errorf("TURN 未就绪")
@@ -454,7 +451,7 @@ func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if len(data) == 0 {
 		return nil
 	}
-	if err := t.ensurePermission(peerAddr.IP); err != nil {
+	if err := t.ensurePermission(peerAddr.IP, peerAddr.Port); err != nil {
 		return err
 	}
 	peerData := xorEncodePeer(peerAddr.IP, peerAddr.Port)
@@ -583,7 +580,6 @@ func (t *TURNLite) handleIncoming(data []byte) {
 	}
 }
 
-// refreshLoop 处理 Refresh 响应。
 func (t *TURNLite) refreshLoop() {
 	defer func() {
 		if r := recover(); r != nil {
