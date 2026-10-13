@@ -105,9 +105,7 @@ type P2PStream struct {
 	peerAddr *net.UDPAddr
 	viaTURN  bool
 
-	// ★ 新增：最近一次成功收到对端帧的源地址，优先作为发送目标
-	// 收到对端任何 N2NS 帧时更新。比 peerAddr 更可信，因为它是
-	// "对端的包实际从哪来"的观测事实。
+	// 最近一次成功收到对端帧的源地址，优先作为发送目标
 	lastRecvFrom *net.UDPAddr
 
 	sendNext uint32
@@ -249,23 +247,13 @@ func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 	}
 }
 
-// ============================================================
-// ★ 修复：sendP2PFrame 多目标发送
+// collectN2NSTargets 收集一个 stream 的所有候选发送地址。
 //
-// 背景：CGNAT 场景下对端的 STUN 反射地址（peerAddr）在某一方向
-// 可能不可达。之前只发这一个地址，导致 SYN 超时后静默回落到 WS，
-// 面板显示 p2p 但实际走中继。
-//
-// 修复：把帧同时发到所有候选地址：
+// 优先级：
 //   1. LAN 地址（同 WiFi 场景）
 //   2. s.lastRecvFrom（对端最近一次发来的源地址，最可信）
 //   3. s.peerAddr（SYN 来源地址或注册时分配的地址）
 //   4. peer 记录的 UDPAddr（观测 raddr）
-//
-// 重复帧由接收端的序列号去重（recvNext）自动丢弃，不会重复处理。
-// ============================================================
-
-// collectN2NSTargets 收集一个 stream 的所有候选发送地址。
 func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	s.mu.Lock()
 	primary := s.peerAddr
@@ -296,31 +284,19 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 		out = append(out, a)
 	}
 
-	// 1. LAN 优先
 	for _, lan := range lanEndpoints {
 		if ra, err := net.ResolveUDPAddr("udp", lan); err == nil {
 			add(ra)
 		}
 	}
-	// 2. 最近一次收到对端帧的源地址（最可信）
 	add(lastRecv)
-	// 3. stream 的 peerAddr
 	add(primary)
-	// 4. peer 记录的观测 raddr
 	add(peerUDPAddr)
 
 	return out
 }
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
-//
-// 优先级：
-//   - LAN 地址
-//   - 最近收到对端帧的源地址
-//   - stream 的 peerAddr
-//   - peer 记录的观测 raddr
-//
-// TURN 模式只走 TURN（TURN 有自己的权限控制，不广播）。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -329,7 +305,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 
 	buf := encodeP2PFrame(f)
 
-	// TURN 模式：只走 TURN
 	if viaTURN {
 		if e.turnClient == nil || !e.turnClient.IsReady() {
 			return errors.New("turn down")
@@ -351,7 +326,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		return e.turnClient.Send(buf, ra)
 	}
 
-	// P2P 模式：多目标发送
 	targets := e.collectN2NSTargets(s)
 	if len(targets) == 0 {
 		return errors.New("no targets for N2NS frame")
@@ -379,6 +353,11 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 }
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
+//
+// ★ 关键修复：只有真实数据帧（SYN/SYNACK/DATA/ACK/FIN/RST）才触发
+//   MarkP2P。PING/PONG 是探针，不算数据面验证 —— 否则 CGNAT hairpin
+//   场景下 PING 能到但 DATA 到不了，会被误判为 P2P 成功，导致 SOCKS5
+//   每次 CONNECT 都尝试 P2P stream，2 秒超时后回落 WS，白白增加延迟。
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -392,10 +371,14 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 		return
 	}
 
+	// 只有真实数据帧才升级到 P2P；PING/PONG 不算
 	if e.relayMgr != nil {
-		if e.relayMgr.GetState(peerID) != ConnP2P {
-			log.Printf("[P2P] 收到真实 P2P 数据帧（stream=%d）→ P2P 直连", f.StreamID)
-			e.relayMgr.MarkP2P(peerID)
+		if f.Type != p2pTypePING && f.Type != p2pTypePONG {
+			if e.relayMgr.GetState(peerID) != ConnP2P {
+				log.Printf("[P2P] 收到真实 P2P 数据帧（stream=%d type=%d）→ P2P 直连",
+					f.StreamID, f.Type)
+				e.relayMgr.MarkP2P(peerID)
+			}
 		}
 	}
 
@@ -410,13 +393,11 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
 
-	// 精确匹配
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) && p.UDPAddr.Port == addr.Port {
 			return id
 		}
 	}
-	// LAN 地址匹配
 	for id, p := range e.peers {
 		for _, lan := range p.LanEndpoints {
 			la, err := net.ResolveUDPAddr("udp", lan)
@@ -428,7 +409,6 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 			}
 		}
 	}
-	// IP-only 匹配
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) {
 			return id
@@ -482,7 +462,6 @@ func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localCon
 	s.recvNext = 1
 	s.mu.Unlock()
 
-	// ★ 首发 SYN 时已经走多目标发送
 	if err := m.edge.sendP2PFrame(s, syn); err != nil {
 		m.remove(s.ID)
 		s.abortNoConn()
@@ -532,10 +511,7 @@ func (s *P2PStream) abortNoConn() {
 	close(s.closeCh)
 }
 
-// acceptSYN 处理收到的 SYN 帧。
-//
-// ★ 修复：幂等检查。多目标发送会导致同一个 SYN 从不同源地址到达多次，
-// 必须保证只创建一次 stream，否则会不断覆盖 byID 并泄漏 goroutine。
+// acceptSYN 处理收到的 SYN 帧。幂等：多目标发送会导致同一 SYN 到达多次。
 func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	if len(f.Payload) < 4 {
 		return
@@ -545,7 +521,6 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 		return
 	}
 
-	// ★ 幂等：已有同 ID stream → 直接重发 SYNACK，不再创建新的
 	if existing := m.get(f.StreamID); existing != nil {
 		existing.mu.Lock()
 		existing.lastRecvFrom = peerAddr
@@ -589,7 +564,6 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 	}
 	s.establishedCh <- true
 
-	// ★ 二次检查：在 add 之前再查一次，防竞态
 	m.mu.Lock()
 	if _, dup := m.byID[s.ID]; dup {
 		m.mu.Unlock()
@@ -621,8 +595,6 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 }
 
 // handleFrame 处理收到的 P2P 帧。
-//
-// ★ 更新：记录 lastRecvFrom，让 sendP2PFrame 优先用这个地址。
 func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	s := m.get(f.StreamID)
 
@@ -652,7 +624,6 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 
 	s.mu.Lock()
 	s.peerAddr = peerAddr
-	// ★ 记录最近一次收到对端帧的源地址
 	s.lastRecvFrom = peerAddr
 	s.viaTURN = viaTURN
 	s.lastAct = time.Now()
