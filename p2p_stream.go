@@ -183,7 +183,6 @@ func (m *P2PStreamManager) closeAll() {
 	}
 }
 
-// dropPeer 关闭并清理指定 peer 的所有 stream。
 func (m *P2PStreamManager) dropPeer(peerID string) {
 	if m == nil || peerID == "" {
 		return
@@ -248,12 +247,6 @@ func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 }
 
 // collectN2NSTargets 收集一个 stream 的所有候选发送地址。
-//
-// 优先级：
-//   1. LAN 地址（同 WiFi 场景）
-//   2. s.lastRecvFrom（对端最近一次发来的源地址，最可信）
-//   3. s.peerAddr（SYN 来源地址或注册时分配的地址）
-//   4. peer 记录的 UDPAddr（观测 raddr）
 func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	s.mu.Lock()
 	primary := s.peerAddr
@@ -296,7 +289,6 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	return out
 }
 
-// sendP2PFrame 发送一帧到对端的所有候选地址。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -354,10 +346,17 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ 关键修复：只有真实数据帧（SYN/SYNACK/DATA/ACK/FIN/RST）才触发
-//   MarkP2P。PING/PONG 是探针，不算数据面验证 —— 否则 CGNAT hairpin
-//   场景下 PING 能到但 DATA 到不了，会被误判为 P2P 成功，导致 SOCKS5
-//   每次 CONNECT 都尝试 P2P stream，2 秒超时后回落 WS，白白增加延迟。
+// ★ 修复：PING/PONG 的语义区分。
+//
+//   收到 PING  → 只证明"对端→本端"单向可达，不升级本端状态，
+//                仅回一个 PONG 让对端确认双向。
+//
+//   收到 PONG  → 本端发出的 PING 到达了对端，且对端回了 PONG。
+//                双向通道已被证明 → 这是真正的数据面验证 → MarkP2P。
+//
+//   之前把 PING 和 PONG 一起过滤，导致两端都停留在 P2PAvailable，
+//   socks5.go 的 useP2P 判断永远为 false，所有 SOCKS5 连接都走
+//   WS 中继——"打洞成功但数据面不过"的根因就在这。
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -371,11 +370,21 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 		return
 	}
 
-	// 只有真实数据帧才升级到 P2P；PING/PONG 不算
 	if e.relayMgr != nil {
-		if f.Type != p2pTypePING && f.Type != p2pTypePONG {
+		switch f.Type {
+		case p2pTypePING:
+			// PING 到达只证明"对端→本端"单向通
+			// 本端不升级，等对端回 PONG 后再升级
+		case p2pTypePONG:
+			// ★ PONG 收到：双向通道已被证明
 			if e.relayMgr.GetState(peerID) != ConnP2P {
-				log.Printf("[P2P] 收到真实 P2P 数据帧（stream=%d type=%d）→ P2P 直连",
+				log.Printf("[P2P] 收到 PONG → P2P 直连（双向通道已验证）")
+				e.relayMgr.MarkP2P(peerID)
+			}
+		default:
+			// SYN/SYNACK/DATA/ACK/FIN/RST 都是真实数据帧
+			if e.relayMgr.GetState(peerID) != ConnP2P {
+				log.Printf("[P2P] 收到数据帧（stream=%d type=%d）→ P2P 直连",
 					f.StreamID, f.Type)
 				e.relayMgr.MarkP2P(peerID)
 			}
@@ -385,7 +394,6 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 	e.p2pStreams.handleFrame(peerID, peerAddr, viaTURN, f)
 }
 
-// findPeerIDByAddr 按对端地址查 peerID。
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -521,6 +529,7 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 		return
 	}
 
+	// ★ 幂等：多目标发送会导致同一 SYN 到达多次
 	if existing := m.get(f.StreamID); existing != nil {
 		existing.mu.Lock()
 		existing.lastRecvFrom = peerAddr
@@ -594,7 +603,6 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 	safeGo("p2p-tx", func() { s.readLocalAndSend(m.edge) })
 }
 
-// handleFrame 处理收到的 P2P 帧。
 func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	s := m.get(f.StreamID)
 
@@ -652,7 +660,6 @@ func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, via
 	case p2pTypeDATA:
 		s.handleData(m.edge, f)
 	case p2pTypeACK:
-		// ack 已处理
 	case p2pTypeFIN, p2pTypeRST:
 		s.close("peer-close")
 	}
