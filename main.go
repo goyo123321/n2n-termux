@@ -68,11 +68,7 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
-	// ★ 新增：P2PAvailable 30 秒超时降级定时器。
-	//
-	// 打洞握手成功后进入 P2PAvailable，30 秒内如果没升到 P2P
-	// （没收到 PONG 或真实数据帧），强制降级到 TURN/WS。
-	// 用可取消的定时器替代之前匿名的 safeGo("p2p-avail-timeout")。
+	// P2PAvailable 30 秒超时降级定时器
 	p2pAvailTimers   map[string]*time.Timer
 	p2pAvailTimersMu sync.Mutex
 
@@ -194,17 +190,21 @@ func (e *Edge) startP2PKeepalive() {
 	})
 }
 
+// ★ 修复：改用 N2NS PING 多目标发送，替代单目标 Punch。
+//
+// 旧版只往 p.UDPAddr 单目标发 Punch，对称 NAT 老化后这个端口失效，
+// Keepalive 打水漂，P2P 通道在 60 秒内静默死掉。
+//
+// 新版调用 p2pStreams.sendP2PProbe，走 sendP2PFrame → collectN2NSTargets
+// 多目标发送（LAN + assisted + lastRecvFrom + peerAddr + peerUDPAddr），
+// 大幅提升 Keepalive 命中率。
 func (e *Edge) sendP2PKeepalive() {
-	if e.relayMgr == nil || e.udpConn == nil {
+	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
 	}
 
 	e.peersMu.RLock()
-	type target struct {
-		id   string
-		addr *net.UDPAddr
-	}
-	var targets []target
+	var targets []string
 	for id, p := range e.peers {
 		if p.UDPAddr == nil {
 			continue
@@ -213,7 +213,7 @@ func (e *Edge) sendP2PKeepalive() {
 		if st != ConnP2P && st != ConnP2PAvailable {
 			continue
 		}
-		targets = append(targets, target{id: id, addr: p.UDPAddr})
+		targets = append(targets, id)
 	}
 	e.peersMu.RUnlock()
 
@@ -221,9 +221,8 @@ func (e *Edge) sendP2PKeepalive() {
 		return
 	}
 
-	probe := buildPunchProbe(e.getVirtualIPLocked())
-	for _, t := range targets {
-		_, _ = e.udpConn.WriteToUDP(probe, t.addr)
+	for _, id := range targets {
+		e.p2pStreams.sendP2PProbe(id)
 	}
 }
 
@@ -278,16 +277,7 @@ func (e *Edge) cancelFallbackTimer(peerID string) {
 	}
 }
 
-// ★ 新增：P2PAvailable 30 秒超时降级。
-//
-// 打洞握手成功后进入 P2PAvailable，30 秒内如果没有升到 P2P（即没有
-// 收到 PONG 或真实数据帧），强制降级到 TURN/WS。
-//
-// 场景：CGNAT hairpin 场景下握手成功但数据面永远过不去。没有这个
-// 兜底会永远停在 P2PAvailable，SOCKS5 每次都尝试建流 2 秒超时。
-//
-// 用可取消的定时器而非匿名 safeGo，原因：peer 断线重连后旧定时器
-// 会误降级新连接。
+// P2PAvailable 30 秒超时降级。
 func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
 	if e.relayMgr == nil || peerID == "" {
 		return
@@ -385,7 +375,7 @@ func main() {
 		peers:          make(map[string]*PeerInfo),
 		udpPort:        udpPort,
 		fallbackTimers: make(map[string]*time.Timer),
-		p2pAvailTimers: make(map[string]*time.Timer), // ★ 新增
+		p2pAvailTimers: make(map[string]*time.Timer),
 		doneCh:         make(chan struct{}),
 		streamMgr:      NewAppStreamManager(),
 	}
@@ -437,7 +427,6 @@ func main() {
 			edge.punchAckLimiter.clear()
 		}
 
-		// ★ 清理所有 P2PAvailable 超时定时器
 		edge.p2pAvailTimersMu.Lock()
 		for _, t := range edge.p2pAvailTimers {
 			t.Stop()
@@ -585,7 +574,6 @@ func (e *Edge) Stop() {
 	e.fallbackTimers = make(map[string]*time.Timer)
 	e.fallbackTimersMu.Unlock()
 
-	// ★ 新增：清理 P2PAvailable 超时定时器
 	e.p2pAvailTimersMu.Lock()
 	for _, t := range e.p2pAvailTimers {
 		t.Stop()
@@ -892,8 +880,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			if e.relayMgr.GetState(peerID) == ConnP2P {
 				continue
 			}
-			// ★ 用 ForceFallback 而非 MarkFallback：服务端明确要求降级时
-			//   应该绕过 P2PAvailable 保护，直接切到 TURN/WS。
 			e.relayMgr.ForceFallback(peerID, reason)
 		}
 
@@ -928,7 +914,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			e.relayMgr.ClearPeer(from)
 		}
 
-		// ★ 清理 P2PAvailable 超时定时器
 		e.cancelP2PAvailTimeout(from)
 
 		if e.punchAckLimiter != nil {
@@ -1030,7 +1015,14 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
+// registerPeer 注册/更新 peer 信息。
+//
+// ★ 本次修复：加诊断日志，打印服务端下发的原始 lanEndpoints 和
+//   sortLANByAffinity 后的结果，用于定位 LAN 候选丢失。
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
+	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
+		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
+
 	var udpAddr *net.UDPAddr
 	if pubIP != "" && pubPort > 0 {
 		udpAddr = &net.UDPAddr{IP: net.ParseIP(pubIP), Port: pubPort}
@@ -1039,6 +1031,8 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 	vip := e.getVirtualIPLocked()
 	prefixes := localPrefixes(vip)
 	sortedLAN := sortLANByAffinity(lanEndpoints, prefixes)
+
+	log.Printf("[registerPeer] %s: sortedLAN=%v (prefixes=%d)", peerID, sortedLAN, len(prefixes))
 
 	e.peersMu.Lock()
 	_, existed := e.peers[peerID]
@@ -1111,13 +1105,6 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 }
 
 // runNatHole 执行一次打洞指令，并在成功时主动触发 P2P 数据面探针。
-//
-// 打洞成功后不等上层应用流量，立刻发一个 P2P PING 探针。
-// 打洞握手成功只证明 NAT 映射打开，状态升级到 P2PAvailable。
-// 要升级到 P2P（数据面验证），必须有真实 P2P 数据帧到达。
-//
-// 主动发 PING 探针：对端收到会回 PONG；本端收到 PONG 后
-// handleP2PFrame 会 MarkP2P。双方在 1 个 RTT 内完成 P2P 升级。
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
 	if res == nil {
@@ -1127,7 +1114,6 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	if res.State == PunchStateSucceeded {
 		e.relayMgr.MarkP2PAvailable(instr.TargetMac)
 
-		// 主动发 P2P PING 探针
 		if e.p2pStreams != nil {
 			safeGo("p2p-probe", func() {
 				e.p2pStreams.sendP2PProbe(instr.TargetMac)
@@ -1137,8 +1123,7 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
 
-	// ★ 修复：TURN/Relay 不冒充 P2P。只有真正 P2P 才报 3，
-	//   打洞握手成功报 2，其余一律 0，避免误导服务端做交叉校验。
+	// TURN/Relay 不冒充 P2P
 	p2pStatus := 0
 	switch e.relayMgr.GetState(instr.TargetMac) {
 	case ConnP2P:
@@ -1189,11 +1174,11 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 是打洞握手路径的统一入口。
 //
-// 与 PC 端 punch.go 对齐四件事：
+// 规则：
 //  1. Punch 与 ACK 分开处理，ACK **绝不回复**
-//  2. 收到 Punch 或 ACK 都升级到 P2PAvailable（打洞握手成功，未验证数据面）
-//  3. 只有收到真实 P2P 数据帧或 PONG 才升级到 P2P
-//  4. 首次进入 P2PAvailable 时主动发 P2P PING 探针
+//  2. 收到 Punch 或 ACK 都升级到 P2PAvailable
+//  3. 只有收到真实 P2P 数据帧或 PONG 才升级到 P2P（在 handleP2PFrame 里）
+//  4. 首次进入 P2PAvailable 时主动发 P2P PING 探针 + 启动 30s 超时降级
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1230,7 +1215,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// ---- 1. 真实数据帧：直接升 P2P（最高优先级）----
+	// ---- 1. 真实数据帧：直接升 P2P ----
 	if isRealData {
 		if e.relayMgr.GetState(clientID) != ConnP2P {
 			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧 → P2P 直连", clientID, ip)
@@ -1252,14 +1237,13 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		justUpgraded = true
 	}
 
-	// 首次进入 P2PAvailable：主动发 P2P PING 探针 + 启动超时降级定时器
+	// 首次进入 P2PAvailable：主动发 P2P PING 探针 + 启动超时降级
 	if justUpgraded {
 		if e.p2pStreams != nil {
 			safeGo("p2p-probe", func() {
 				e.p2pStreams.sendP2PProbe(clientID)
 			})
 		}
-		// ★ 用可取消的定时器替代匿名 safeGo
 		e.scheduleP2PAvailTimeout(clientID)
 	}
 
@@ -1466,7 +1450,7 @@ func readNameservers(path string) []string {
 	return result
 }
 
-// ============ LAN 地址探测（同 WiFi 直连用） ============
+// ============ LAN 地址探测 ============
 
 func collectLANEndpoints(port int, selfVIP string) []string {
 	var result []string
