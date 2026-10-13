@@ -1,770 +1,686 @@
 # n2n-termux
 
-在 **Android Termux** 里跑的点对点组网客户端。**无需 root，无需 TUN**，通过 **SOCKS5 代理**把应用层流量接入 n2n 虚拟网。
+**n2n 组网系统的 Termux 客户端**——基于 SOCKS5 代理，无需 root。
 
-配合 [edge-signal](https://github.com/goyo123321/edge-signal) 使用，与 [n2n-go-client](https://github.com/goyo123321/n2n-go-client) 和 [n2n-android](https://github.com/goyo123321/n2n-android) 互通。
+配合 [edge-signal](https://github.com/goyo123321/edge-signal) 使用，通过 Cloudflare Workers 信令服务器建立 **LAN 直连 / P2P / TURN / WebSocket 中继** 四级降级连接。
+
+**与 [n2n-go-client](https://github.com/goyo123321/n2n-go-client)、[n2n-android](https://github.com/goyo123321/n2n-android) 完全互通**——Termux 通过 SOCKS5 访问其他节点的服务，反之亦然。
+
+---
+
+## 🌐 四端协同全景
+
+```
+              ┌───────────────────────────────────────────┐
+              │      edge-signal (Cloudflare Worker)      │
+              │  ├─ 信令路由                              │
+              │  ├─ NAT 打洞协调                          │
+              │  ├─ TURN 凭证下发                         │
+              │  └─ WS 中继（最后兜底）                   │
+              └──────────────┬────────────────────────────┘
+                             │
+         ┌───────────────────┼───────────────────┐
+         │                   │                   │
+         ▼                   ▼                   ▼
+   n2n-go-client       n2n-termux          n2n-android
+   ┌──────────┐       ┌──────────┐        ┌──────────┐
+   │ TUN 模式  │       │ SOCKS5   │        │ VpnService│
+   │ 系统级路由│       │ 代理模式 │        │ 无 root  │
+   │ 需 root  │       │ 无 root  │        │          │
+   └──────────┘       └──────────┘        └──────────┘
+     Linux/macOS         Android              Android
+     Windows             Termux                APK
+     路由器
+
+       LAN / P2P / TURN / WS  --  完全互通
+```
+
+### 三种客户端定位对比
+
+| 维度 | n2n-go-client | **n2n-termux**（本仓库） | n2n-android |
+|:---|:---|:---|:---|
+| **运行环境** | Linux / macOS / Windows / 路由器 | Android Termux | Android APK |
+| **数据面** | TUN 虚拟网卡 | SOCKS5 代理 | VpnService（TUN） |
+| **权限要求** | root / 管理员 | **无 root** | 无 root |
+| **应用透明** | ✅ 系统级 | ⚠️ 需 App 显式配 SOCKS5 | ✅ 系统级 |
+| **协议支持** | TCP / UDP / ICMP | **仅 TCP** | TCP / UDP / ICMP |
+| **使用方式** | `curl http://10.64.0.X` | `curl --socks5 127.0.0.1:1080 ...` | 同 TUN |
+| **适用场景** | 服务器 / 桌面 / 路由器 | **临时测试 / 无 root 设备** | 日常使用（手机） |
+
+---
+
+## 💡 为什么选择 n2n-termux
+
+### 不需要 root
+
+**Android 内核拒绝非特权 App 创建 TUN 网卡**。所以想在无 root 的 Android 设备上跑 n2n，只能走 SOCKS5 代理模式——这就是 n2n-termux 的定位。
+
+### 与其他客户端的协作
+
+| 场景 | 用哪个 | 理由 |
+|:---|:---|:---|
+| 日常手机使用 | n2n-android | VpnService，应用透明 |
+| 临时调试 / 跑脚本 | **n2n-termux** | 无需 root，快速启动 |
+| 与其他 n2n 客户端共存 | **n2n-termux** | SOCKS5 不抢 VPN 权限 |
+| 已 root 且要完整数据面 | n2n-go-client（Termux+root） | 完整 TUN 数据面 |
+| 路由器做网关 | n2n-go-client | 系统级路由 |
+
+### 与 n2n-android 共存
+
+**可以同时运行**：
+
+- n2n-android 用 `VpnService`（走 TUN）
+- n2n-termux 用 `SOCKS5`（走 `127.0.0.1`）
+- 两者数据面路径独立，互不冲突
+
+**但同一类型只能开一个**：两个 `VpnService` 会抢权限。
 
 ---
 
 ## ✨ 特性
 
-- **无 root** — Termux 普通 App 权限即可运行
-- **无 TUN** — 不碰 `/dev/net/tun`，用 SOCKS5 代理接入
-- **LAN 直连** — 同 WiFi 场景自动发现 LAN 地址，绕过 NAT 直接内网通信
+- **无需 root** — 纯 SOCKS5 模式，任何 Android 设备都能跑
 - **四级降级** — `LAN → P2P → TURN → WS`，连接永远可用
-- **P2P 直连** — UDP 打洞 + 自定义可靠流协议（`N2NS` 帧），延迟 10-50ms
-- **TURN 中继** — 手写 TURN-Lite 客户端，UDP 不通自动切 TCP
-- **WS 中继兜底** — 通过 Cloudflare Worker 转发，不消耗额外资源
+- **P2P 直连** — STUN 探测 + NAT 打洞，延迟低至 10ms
 - **多目标打洞** — LAN + STUN 反射 + 观测 raddr 同时扫描，命中率大幅提升
-- **Keepalive 自愈** — 15 秒多目标 PING，NAT 端口漂移后自动重连
-- **DNS 内置修复** — 解决 Go 静态二进制读不到 Termux `/etc/resolv.conf` 的问题
-- **多架构** — arm64 / armv7 / amd64 三种二进制
-- **一键安装** — `curl | bash` 式脚本，全自动配置
+- **CGNAT hairpin** — 同 STUN 出口 IP 时尝试端口扫描 + probe 回发
+- **UDP 保活** — 每 5 秒刷新 STUN 映射，防止 CGNAT 端口漂移
+- **P2P 通道保活** — 每 15 秒往对端发 N2NS PING 多目标探针
+- **TURN 中继** — 支持 Cloudflare TURN + 自建 coturn（UDP / TCP / RFC6062）
+- **中继回退** — TURN 失败自动降级到 WebSocket 中继
+- **断线重连** — WebSocket 自动重连 + 90 秒读超时检测下行僵死
+- **一键部署** — `install.sh` 全自动安装
+- **CLIENT_ID 持久化** — 重启后虚拟 IP 不变
+- **虚拟网段可配** — 服务端通过 `VIRTUAL_NETWORK` 下发
+- **与 PC / Android APK 无缝互通**
 
 ---
 
 ## 🏗️ 架构
 
-Termux 是普通 App，Android 内核**不允许**其创建 TUN 设备，所以不能像 PC / Android APK 那样接管系统路由。
-
-替代方案：**用 SOCKS5 代理截获应用层 TCP 连接**，通过自定义帧协议在对端重建连接。
-
 ```
-┌────────────────────────────────────────────────────────┐
-│  Termux 里的应用（curl / ssh / wget / …）              │
-│      │                                                  │
-│      │ SOCKS5 请求 "连 10.64.0.3:8080"                 │
-│      ▼                                                  │
-│  ┌──────────────┐    ┌────────────────┐                │
-│  │ SOCKS5 服务器 │───▶│ P2P 可靠流 /    │                │
-│  │ socks5.go    │    │ WS 应用流       │                │
-│  └──────────────┘    └────────┬───────┘                │
-│                               │                         │
-│                     四级数据通路：                       │
-│                     ├─ LAN 直连（同 WiFi，<5ms）       │
-│                     ├─ P2P UDP（10-50ms）              │
-│                     ├─ TURN 中继（30-100ms）           │
-│                     └─ WebSocket（100-300ms）           │
-└───────────────────────────────┬────────────────────────┘
-                                │
-                                ▼
-                    ┌───────────────────────┐
-                    │ edge-signal (Worker)  │
-                    │ ├─ 信令路由            │
-                    │ ├─ NAT 打洞协调        │
-                    │ ├─ 下发 TURN 凭证      │
-                    │ └─ WS 中继兜底         │
-                    └───────────────────────┘
-                                │
-                                ▼
-                    ┌───────────────────────┐
-                    │  对端客户端            │
-                    │  n2n-termux /         │
-                    │  n2n-go-client /      │
-                    │  n2n-android          │
-                    └───────────────────────┘
+┌──────────────────────────────────────────┐
+│           Termux 客户端                   │
+│                                           │
+│   ┌──────────┐   ┌──────────┐            │
+│   │ App 请求  │──→│ SOCKS5   │            │
+│   │ (curl等)  │   │ 127.0.0.1│            │
+│   └──────────┘   └────┬─────┘            │
+│                       │                   │
+│                       ↓                   │
+│                  ┌──────────┐            │
+│                  │ 数据泵    │            │
+│                  │ N2NS 帧   │            │
+│                  └────┬─────┘            │
+│                       │                   │
+│                       ↓                   │
+│                  ┌──────────┐            │
+│                  │ UDP/WS   │            │
+│                  │ 传输层    │            │
+│                  └──────────┘            │
+└──────────────────────────────────────────┘
 ```
 
-**数据面格式**：
+**与 PC 端的区别**：
 
-| 通道 | 帧格式 | 传输 |
-|------|--------|------|
-| LAN / P2P / TURN | `N2NS` 自定义帧（SYN/DATA/ACK/FIN + 重传 + 窗口） | UDP |
-| WS | JSON（`app_stream_open` / `app_stream_data` + base64） | WebSocket |
+- PC：TUN 内核栈 → 应用无感知
+- Termux：SOCKS5 代理 → 应用**必须显式配置**走代理
+
+---
+
+## 📡 四级降级链路
+
+```
+优先级 1: LAN 直连        ← 同 WiFi 场景，零 NAT 穿越
+   ↓ 不同 LAN
+优先级 2: P2P 直连        ← 打洞成功，含 CGNAT hairpin
+   ↓ 打洞失败
+优先级 3: TURN 中继       ← 专业 UDP 中继，不消耗 Worker
+   ↓ TURN 不可用/失败
+优先级 4: WS 中继         ← 最后兜底，走 Worker，消耗配额
+```
+
+**每对 peer 独立决策**：A↔B 可能走 LAN，A↔C 走 P2P，A↔D 走 TURN，互不影响。
+
+---
+
+## 🔥 保活机制
+
+### 为什么需要保活
+
+**Android 上 CGNAT 更激进**——手机息屏后运营商 NAT 通常 TTL 更短。UDP 映射被回收后，P2P 通道立即断裂。
+
+### 两层保活
+
+| 层 | 间隔 | 目标 | 作用 |
+|:---|:---|:---|:---|
+| **UDP 保活** | 5 秒 | 3 个 STUN 服务器 | 保 socket 的 CGNAT 映射 |
+| **P2P 通道保活** | 15 秒 | 每个 P2P 对端 | 保 A→B 会话 |
+
+**流量代价**：
+- UDP 保活：~50 MB/天
+- P2P 保活：~180 KB/天 × 对端数
+
+**真实数据帧天然刷新 CGNAT 映射**。保活只在**空闲时**兜底。
 
 ---
 
 ## 🚀 快速开始
 
-### 前提
-
-1. Android 手机装了 [Termux](https://f-droid.org/packages/com.termux/)（**强烈建议从 F-Droid 装**，Play Store 版本已停更）
-2. 已部署 [edge-signal](https://github.com/goyo123321/edge-signal)，拿到 `wss://xxx.workers.dev` 地址
-
 ### 一键安装
 
-```bash
-curl -fsSL -o ~/install-n2n.sh https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh
-bash ~/install-n2n.sh
-```
-
-回车后按提示输入：
-
-```
-Worker WSS 地址: wss://edge-signal.<你的子域>.workers.dev
-连接密码 CONNECT_TOKEN:     ← 无则直接回车
-房间名 ROOM_ID: testroom
-客户端 ID CLIENT_ID: termux-a
-显示名 NODE_NAME: Termux-A
-SOCKS5 监听地址 (127.0.0.1:1080):     ← 直接回车
-```
-## install.sh 指定版本（推荐）
+在 Termux 里：
 
 ```bash
-VERSION=v1.1.10 \
-SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
+curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh | bash
+```
+
+或非交互式：
+
+```bash
+SIGNALING_URL="wss://edge-signal.xxx.workers.dev" \
 ROOM_ID="myroom" \
 CLIENT_ID="termux-a" \
-NODE_NAME="Termux-A" \
 AUTO_START=1 \
-bash ~/install-n2n.sh
+  bash install.sh
 ```
 
-## 非交互式部署（推荐）
+**安装脚本会**：
+
+1. 检测架构（arm64 / armv7 / amd64）
+2. 下载对应架构的二进制
+3. 生成配置文件 `~/.n2n-termux/config.env`
+4. 生成启动脚本 `~/.n2n-termux/start.sh`
+5. 可选自动启动
+
+### 手动启动
 
 ```bash
-SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
-ROOM_ID="testroom" \
-CLIENT_ID="termux-a" \
-NODE_NAME="Termux-A" \
-CONNECT_TOKEN="" \
-SOCKS5_LISTEN="127.0.0.1:1080" \
-AUTO_START=1 \
-bash ~/install-n2n.sh
+~/.n2n-termux/start.sh
 ```
 
-要改的只有两处：
-
-占位符 换成
-edge-signal.<你的子域>.workers.dev 你部署 edge-signal 时 wrangler 输出的 URL
-termux-a / Termux-A 每台设备不同（termux-a/termux-b）
-
----
-
-两台设备的具体命令
-
-设备 A
-
-```bash
-SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
-ROOM_ID="myroom" \
-CLIENT_ID="termux-a" \
-NODE_NAME="Termux-A" \
-AUTO_START=1 \
-bash ~/install-n2n.sh
-```
-
-设备 B
-
-```bash
-SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
-ROOM_ID="myroom" \
-CLIENT_ID="termux-b" \
-NODE_NAME="Termux-B" \
-AUTO_START=1 \
-bash ~/install-n2n.sh
-```
-
-同一房间 → ROOM_ID 相同
-不同设备 → CLIENT_ID / NODE_NAME 不同
-
----
-
-有 CONNECT_TOKEN 的服务端
-
-服务端配了 npx wrangler secret put CONNECT_TOKEN，客户端就要带：
-
-```bash
-SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
-CONNECT_TOKEN="你设的token" \
-ROOM_ID="myroom" \
-CLIENT_ID="termux-a" \
-NODE_NAME="Termux-A" \
-AUTO_START=1 \
-bash ~/install-n2n.sh
-```
-## 验证p2p直连
-A开个窗口新建http监听
-```bash
-cd ~ && python3 -m http.server 8080
-```
-
-B开个新窗口做curl 测试
-
-```bash
-curl --socks5 127.0.0.1:1080 -v --max-time 15 http://10.64.0.2:8080/ -o /dev/null
-```
-
-没配就不写 CONNECT_TOKEN，脚本默认空。
-
----
-
-更新 install.sh 到最新版
-
-```bash
-curl -fsSL -o ~/install-n2n.sh \
-  https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh
-```
-
-
-装完自动启动。
-
-### 后台运行
+**后台启动**：
 
 ```bash
 nohup ~/.n2n-termux/start.sh > ~/n2n.log 2>&1 &
-
-# 看日志
-tail -f ~/n2n.log
 ```
 
-### 停止
+**停止**：
 
 ```bash
-~/.n2n-termux/stop.sh
+pkill -f n2n-client
 ```
 
----
+### 使用 SOCKS5
 
-## 📖 使用
+**必须显式走 SOCKS5**——因为 n2n-termux 只提供 `127.0.0.1:1080` 代理入口。
 
-### 应用通过 SOCKS5 访问虚拟 IP
-
-**单次命令**（curl 支持 `--socks5`）：
+**curl**：
 
 ```bash
+# 单条命令
 curl --socks5 127.0.0.1:1080 http://10.64.0.3:8080/
-```
 
-**全局代理**（环境变量）：
-
-```bash
+# 环境变量（会话级）
 export ALL_PROXY=socks5://127.0.0.1:1080
 curl http://10.64.0.3:8080/
 ```
 
-**SSH 通过 SOCKS5**：
+**ssh**（通过 ProxyCommand）：
 
 ```bash
 ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@10.64.0.3
 ```
 
-**其他 SOCKS5 客户端**：
-
-| 应用 | 配置方式 |
-|------|---------|
-| `git` | `git config --global http.proxy socks5://127.0.0.1:1080` |
-| `wget` | 不支持 SOCKS5，需 `proxychains` |
-| `curl` | `--socks5 127.0.0.1:1080` |
-| `scp` | `scp -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p'` |
-
-### 从其他设备访问 Termux 上的服务
-
-在 Termux 里起服务（例如 `python3 -m http.server 8080`），其他设备通过它们的虚拟 IP 直接访问：
+**wget**：
 
 ```bash
-# 从 PC 的 n2n-go-client
-curl http://10.64.0.2:8080/
+wget -e use_proxy=yes -e socks_proxy=127.0.0.1:1080 http://10.64.0.3:8080/
+```
+
+**Python**：
+
+```python
+import socks  # pip install PySocks
+import socket
+socks.set_default_proxy(socks.SOCKS5, "127.0.0.1", 1080)
+socket.socket = socks.socksocket
 ```
 
 ---
 
-## ⚙️ 环境变量
+## 🌐 典型使用场景
+
+### 场景 A：Termux 访问 PC 上的服务
+
+**PC 端起服务**（监听 `0.0.0.0`）：
+
+```bash
+# Linux/macOS
+python3 -m http.server 8080 --bind 0.0.0.0
+
+# Windows
+python -m http.server 8080 --bind 0.0.0.0
+```
+
+**Termux 端通过 SOCKS5 访问**：
+
+```bash
+curl --socks5 127.0.0.1:1080 http://10.64.0.2:8080/
+```
+
+### 场景 B：PC 访问 Termux 上的服务
+
+**Termux 端起服务**：
+
+```bash
+# 监听 0.0.0.0，否则 PC 访问不到
+python3 -m http.server 8080 --bind 0.0.0.0
+# 或
+sshd    # SSH 服务监听 8022
+```
+
+**PC 端直接访问**（走 TUN）：
+
+```bash
+curl http://10.64.0.3:8080/
+ssh -p 8022 u0_aXXX@10.64.0.3
+```
+
+**注意**：Termux 端服务**必须监听 `0.0.0.0`**，否则 PC 通过虚拟 IP 访问不到。
+
+### 场景 C：Termux ↔ Termux
+
+**主动方**：
+
+```bash
+curl --socks5 127.0.0.1:1080 http://10.64.0.4:8080/
+```
+
+**被动方**：
+
+```bash
+python3 -m http.server 8080 --bind 0.0.0.0
+```
+
+**注意**：两端都得跑 n2n-termux。
+
+### 场景 D：与 Android APK 混合
+
+同一台 Android 设备**可以同时**跑：
+
+- **n2n-android APK**（VpnService）——系统级应用透明
+- **n2n-termux**（SOCKS5）——脚本临时调试
+
+**互不冲突**：VpnService 走 TUN，Termux 走 SOCKS5。
+
+---
+
+## ⚙️ 配置项
+
+### `~/.n2n-termux/config.env`
+
+```bash
+SIGNALING_URL="wss://edge-signal.xxx.workers.dev"
+CONNECT_TOKEN=""
+ROOM_ID="default-room"
+CLIENT_ID="termux-a"
+NODE_NAME="Android Termux"
+SOCKS5_LISTEN="127.0.0.1:1080"
+```
 
 | 变量 | 必填 | 默认值 | 说明 |
-|------|:----:|--------|------|
+|:---|:---|:---|:---|
 | `SIGNALING_URL` | ✅ | — | edge-signal 的 WSS 地址 |
-| `CONNECT_TOKEN` | ❌ | `""` | 连接密码（服务端配了才需要） |
-| `ROOM_ID` | ❌ | `default-room` | 房间名，只允许 `[A-Za-z0-9_-]+` |
-| `CLIENT_ID` | ❌ | 自动生成并持久化 | 客户端唯一 ID，多设备必须不同 |
-| `NODE_NAME` | ❌ | hostname | 面板显示名 |
+| `CONNECT_TOKEN` | ⚠️ | `""` | 连接密码（Worker 配了才需要）|
+| `ROOM_ID` | ❌ | `default-room` | 房间名。只允许 `[A-Za-z0-9_-]+` |
+| `CLIENT_ID` | ❌ | 自动生成并持久化 | 客户端唯一 ID |
+| `NODE_NAME` | ❌ | hostname | 显示名 |
 | `SOCKS5_LISTEN` | ❌ | `127.0.0.1:1080` | SOCKS5 监听地址 |
-| `STUN_SERVERS` | ❌ | 国内 STUN | STUN 服务器列表（逗号分隔） |
-| `UDP_PORT` | ❌ | `0` | P2P UDP 端口，`0`=自动分配 |
 
-**虚拟网段**由服务端 `VIRTUAL_NETWORK` 决定，客户端从 `ready` 消息自动接收。默认 `10.64.0.0/24`。
+**虚拟网段**由服务端 `wrangler.toml` 的 `VIRTUAL_NETWORK` 决定，客户端从 `ready` 消息自动接收。
+
+**修改配置后**需要重启客户端。
 
 ---
 
-## 📋 启动日志示例
+## 📋 启动日志
 
-正常启动（同 WiFi 场景）：
+启动成功后：
 
 ```
-[DNS] 使用 /data/data/com.termux/files/usr/etc/resolv.conf 的 2 个 nameserver: [8.8.8.8:53 8.8.4.4:53]
-n2n-termux v1.1.0 启动
+n2n-termux dev 启动
 [配置] 未设置 CONNECT_TOKEN
-[P2P] UDP 监听端口 37221
-[NAT] 启动预收集 LAN: [192.168.10.2:37221 192.168.10.11:37221]
-[NAT] STUN stun.chat.bilibili.com:3478 → 120.239.134.121:47877
-[NAT] STUN stun.hitv.com:3478 → 120.239.134.121:47878
-[NAT] HardNAT（对称），ports_diff=1 pub=120.239.134.121:47877 endpoints=2
-[WS] 连接 wss://url.jyece.kdns.fr/ws/testroom?cid=termux-a
-已连接信令，Client ID: termux-a，节点名: Termux-A
-分配虚拟 IP: 10.64.0.2（网段 10.64.0.0/24）
-[信令] 服务端看到的本机出口 IP: 120.239.134.121（WS/TCP 出口，仅参考）
-[NAT] 上报 LAN 地址: [192.168.10.2:37221 192.168.10.11:37221]
-[信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="120.239.134.121:47877" multiExit=true assisted=2 lan=2
-[SOCKS5] 监听 127.0.0.1:1080（用 curl --socks5 或 ALL_PROXY 访问虚拟 IP）
-[TURN] endpoint: 111.171.194.230:3478 (scheme=turn transport=udp)
-[TURN-Lite] ✅ Allocation 成功: relay=111.171.194.230:63458
-[Keepalive] 启动，每 5s 刷新 3 个 STUN 服务器（仅在有 peer 时）
+[配置] 生成并持久化 CLIENT_ID: termux-a-1704067200 -> /data/data/com.termux/files/home/.n2n-termux/client_id
+[P2P] UDP 监听端口 42529
+[NAT] 启动预收集 LAN: [...] 或 [NAT] 启动预收集 LAN 为空（可能蜂窝网络）
+[NAT] STUN 74.125.250.129:19302 → 120.239.134.13:19190
+[NAT] HardNAT（对称），ports_diff=0 pub=120.239.134.13:19190
+[WS] 连接 wss://edge-signal.xxx.workers.dev/ws/myroom?cid=termux-a
+已连接信令，Client ID: termux-a-1704067200，节点名: Android Termux
+分配虚拟 IP: 10.64.0.3（网段 10.64.0.0/24）
+[信令] 服务端看到的本机出口 IP: 120.229.199.61
+[NAT] 上报 LAN 地址: [...]
+[信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="120.239.134.13:19190" multiExit=true assisted=2 lan=1
+[TURN] 获取到 custom TURN 服务器: turn:xxx:3478
+[TURN] 中继地址: 5.6.7.8:50000
+[Keepalive] 启动，每 5s 刷新 3 个 STUN 服务器
 [P2P-Keepalive] 启动，每 15s 刷新 P2P 通道
+[SOCKS5] 监听 127.0.0.1:1080（用 curl --socks5 或 ALL_PROXY 访问虚拟 IP）
 
 ================= 本机信息 =================
-  Client ID   : termux-a
-  节点名       : Termux-A
-  虚拟 IP     : 10.64.0.2
+  Client ID   : termux-a-1704067200
+  节点名       : Android Termux
+  虚拟 IP     : 10.64.0.3
   虚拟网段    : 10.64.0.0/24
-  P2P 端口    : 37221
-  模式         : proxy (SOCKS5)
+  P2P 端口    : 42529
 ==========================================
 ```
 
-**对端上线 + LAN 直连打洞**：
+**对端上线**：
 
 ```
-[registerPeer] termux-b: 收到 assisted=1 个 [120.239.134.121:47742] lanEndpoints=1 个 [192.168.10.12:56629]
-[registerPeer] termux-b: sortedLAN=[192.168.10.12:56629] (prefixes=2)
-[信令] 节点上线: termux-b (vip=10.64.0.3)
-
-========== 节点就绪: termux-b ==========
-  虚拟 IP   : 10.64.0.3
-  公网地址  : 120.239.134.121:47742
-  LAN 地址  : [192.168.10.12:56629]
-  STUN 端点 : [120.239.134.121:47742]
+========== 节点就绪: pc-a ==========
+  虚拟 IP   : 10.64.0.2
+  公网地址  : 1.2.3.4:54321
+  LAN 地址  : [192.168.1.100:54321]
+  STUN 端点 : [1.2.3.4:54321 1.2.3.4:54335]
 ==========================================
 
-[NAT-HOLE] 开始打洞 role=1 target=192.168.10.12:56629
-[collectScanTargets] 去重后 2 个候选: [192.168.10.12:56629 120.239.134.121:47742]
-[NAT-HOLE] 优先扫描 2 个候选端点
-[P2P] 从 termux-b (192.168.10.12) 收到 Punch → P2PAvailable（等待数据帧验证）
+[P2P] 从 pc-a (192.168.1.100) 收到 Punch → P2PAvailable（等待数据帧验证）
 [P2P] 收到 PONG → P2P 直连（双向通道已验证）
-[连接] termux-b → P2P 直连（prev=p2p-avail，数据面已验证）
-```
-
-**P2P 数据面成功**（真 P2P）：
-
-```
-[SOCKS5] CONNECT 10.64.0.3:8080
-[SOCKS5] CONNECT 10.64.0.3:8080 → P2P 直连 (stream=2)
-```
-
-**P2P 失败回落 WS**：
-
-```
-[SOCKS5] CONNECT 10.64.0.3:8080
-[P2P-STREAM] 2 建流超时（2s），保留 conn 让调用方回落
-[SOCKS5] P2P 建流失败(syn timeout)，回落 WS 中继
-[SOCKS5] CONNECT 10.64.0.3:8080 → WS 中继 (stream=termux-a-1)
+[连接] pc-a → P2P 直连
 ```
 
 ---
 
-## 🔥 四级降级
+## 🔍 与 PC / Android 的数据面差异
 
-```
-① LAN 直连（同 WiFi 首选）
-   ├─ 延迟 <5ms
-   ├─ 零 NAT 穿越
-   ├─ 无流量计费
-   └─ 不同 LAN 则降级
-       │
-       ▼
-② P2P UDP 直连
-   ├─ 延迟 10-50ms
-   ├─ 不消耗任何资源
-   └─ 打洞失败则降级
-       │
-       ▼
-③ TURN 中继
-   ├─ 延迟 30-100ms
-   ├─ 消耗 TURN 服务器带宽（Cloudflare 1000GB/月免费）
-   └─ TURN 不可用则降级
-       │
-       ▼
-④ WebSocket 中继
-   ├─ 延迟 100-300ms
-   ├─ 消耗 Worker 请求配额（每天 10 万）
-   └─ 最后兜底
-```
+### 数据面协议对比
 
-**每对 peer 独立决策**：A↔B 可以走 LAN，A↔C 走 P2P，A↔D 走 TURN。
+| 端 | 数据面 | 协议支持 | 应用透明 |
+|:---|:---|:---|:---|
+| **n2n-go-client (PC)** | TUN | TCP / UDP / ICMP | ✅ |
+| **n2n-android (APK)** | VpnService | TCP / UDP / ICMP | ✅ |
+| **n2n-termux (本仓库)** | SOCKS5 | **仅 TCP** | ⚠️ |
 
----
+### 互通机制
 
-## 🔍 P2P 数据流原理
+**三端在服务端和 P2P 通道层用同一套协议**：
 
-### LAN 地址发现（双路径）
+- N2NS 帧（21 字节头）
+- Punch/ACK 握手
+- 打洞指令（`nat_hole_instruction`）
+- 状态机（`P2PAvailable` → `P2P`）
 
-**路径 1：UDP connect 骗内核**
+**所以完全互通**：
 
-```go
-conn, _ := net.Dial("udp4", "8.8.8.8:80")
-localIP := conn.LocalAddr().(*net.UDPAddr).IP
-```
-
-原理：connect UDP **不真正发包**，只更新内核路由缓存。`getsockname()` 返回内核为该 socket 选定的出口 IP —— 即"出网卡"的 IP。
-
-- WiFi 下返回 `192.168.x.x` —— 直接可用
-- 蜂窝下返回运营商内网 IP（`10.x` / `100.64.x`）—— 会被过滤掉
-- **不触发 netlink 权限检查，Termux 里也能用**
-
-**路径 2：遍历 `net.Interfaces()`**
-
-覆盖多网卡场景（WiFi + USB 网卡）。两条路径结果合并去重。
-
-**上报链路**：`p2p_metadata` 里带 `lanEndpoints` → 服务端存储 → 广播 `joined` → 对端 `registerPeer` 时收到。
-
-### 打洞候选（score 制匹配）
-
-对端可能从**三个不同源地址**发来 Punch/ACK：
-
-| 源 | 分数 | 场景 |
+| 主动方 | 被动方 | 数据面路径 |
 |:---|:---|:---|
-| `p.UDPAddr` 完全匹配 | 4 | 公网地址未变 |
-| `p.UDPAddr` IP 匹配 | 3 | 端口漂移 |
-| `p.LanEndpoints` 完全匹配 | **5（最高）** | 同 WiFi 直连 |
-| `p.LanEndpoints` IP 匹配 | 2 | LAN 端口漂移 |
-| `p.AssistedEndpoints` 完全匹配 | 4 | STUN 反射 |
-| `p.AssistedEndpoints` IP 匹配 | 1 | 反射端口漂移 |
+| PC（TUN） | Termux（SOCKS5） | PC 发 N2NS → Termux 收到后转发到本地 TCP |
+| Termux（SOCKS5） | PC（TUN） | Termux 发 N2NS → PC 收到后写入 TUN |
+| Termux（SOCKS5） | Android（VpnService） | Termux 发 N2NS → Android 收到后写入 TUN |
+| Android（VpnService） | Termux（SOCKS5） | Android 发 N2NS → Termux 侧转发到本地 TCP |
 
-**最高分匹配**优先。
+**唯一区别**：Termux 端没有 `peer.UDPAddr` 直发路径（不会直接往虚拟 IP 发包），只能通过 SOCKS5 触发。
 
-### 发起方（A）
+### 打洞行为一致
 
-```
-curl 通过 SOCKS5 发起 → "连 10.64.0.3:8080"
-   ↓
-socks5.go 查 peer 表 → 找到 termux-b
-   ↓
-relayMgr.IsP2P("termux-b") || IsP2PAvailable || IsTURN → true
-   ↓
-p2p_stream.go: OpenP2PStream()
-   ↓
-构造 N2NS SYN 帧（含 targetPort=8080）
-   ↓
-collectN2NSTargets 收集所有候选：
-   ├─ LAN 地址（同 WiFi 优先）
-   ├─ AssistedEndpoints（STUN 反射）
-   ├─ lastRecvFrom（对端最近发来的源地址）
-   ├─ peerAddr（注册分配）
-   └─ peer.UDPAddr（观测 raddr）
-   ↓
-多目标发送（命中率大幅提升）
-   ↓
-等 SYNACK（超时 2s）
-```
+**Termux ↔ PC** 与 **Termux ↔ Termux** 打洞行为一致：
 
-### 接收方（B）
+- 双端都上报 `lanEndpoints` → LAN 直连优先
+- 双端都上报 `assistedEndpoints` → STUN 反射多端点
+- 打洞指令由同一个 `coordinator.js` 生成
+- 状态机完全相同
 
-```
-udpReadLoop 收到 N2NS 帧
-   ↓
-findPeerIDByAddr → score 制匹配 termux-a
-   ↓
-acceptSYN（幂等：多目标重复 SYN 只建一个 stream）
-   ↓
-dial 127.0.0.1:8080
-   ↓
-回 N2NS SYNACK (Ack=1)
-   ↓
-启动数据泵：读 localConn → N2NS DATA → 发回 A
+---
+
+## 🔧 从源码构建
+
+### 前置要求
+
+- Go 1.21+
+- Android NDK（可选，交叉编译用）
+
+### 构建
+
+```bash
+git clone https://github.com/goyo123321/n2n-termux.git
+cd n2n-termux
+go mod tidy
+
+# 当前平台
+go build -o n2n-client .
+
+# Termux (arm64)
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o n2n-client-linux-arm64 .
+
+# Termux (armv7)
+GOOS=linux GOARCH=arm CGO_ENABLED=0 GOARM=7 go build -o n2n-client-linux-armv7 .
 ```
 
-### 数据帧格式（21 字节头 + payload）
+### GitHub Actions 自动构建
 
 ```
-偏移  长度  字段
-────────────────────────────
-0     4     "N2NS"      魔数
-4     1     ver         版本 1
-5     1     type        SYN=1 SYNACK=2 DATA=3 ACK=4 FIN=5 RST=6 PING=7 PONG=8
-6     4     streamID    大端 uint32（偶数）
-10    4     seq         本帧序列号
-14    4     ack         确认收到的对方 seq
-18    1     flags       保留
-19    2     payloadLen  大端 uint16
-21    N     payload     数据
-```
-
-**可靠性机制**：
-
-- 每帧带序列号 + ACK，接收方按序交付
-- 未 ACK 200ms 重传，最多 8 次
-- 滑动窗口 16 帧
-- 乱序缓存后按序交付
-
-### P2P 通道状态机
-
-```
-Unknown → P2PAvailable → P2P
-           ↑                ↑
-      收到 Punch/ACK    收到 PONG 或
-      打洞握手成功      真实数据帧
-```
-
-**PING/PONG 语义**（关键）：
-
-- 收到 **PING** → 只回 PONG，**不升级本端状态**（单向证明）
-- 收到 **PONG** → 双向通道已验证 → **升级到 P2P**
-- 收到 **SYN/SYNACK/DATA/ACK/FIN/RST** → **升级到 P2P**（真实数据帧）
-
-**P2PAvailable 30 秒超时**：打洞握手成功但 30 秒内没升到 P2P → 强制降级到 TURN/WS，避免永远卡在中间态。
-
-### P2P Keepalive（NAT 映射保持）
-
-**问题**：CGNAT 的 UDP 端口映射老化时间通常 30-60 秒。P2P 建立后如果没流量，映射会消失，之后发包用新端口，对端识别不了。
-
-**方案**：每 15 秒用 **N2NS PING 多目标**发送（走 `collectN2NSTargets` 同一套候选），命中率比单目标高得多。PING 也刷新对端 NAT 映射，双向保活。
-
-**关键代码路径**：`p2p_stream.go` 的 `sendP2PFrame`：
-
-```go
-targets := e.collectN2NSTargets(s)
-for _, addr := range targets {
-    e.udpConn.WriteToUDP(buf, addr)   // 多目标发送
-}
+Actions → Build n2n-termux → Run workflow
+  version: v1.0.0
+  publish: ✓
 ```
 
 ---
 
-## 🐛 DNS 修复
-
-Termux 环境有个坑：
-
-- `/etc` 是 `/system/etc` 的符号链接，Android 只读，**里面没有 `resolv.conf`**
-- Termux 真正的 DNS 配置在 `$PREFIX/etc/resolv.conf`
-- **Go 静态二进制（`CGO_ENABLED=0`）不经过 libc**，`termux-exec` 拦不到它
-- 结果：Go 硬编码读 `/etc/resolv.conf` 失败 → fallback 到 `[::1]:53` → `connection refused`
-
-**客户端内置修复**：启动时主动读 `$PREFIX/etc/resolv.conf`，覆盖 `net.DefaultResolver`。
-
-**验证**：启动日志第一行应该有：
+## 📁 项目结构
 
 ```
-[DNS] 使用 /data/data/com.termux/files/usr/etc/resolv.conf 的 2 个 nameserver: [8.8.8.8:53 8.8.4.4:53]
+n2n-termux/
+├── main.go                       # 主程序（含 UDP 保活 + P2P 通道保活）
+├── ws_transport.go               # WebSocket 传输层（断线重连 + 90s 读超时）
+├── relay_fallback.go             # 四级降级管理器
+├── turn_client.go                # TURN 客户端
+├── turn_lite.go                  # TURN-Lite 实现
+├── turn_lite_tcp.go              # TURN over TCP
+├── nat_probe.go                  # NAT 类型探测
+├── nathole_executor.go           # 打洞指令执行
+├── p2p_stream.go                 # N2NS 可靠流协议
+├── punch.go                      # Punch/ACK 定义
+├── socks5.go                     # SOCKS5 入口
+├── app_stream.go                 # WS 应用层隧道
+├── install.sh                    # 一键部署脚本
+└── go.mod
 ```
-
-**自定义 DNS**：改 `$PREFIX/etc/resolv.conf` 即可。
 
 ---
 
-## ❓ 常见问题
+## ⚠️ 限制
 
-### Q: 装完启动报 `请设置 SIGNALING_URL`？
+### Termux 特有
 
-正常——`install.sh` 装的是二进制，不负责启动。用 `~/.n2n-termux/start.sh` 启动（它会 source `config.env`）。
+| 项 | 说明 |
+|:---|:---|
+| **无 TUN** | Android 内核拒绝非特权 App 创建 TUN |
+| **仅 SOCKS5** | 应用**必须**显式配置代理，不支持系统级路由 |
+| **仅 TCP** | SOCKS5 只代理 TCP，不支持 UDP / ICMP |
+| **ping 不通** | ICMP 不走 SOCKS5 |
 
-### Q: SOCKS5 起来了吗？
+### 权限
+
+| 项 | 要求 |
+|:---|:---|
+| root | ❌ 不需要 |
+| 特殊权限 | ❌ 不需要 |
+| Termux 环境 | ✅ 需要 |
+
+### 与其他客户端共存
+
+| 组合 | 可以吗 | 说明 |
+|:---|:---|:---|
+| n2n-termux 单独跑 | ✅ | 标准用法 |
+| n2n-termux + n2n-android | ✅ | SOCKS5 与 VpnService 不冲突 |
+| n2n-termux × 2 | ⚠️ | 两个 SOCKS5 会抢 `127.0.0.1:1080` 端口，需改 `SOCKS5_LISTEN` |
+| n2n-termux + Clash | ⚠️ | 如果 Clash 也用 1080 端口会冲突 |
+
+---
+
+## 📊 性能参考
+
+| 连接方式 | 延迟 | 消耗 |
+|:---|:---|:---|
+| **LAN 直连** | **<10ms** | **无** |
+| P2P 直连（跨 NAT） | 20~60ms | 无 |
+| **CGNAT hairpin** | **20~40ms** | **无** |
+| TURN 中继 | 40~120ms | Cloudflare TURN 配额 |
+| WebSocket 中继 | 100~300ms | Worker 请求配额 |
+
+**注意**：Termux 端有 SOCKS5 代理层开销（约 5~10ms）。PC 端直接走 TUN，无此开销。
+
+---
+
+## 🐛 常见问题
+
+### Q: 无 root 真的能用吗？
+
+**能**。Termux 本身不需要 root，SOCKS5 模式也不需要特殊权限。
+
+**但要清楚限制**：
+- 应用**必须**显式走 SOCKS5 代理（不能用 `ping`，不能直接 `curl http://10.64.0.x`）
+- 仅支持 TCP（不支持 UDP / ICMP）
+- 端口固定 `127.0.0.1:1080`（可改 `SOCKS5_LISTEN`）
+
+### Q: 为什么 `ping 10.64.0.3` 不通？
+
+**ICMP 不走 SOCKS5**。SOCKS5 是 TCP 代理协议，`ping` 用的是 ICMP，两者完全独立。
+
+**用 TCP 测**：
 
 ```bash
-ss -tlnp 2>/dev/null | grep 1080
-# 期望：LISTEN 127.0.0.1:1080
+# 对端开服务
+python3 -m http.server 8080 --bind 0.0.0.0
+
+# 本机测
+curl --socks5 127.0.0.1:1080 http://10.64.0.3:8080/
 ```
 
-或直接测协议握手：
+### Q: 为什么 `curl http://10.64.0.3:8080/` 不通？
+
+**没走 SOCKS5**。默认 `curl` 直连，会尝试通过系统网络访问 `10.64.0.3`——但该地址在系统里不存在。
+
+**必须显式走 SOCKS5**：
 
 ```bash
-printf '\x05\x01\x00' | nc 127.0.0.1 1080 | xxd
-# 期望：00000000: 0500
+# 方式 1：命令行参数
+curl --socks5 127.0.0.1:1080 http://10.64.0.3:8080/
+
+# 方式 2：环境变量（会话级）
+export ALL_PROXY=socks5://127.0.0.1:1080
+curl http://10.64.0.3:8080/
+
+# 方式 3：永久写入 shell 配置
+echo 'export ALL_PROXY=socks5://127.0.0.1:1080' >> ~/.bashrc
 ```
 
-### Q: curl 返回 `000` 立即失败？
+### Q: PC 访问 Termux 服务失败？
 
-**错误**：`找不到 VIP xxx 对应的 peer`——说明对端不在线或已离线。
-
-**检查**：
+**Termux 端服务必须监听 `0.0.0.0`**。
 
 ```bash
-grep "节点上线\|节点离开" ~/n2n.log | tail -5
+# ✅ 可以（PC 能访问）
+python3 -m http.server 8080 --bind 0.0.0.0
+
+# ❌ 不行（只监听 loopback，PC 访问不到）
+python3 -m http.server 8080 --bind 127.0.0.1
 ```
 
-### Q: 如何判断走的是 LAN / P2P / TURN / WS？
+因为 n2n-termux 是 SOCKS5 代理，PC 通过虚拟 IP 访问 Termux 时，N2NS 帧到达 Termux 后会被转发到 `127.0.0.1:port`。但如果服务只监听 `127.0.0.1`，**PC 侧无法触发 N2NS 帧**。
 
-**看日志**：
+### Q: 与其他 VPN 冲突？
 
-```
-[SOCKS5] CONNECT 10.64.0.3:8080 → P2P 直连 (stream=2)       ← LAN 或 P2P
-[SOCKS5] CONNECT 10.64.0.3:8080 → TURN 中继 (...)           ← TURN
-[SOCKS5] CONNECT 10.64.0.3:8080 → WS 中继 (stream=...)      ← WS
-```
+**SOCKS5 模式不冲突**——SOCKS5 走 `127.0.0.1`，不抢 VPN 权限。
 
-**看服务端面板**：
+即使设备上已运行 Clash / n2n-android，n2n-termux 也能正常启动。
 
-```
-连接状态：p2p-B      ← P2P（含 LAN）
-连接状态：TURN-B     ← TURN
-连接状态：ws-B       ← WS
-```
-
-**中继流量**：如果 P2P/LAN 生效，**TURN 中继流量保持 0 B**。
-
-### Q: 怎么知道走的是 LAN 不是公网 P2P？
-
-**看打洞日志的源 IP**：
-
-```
-[P2P] 从 termux-b (192.168.10.12) 收到 Punch    ← LAN
-[P2P] 从 termux-b (120.239.134.121) 收到 Punch  ← 公网 P2P
-```
-
-`192.168.x.x` = LAN 直连，`120.x.x.x` = 公网 P2P。
-
-**面板 NAT 类型显示 `LAN`** 也说明有 LAN 地址（打洞首选 LAN）。
-
-### Q: 面板 NAT 类型一直是"未知"？
-
-**正常**。STUN 探测有时只拿到一个样本（比如 `natType=unknown`），不影响功能。
-
-**有 LAN 地址时显示 `LAN`**，比 NAT 类型更直观——毕竟打洞首选就是 LAN。
-
-### Q: curl 慢（3-5 秒）？
-
-**原因**：每次请求都先尝试 P2P，2 秒超时后才回落 WS。
-
-**排查**：
-
-1. 看 A 端日志有没有 `[P2P-STREAM] 建流超时`
-2. 看 B 端日志有没有 `[P2P-STREAM] 收到 SYN`
-
-**如果 A 建流超时但 B 没收到 SYN** —— UDP 单向不通（CGNAT hairpin）。
-
-**如果走 LAN 直连但依然慢** —— 检查是否真在同 WiFi，`[P2P] 从 ... 收到 Punch` 的源 IP 应该是 `192.168.x.x`。
+**唯一冲突点**：如果 Clash 也监听 `1080` 端口，会抢端口。改 `SOCKS5_LISTEN="127.0.0.1:1081"` 即可。
 
 ### Q: 打洞一直失败？
 
-**检查 UDP 出口 IP 是否相同**：
+看日志 `[NAT-HOLE] ❌ 失败`。会自动降级到 TURN 中继。TURN 也不可用则降级到 WS 中继。
 
-```
-A: UDP 120.239.134.121:47877
-B: UDP 120.230.243.39:5417     ← 应不同
-```
+**排查**：
 
-**相同 = 同 CGNAT 出口**，P2P 大概率失败（需要 hairpin，运营商多半不支持）。
+1. **`publicEndpoint` 为空** → NAT 探测失败，STUN 服务器被封
+2. **端口差 > 100** → CGNAT 映射漂移严重
+3. **同 STUN 出口 IP** → 同 CGNAT，需要 hairpin
 
-**换网络**：一台用 4G，一台用 WiFi，出口 IP 就会不同。
+### Q: 手动指定 SOCKS5 端口
 
-**如果两端在同一 WiFi**：应该走 LAN 直连（不受 CGNAT 影响）。
-
-**即使 P2P 失败，TURN / WS 依然能通**——只是延迟高一些。
-
-### Q: LAN 地址收集不到？
-
-**检查启动日志**：
-
-```
-[NAT] 启动预收集 LAN: [...]   ← 有这行说明能收集
-[NAT] 启动预收集 LAN 为空（可能蜂窝网络，或 WiFi 未就绪）  ← 说明收集失败
-```
-
-**常见原因**：
-
-1. **纯蜂窝网络** —— 没有 LAN 接口，`net.Interfaces()` 返回空，正常现象
-2. **手机在蜂窝下启动后切 WiFi** —— 后台每 500ms 重试一次，10 秒内自动补齐
-3. **A 的默认路由不在 WiFi 上** —— Android 系统把蜂窝当主网卡，`detectOutboundIP` 返回运营商 IP 被过滤
-
-**手工验证**（A 端 Termux 里跑）：
+编辑 `~/.n2n-termux/config.env`：
 
 ```bash
-python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(('8.8.8.8',80)); print(s.getsockname()[0])"
+SOCKS5_LISTEN="127.0.0.1:1081"
 ```
 
-- 输出 `192.168.x.x` → Go 也能拿到 LAN
-- 输出 `10.x` / `100.64.x` → A 的默认路由不在 WiFi，需要在 Android 设置里把 WiFi 设为主网卡
+然后重启客户端。
 
-### Q: TURN 一直失败/刷屏？
-
-**原因**：服务端配的 TURN 服务器访问不通。
-
-**修复**：
-
-**方案 1（推荐）**：服务端 `edge-signal/wrangler.toml` 里注释掉 `TURN_SERVERS`：
-
-```toml
-# TURN_SERVERS = "turn://..."
-```
-
-**方案 2**：客户端连续失败 5 次后自动放弃（v1.0.2 起内置）。
-
-### Q: Termux 切后台被杀？
-
-**解决**：
+### Q: 怎么看日志？
 
 ```bash
-termux-wake-lock
-nohup ~/.n2n-termux/start.sh > ~/n2n.log 2>&1 &
+# 前台运行时，直接看
+~/.n2n-termux/start.sh
+
+# 后台运行时
+tail -f ~/n2n.log
+
+# 或过滤关键字
+tail -f ~/n2n.log | grep -E "\[P2P\]|\[NAT-HOLE\]|\[连接\]"
 ```
 
-**需要装 [Termux:API](https://f-droid.org/packages/com.termux.api/)**。
-
-**长期方案**：Android 设置 → 电池 → 电池优化 → Termux → 不优化。
-
-### Q: 如何让 Termux 开机自启？
-
-装 [Termux:Boot](https://f-droid.org/packages/com.termux.boot/)：
+### Q: 怎么停止客户端？
 
 ```bash
-mkdir -p ~/.termux/boot
-cat > ~/.termux/boot/n2n.sh <<'EOF'
-#!/data/data/com.termux/files/usr/bin/sh
-termux-wake-lock
-nohup $HOME/.n2n-termux/start.sh > $HOME/n2n.log 2>&1 &
-EOF
-chmod +x ~/.termux/boot/n2n.sh
+# 方式 1：pkill
+pkill -f n2n-client
+
+# 方式 2：查 PID
+ps aux | grep n2n-client
+kill <pid>
 ```
 
-### Q: 支持域名吗？
+### Q: 重启后虚拟 IP 变了？
 
-**不支持**。SOCKS5 请求带域名会返回 `Address type not supported`。
+客户端会持久化 `CLIENT_ID` 到 `~/.n2n-termux/client_id`，正常情况下重启 IP 不变。
 
-**原因**：n2n 虚拟网里没有 DNS 服务。
+如果 IP 变了，检查：
 
-**变通**：直接用虚拟 IP，或在本地 hosts 里加映射。
+```bash
+cat ~/.n2n-termux/client_id
+```
 
-### Q: 支持 IPv6 / UDP 吗？
-
-**不支持**。SOCKS5 请求解析不支持 IPv6 目标；`UDP ASSOCIATE` 命令未实现（只支持 `CONNECT`）。
-
-**原因**：底层数据面是可靠流（序列号 + ACK + 重传），对 UDP 应用不友好。绝大多数 Termux 场景（SSH/HTTP/DB）只需要 TCP。
-
-### Q: 一次能跑几个实例？
-
-同一台手机可以跑多个（不同 `SOCKS5_LISTEN` 端口、不同 `CLIENT_ID`、不同 `UDP_PORT`）。
-
-**同机多实例测不出真 P2P** —— 两个实例出口 IP 相同，会走 hairpin 逻辑（大概率失败 → TURN/WS）。
-
-**要验证 P2P 必须两台物理设备**，且出口 UDP IP 不同。
+文件被删或换目录会导致 IP 变。
 
 ### Q: 面板显示 `p2p-avail` 不是 `p2p`？
 
-**`p2p-avail`** = 打洞握手成功，但 PONG 或真实数据帧还没到，尚未确认双向通道。
+**`p2p-avail`** = 打洞握手成功，但 PONG 或真实数据帧还没到。
 
-**正常情况 1-2 秒内**会升级到 `p2p`：
+**正常 1-2 秒内**会升级到 `p2p`：
 
 ```
-[P2P] 从 termux-b 收到 Punch → P2PAvailable（等待数据帧验证）
-[P2P] 收到 PONG → P2P 直连（双向通道已验证）       ← 这行出现就升 P2P
+[P2P] 从 pc-a 收到 Punch → P2PAvailable（等待数据帧验证）
+[P2P] 收到 PONG → P2P 直连（双向通道已验证）
 ```
 
-**如果一直停在 `p2p-avail`**：30 秒后会超时降级到 TURN/WS。
+**一直停在 `p2p-avail`** → 30 秒后自动降级到 TURN/WS。
 
 ---
 
-## 🔗 相关项目
+## 🔗 与 edge-signal 配合
 
-| 项目 | 平台 | 模式 |
-|------|------|------|
-| [edge-signal](https://github.com/goyo123321/edge-signal) | Cloudflare Workers | 信令服务器 + 打洞协调 + WS 中继 |
-| [n2n-go-client](https://github.com/goyo123321/n2n-go-client) | Linux / macOS / Windows | TUN 网卡（需 root/管理员） |
-| [n2n-android](https://github.com/goyo123321/n2n-android) | Android APK | VpnService TUN |
-| **n2n-termux** | Android Termux | **SOCKS5 代理（无 root）** |
+| 项 | edge-signal | n2n-termux |
+|:---|:---|:---|
+| 部署位置 | Cloudflare 边缘 | Android Termux |
+| 角色 | 信令服务器 + TURN 凭证下发 + 中继兜底 | 建立 SOCKS5 + LAN/P2P/TURN 连接 |
+| 语言 | TypeScript | Go |
+| 存储 | Durable Objects | 本地 |
 
-三端**互通**：n2n-termux ↔ n2n-go-client ↔ n2n-android 可以互相访问。
-
----
-
-## 🚨 限制
-
-| 项 | 说明 |
-|----|------|
-| **应用透明性** | 需要显式配置 SOCKS5，不像 TUN 模式那样"自动生效" |
-| **域名** | 不支持，只能用虚拟 IP |
-| **IPv6** | 不支持 |
-| **UDP 应用** | SOCKS5 只代理 TCP，`UDP ASSOCIATE` 未实现 |
-| **性能** | 比 TUN 模式略慢（多一层 SOCKS5 和应用流封装） |
-| **单设备 P2P** | 同机多实例测不出真 P2P（CGNAT 特性） |
-| **CGNAT hairpin** | 运营商 CGNAT 通常不支持，同出口 IP 时 P2P 会失败。**同 WiFi 场景优先走 LAN** |
+**先部署 edge-signal，再运行 n2n-termux。**
 
 ---
 
@@ -772,10 +688,13 @@ chmod +x ~/.termux/boot/n2n.sh
 
 MIT
 
----
+## 🔗 相关项目
 
-## 🙏 致谢
+| 项目 | 平台 | 模式 | 互通 |
+|:---|:---|:---|:---|
+| [edge-signal](https://github.com/goyo123321/edge-signal) | Cloudflare Workers | 信令服务器 | — |
+| [n2n-go-client](https://github.com/goyo123321/n2n-go-client) | Linux / macOS / Windows | TUN | ✅ 全部 |
+| **n2n-termux** | Android Termux | **SOCKS5** | ✅ 全部 |
+| [n2n-android](https://github.com/goyo123321/n2n-android) | Android APK | VpnService | ✅ 全部 |
 
-- [pion/stun](https://github.com/pion/stun) — STUN 协议实现（NAT 探测）
-- [gorilla/websocket](https://github.com/gorilla/websocket) — WebSocket 传输
-- 服务端 [edge-signal](https://github.com/goyo123321/edge-signal) 提供信令、打洞协调、TURN 凭证
+**三端互通**：n2n-termux ↔ n2n-go-client ↔ n2n-android 可以互相访问。
