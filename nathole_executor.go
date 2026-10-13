@@ -56,7 +56,9 @@ const (
 
 const maxConsecutiveFails = 5
 
-var probePrefix = []byte{0x4E, 0x32, 0x4E, 0x50}
+// ★ 注意：probePrefix 和 buildPunchProbe 定义在 punch.go 里。
+//   之前在此文件里重复定义了这两项导致编译错误，现已删除。
+//   executeNatHole 里对 buildPunchProbe 的调用会自动解析到 punch.go。
 
 var (
 	natHoleActiveMu sync.Mutex
@@ -169,7 +171,7 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 
 // collectScanTargets 收集本轮打洞的全部候选地址。
 //
-// ★ 新增：与 PC 端对齐，四类候选去重合并：
+// 与 PC 端对齐，四类候选去重合并：
 //   1. LAN 地址（本机 peer 记录）—— 同 WiFi 场景优先
 //   2. 观测 raddr —— 已被证明可达的地址，最优先
 //   3. 服务端下发的 TargetAssistedEndpoints —— STUN 反射地址
@@ -288,7 +290,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		instr.BehaviorIndex, instr.Mode, instr.TTL,
 	)
 
-	// ★ 多目标候选：LAN + raddr + assisted + lan
+	// 多目标候选：LAN + raddr + assisted + lan
 	assistedTargets := e.collectScanTargets(instr)
 	log.Printf("[NAT-HOLE] 多目标扫描：LAN+raddr+assisted 共 %d 个候选", len(assistedTargets))
 
@@ -296,6 +298,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		time.Sleep(time.Duration(instr.SendDelayMs) * time.Millisecond)
 	}
 
+	// ★ buildPunchProbe 定义在 punch.go 里
 	probe := buildPunchProbe(e.virtualIP)
 	var attempts uint32
 
@@ -518,7 +521,9 @@ func parseSockAddr(s string) *net.UDPAddr {
 
 // resolveTarget 决定这次打洞往哪个地址发包。
 //
-// ★ 与 PC 端对齐：优先使用本机观测过的 raddr。
+// 与 PC 端对齐：优先使用本机观测过的 raddr。
+//   1. 观测 raddr —— 对端的包实际从哪来，唯一被证明可达的地址
+//   2. 指令声明的 TargetPubSocket / SenderPubSocket / ReceiverPubSocket
 func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 	// 1. 观测 raddr
 	e.peersMu.RLock()
@@ -540,15 +545,6 @@ func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 		}
 	}
 	return parseSockAddr(sock)
-}
-
-func buildPunchProbe(virtualIP string) []byte {
-	buf := make([]byte, 32)
-	copy(buf[0:4], probePrefix)
-	if ip := net.ParseIP(virtualIP); ip != nil && ip.To4() != nil {
-		copy(buf[4:8], ip.To4())
-	}
-	return buf
 }
 
 // hasTrafficFromTarget 检查是否从指定 peer 收到过包。
