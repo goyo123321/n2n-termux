@@ -247,6 +247,17 @@ func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 }
 
 // collectN2NSTargets 收集一个 stream 的所有候选发送地址。
+//
+// ★ 修复：加入 AssistedEndpoints —— 之前只有 LAN + lastRecvFrom +
+//   peerAddr + peerUDPAddr，缺少 STUN 反射的多端点。对称 NAT 场景下
+//   多端点候选是命中率的关键。
+//
+// 优先级（保持顺序，去重保留首次）：
+//   1. LAN 地址（同 WiFi 场景）
+//   2. AssistedEndpoints（STUN 反射的多个公网映射）
+//   3. lastRecvFrom（对端最近一次发来的源地址，最可信）
+//   4. peerAddr（注册时分配的地址 / SYN 来源地址）
+//   5. peer.UDPAddr（观测 raddr）
 func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	s.mu.Lock()
 	primary := s.peerAddr
@@ -256,9 +267,11 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 	e.peersMu.RLock()
 	var lanEndpoints []string
+	var assisted []string
 	var peerUDPAddr *net.UDPAddr
 	if p := e.peers[peerID]; p != nil {
 		lanEndpoints = p.LanEndpoints
+		assisted = p.AssistedEndpoints
 		peerUDPAddr = p.UDPAddr
 	}
 	e.peersMu.RUnlock()
@@ -277,18 +290,33 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 		out = append(out, a)
 	}
 
+	// 1. LAN
 	for _, lan := range lanEndpoints {
 		if ra, err := net.ResolveUDPAddr("udp", lan); err == nil {
 			add(ra)
 		}
 	}
+
+	// 2. AssistedEndpoints（★ 新增）
+	for _, ep := range assisted {
+		if ra, err := net.ResolveUDPAddr("udp", ep); err == nil {
+			add(ra)
+		}
+	}
+
+	// 3. lastRecvFrom
 	add(lastRecv)
+
+	// 4. peerAddr
 	add(primary)
+
+	// 5. peer.UDPAddr
 	add(peerUDPAddr)
 
 	return out
 }
 
+// sendP2PFrame 发送一帧到对端的所有候选地址。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -346,7 +374,7 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ 修复：PING/PONG 的语义区分。
+// ★ 修复：PING/PONG 语义区分。
 //
 //   收到 PING  → 只证明"对端→本端"单向可达，不升级本端状态，
 //                仅回一个 PONG 让对端确认双向。
@@ -354,9 +382,9 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 //   收到 PONG  → 本端发出的 PING 到达了对端，且对端回了 PONG。
 //                双向通道已被证明 → 这是真正的数据面验证 → MarkP2P。
 //
-//   之前把 PING 和 PONG 一起过滤，导致两端都停留在 P2PAvailable，
-//   socks5.go 的 useP2P 判断永远为 false，所有 SOCKS5 连接都走
-//   WS 中继——"打洞成功但数据面不过"的根因就在这。
+//   收到真实数据帧（SYN/SYNACK/DATA/ACK/FIN/RST）→ 直接 MarkP2P。
+//
+//   另外：收到任何 N2NS 帧都刷新 p.UDPAddr，避免 Keepalive 打到旧端口。
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -368,6 +396,17 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 	peerID := e.findPeerIDByAddr(peerAddr)
 	if peerID == "" {
 		return
+	}
+
+	// ★ 收到任何非 TURN 中继的 N2NS 帧都刷新 p.UDPAddr + lastRecvAt
+	//   避免 Keepalive 一直在打已老化的端口
+	if !viaTURN {
+		e.peersMu.Lock()
+		if p := e.peers[peerID]; p != nil {
+			p.UDPAddr = &net.UDPAddr{IP: peerAddr.IP, Port: peerAddr.Port}
+			p.lastRecvAt = time.Now().UnixMilli()
+		}
+		e.peersMu.Unlock()
 	}
 
 	if e.relayMgr != nil {
