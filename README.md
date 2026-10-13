@@ -91,13 +91,88 @@ bash ~/install-n2n.sh
 回车后按提示输入：
 
 ```
-Worker WSS 地址: wss://url.jyece.kdns.fr
+Worker WSS 地址: wss://edge-signal.<你的子域>.workers.dev
 连接密码 CONNECT_TOKEN:     ← 无则直接回车
 房间名 ROOM_ID: testroom
 客户端 ID CLIENT_ID: termux-a
 显示名 NODE_NAME: Termux-A
 SOCKS5 监听地址 (127.0.0.1:1080):     ← 直接回车
 ```
+非交互式部署（推荐）
+
+```bash
+SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
+ROOM_ID="testroom" \
+CLIENT_ID="termux-a" \
+NODE_NAME="Termux-A" \
+CONNECT_TOKEN="" \
+SOCKS5_LISTEN="127.0.0.1:1080" \
+AUTO_START=1 \
+bash ~/install-n2n.sh
+```
+
+要改的只有两处：
+
+占位符 换成
+edge-signal.<你的子域>.workers.dev 你部署 edge-signal 时 wrangler 输出的 URL
+termux-a / Termux-A 每台设备不同（termux-a/termux-b）
+
+---
+
+两台设备的具体命令
+
+设备 A
+
+```bash
+SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
+ROOM_ID="myroom" \
+CLIENT_ID="termux-a" \
+NODE_NAME="Termux-A" \
+AUTO_START=1 \
+bash ~/install-n2n.sh
+```
+
+设备 B
+
+```bash
+SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
+ROOM_ID="myroom" \
+CLIENT_ID="termux-b" \
+NODE_NAME="Termux-B" \
+AUTO_START=1 \
+bash ~/install-n2n.sh
+```
+
+同一房间 → ROOM_ID 相同
+不同设备 → CLIENT_ID / NODE_NAME 不同
+
+---
+
+有 CONNECT_TOKEN 的服务端
+
+服务端配了 npx wrangler secret put CONNECT_TOKEN，客户端就要带：
+
+```bash
+SIGNALING_URL="wss://edge-signal.<你的子域>.workers.dev" \
+CONNECT_TOKEN="你设的token" \
+ROOM_ID="myroom" \
+CLIENT_ID="termux-a" \
+NODE_NAME="Termux-A" \
+AUTO_START=1 \
+bash ~/install-n2n.sh
+```
+
+没配就不写 CONNECT_TOKEN，脚本默认空。
+
+---
+
+更新 install.sh 到最新版
+
+```bash
+curl -fsSL -o ~/install-n2n.sh \
+  https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh
+```
+
 
 装完自动启动。
 
