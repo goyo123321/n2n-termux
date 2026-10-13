@@ -28,6 +28,35 @@ var (
 
 const DefaultVirtualCIDR = "10.64.0.0/24"
 
+// ★ LAN 缓存：reportMetadata 里实时收集为空时，回退用上次成功结果，
+//   避免 ready 处理瞬间 net.Interfaces() 返回空导致首次 p2p_metadata
+//   里 lanEndpoints 缺失。
+var (
+	lanCacheMu   sync.Mutex
+	lanCache     []string
+	lanCacheTime time.Time
+)
+
+func saveLANCache(lans []string) {
+	if len(lans) == 0 {
+		return
+	}
+	lanCacheMu.Lock()
+	lanCache = append([]string(nil), lans...)
+	lanCacheTime = time.Now()
+	lanCacheMu.Unlock()
+}
+
+func loadLANCache() []string {
+	lanCacheMu.Lock()
+	defer lanCacheMu.Unlock()
+	// 缓存超过 5 分钟不用（可能网络已切换）
+	if len(lanCache) == 0 || time.Since(lanCacheTime) > 5*time.Minute {
+		return nil
+	}
+	return append([]string(nil), lanCache...)
+}
+
 type PeerInfo struct {
 	ClientID          string
 	VirtualIP         string
@@ -68,7 +97,6 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
-	// P2PAvailable 30 秒超时降级定时器
 	p2pAvailTimers   map[string]*time.Timer
 	p2pAvailTimersMu sync.Mutex
 
@@ -190,14 +218,7 @@ func (e *Edge) startP2PKeepalive() {
 	})
 }
 
-// ★ 修复：改用 N2NS PING 多目标发送，替代单目标 Punch。
-//
-// 旧版只往 p.UDPAddr 单目标发 Punch，对称 NAT 老化后这个端口失效，
-// Keepalive 打水漂，P2P 通道在 60 秒内静默死掉。
-//
-// 新版调用 p2pStreams.sendP2PProbe，走 sendP2PFrame → collectN2NSTargets
-// 多目标发送（LAN + assisted + lastRecvFrom + peerAddr + peerUDPAddr），
-// 大幅提升 Keepalive 命中率。
+// sendP2PKeepalive 用 N2NS PING 多目标发送，替代单目标 Punch。
 func (e *Edge) sendP2PKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -277,7 +298,6 @@ func (e *Edge) cancelFallbackTimer(peerID string) {
 	}
 }
 
-// P2PAvailable 30 秒超时降级。
 func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
 	if e.relayMgr == nil || peerID == "" {
 		return
@@ -396,6 +416,12 @@ func main() {
 	actualPort := udpConn.LocalAddr().(*net.UDPAddr).Port
 	edge.udpPort = actualPort
 	log.Printf("[P2P] UDP 监听端口 %d", actualPort)
+
+	// ★ 启动早期先预收集一次 LAN，让缓存就绪
+	if lans := collectLANEndpoints(actualPort, ""); len(lans) > 0 {
+		saveLANCache(lans)
+		log.Printf("[NAT] 启动预收集 LAN: %v", lans)
+	}
 
 	servers := []string{}
 	if stunServers != "" {
@@ -595,6 +621,10 @@ func (e *Edge) Stop() {
 	}
 }
 
+// reportMetadata 上报 p2p_metadata。
+//
+// ★ 修复：LAN 收集为空时回退用缓存，避免 ready 处理瞬间接口未就绪
+//   导致首次上报的 lanEndpoints 缺失。
 func (e *Edge) reportMetadata() {
 	if e.ws == nil || e.natMeta == nil {
 		return
@@ -630,18 +660,53 @@ func (e *Edge) reportMetadata() {
 		metaPayload["assistedEndpoints"] = nm.AllEndpoints
 	}
 
+	// ★ LAN：优先实时收集；空则用缓存；非空则更新缓存
 	vip := e.getVirtualIPLocked()
-	if lanEndpoints := collectLANEndpoints(e.udpPort, vip); len(lanEndpoints) > 0 {
+	lanEndpoints := collectLANEndpoints(e.udpPort, vip)
+	if len(lanEndpoints) > 0 {
+		saveLANCache(lanEndpoints)
+	} else {
+		if cached := loadLANCache(); len(cached) > 0 {
+			lanEndpoints = cached
+			log.Printf("[NAT] LAN 实时为空，用缓存: %v", cached)
+		}
+	}
+	if len(lanEndpoints) > 0 {
 		metaPayload["lanEndpoints"] = lanEndpoints
 		log.Printf("[NAT] 上报 LAN 地址: %v", lanEndpoints)
 	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d",
-		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints))
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d lan=%d",
+		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints), len(lanEndpoints))
 
 	_ = e.ws.Send(map[string]interface{}{
 		"type":    "p2p_metadata",
 		"payload": metaPayload,
+	})
+}
+
+// ★ 新增：异步重试 LAN 收集。首次 ready 时如果 LAN 为空，
+//   后台每 500ms 重试一次，成功就重新上报 p2p_metadata。
+//   最多重试 20 次（10 秒）。
+func (e *Edge) retryLANCollection() {
+	safeGo("lan-retry", func() {
+		for i := 0; i < 20; i++ {
+			select {
+			case <-e.doneCh:
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+
+			vip := e.getVirtualIPLocked()
+			lans := collectLANEndpoints(e.udpPort, vip)
+			if len(lans) > 0 {
+				saveLANCache(lans)
+				log.Printf("[NAT] ✅ LAN 重试成功（第 %d 次）: %v，重新上报 p2p_metadata", i+1, lans)
+				e.reportMetadata()
+				return
+			}
+		}
+		log.Printf("[NAT] ⚠️ LAN 重试 20 次仍为空（10s），放弃")
 	})
 }
 
@@ -685,6 +750,7 @@ func (e *Edge) logPeerReady(peerID string) {
 	pubPort := p.PubPort
 	clientID := p.ClientID
 	lans := p.LanEndpoints
+	assisted := p.AssistedEndpoints
 	e.peersMu.Unlock()
 
 	log.Println("")
@@ -695,6 +761,9 @@ func (e *Edge) logPeerReady(peerID string) {
 	}
 	if len(lans) > 0 {
 		log.Printf("  LAN 地址  : %v", lans)
+	}
+	if len(assisted) > 0 {
+		log.Printf("  STUN 端点 : %v", assisted)
 	}
 	log.Println("==========================================")
 	log.Println("")
@@ -732,6 +801,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 		e.reportMetadata()
+
+		// ★ 如果 LAN 实时收集为空，异步重试。这是修复
+		//   "首次 p2p_metadata 里 lanEndpoints 缺失" 的关键。
+		if len(collectLANEndpoints(e.udpPort, vip)) == 0 {
+			log.Printf("[NAT] 首次 LAN 收集为空，启动后台重试")
+			e.retryLANCollection()
+		}
 
 		if peers, ok := payload["peers"].([]interface{}); ok {
 			for _, p := range peers {
@@ -1015,10 +1091,6 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
-// registerPeer 注册/更新 peer 信息。
-//
-// ★ 本次修复：加诊断日志，打印服务端下发的原始 lanEndpoints 和
-//   sortLANByAffinity 后的结果，用于定位 LAN 候选丢失。
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
 		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
@@ -1104,7 +1176,6 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	}
 }
 
-// runNatHole 执行一次打洞指令，并在成功时主动触发 P2P 数据面探针。
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
 	if res == nil {
@@ -1123,7 +1194,6 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
 
-	// TURN/Relay 不冒充 P2P
 	p2pStatus := 0
 	switch e.relayMgr.GetState(instr.TargetMac) {
 	case ConnP2P:
@@ -1172,13 +1242,6 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true, false)
 }
 
-// notePeerCommon 是打洞握手路径的统一入口。
-//
-// 规则：
-//  1. Punch 与 ACK 分开处理，ACK **绝不回复**
-//  2. 收到 Punch 或 ACK 都升级到 P2PAvailable
-//  3. 只有收到真实 P2P 数据帧或 PONG 才升级到 P2P（在 handleP2PFrame 里）
-//  4. 首次进入 P2PAvailable 时主动发 P2P PING 探针 + 启动 30s 超时降级
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1215,7 +1278,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// ---- 1. 真实数据帧：直接升 P2P ----
 	if isRealData {
 		if e.relayMgr.GetState(clientID) != ConnP2P {
 			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧 → P2P 直连", clientID, ip)
@@ -1224,7 +1286,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// ---- 2. Punch / ACK：打洞握手成功，升级到 P2PAvailable ----
 	curState := e.relayMgr.GetState(clientID)
 	justUpgraded := false
 	if curState != ConnP2P && curState != ConnP2PAvailable {
@@ -1237,7 +1298,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		justUpgraded = true
 	}
 
-	// 首次进入 P2PAvailable：主动发 P2P PING 探针 + 启动超时降级
 	if justUpgraded {
 		if e.p2pStreams != nil {
 			safeGo("p2p-probe", func() {
@@ -1247,7 +1307,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		e.scheduleP2PAvailTimeout(clientID)
 	}
 
-	// ---- 3. 只对 Punch 回 ACK，对 ACK 绝不回复 ----
 	if isAck {
 		return
 	}
