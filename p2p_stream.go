@@ -21,6 +21,8 @@ const (
 	p2pTypeACK    = 4
 	p2pTypeFIN    = 5
 	p2pTypeRST    = 6
+	p2pTypePING   = 7 // ★ 新增：数据面活跃探针
+	p2pTypePONG   = 8 // ★ 新增：PING 响应
 )
 
 const (
@@ -200,6 +202,38 @@ func (m *P2PStreamManager) reaper() {
 	}
 }
 
+// sendP2PProbe 向 peerID 发一个裸 P2P PING 帧（无需 stream）。
+//
+// 目的：打洞握手成功后（P2PAvailable 状态），主动触发一次数据面验证。
+// 对端收到 PING 会走 handleP2PFrame → MarkP2P，同时回 PONG；
+// 本端收到 PONG 也会 MarkP2P。双方都在 1 个 RTT 内完成 FullDuplex 升级，
+// 不用等上层应用发起业务流量。
+//
+// 帧的 StreamID 用 0（保留值，与真实 stream 的偶数 ID 不冲突），
+// 对端 handleFrame 找不到 stream 会直接走裸探针分支。
+func (m *P2PStreamManager) sendP2PProbe(peerID string) {
+	if m == nil || m.edge == nil || peerID == "" {
+		return
+	}
+	addr, viaTURN := m.edge.peerAddrAndMode(peerID)
+	if addr == nil {
+		return
+	}
+	frame := &p2pFrame{
+		Type:     p2pTypePING,
+		StreamID: 0,
+	}
+	tmp := &P2PStream{
+		ID:       0,
+		PeerID:   peerID,
+		peerAddr: addr,
+		viaTURN:  viaTURN,
+	}
+	if err := m.edge.sendP2PFrame(tmp, frame); err != nil {
+		log.Printf("[P2P-PROBE] 向 %s 发 P2P PING 失败: %v", peerID, err)
+	}
+}
+
 // sendP2PFrame 发送一帧到对端。
 //
 // 优先级：
@@ -374,7 +408,7 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 	viaTURN := true
 	if e.relayMgr != nil {
 		st := e.relayMgr.GetState(peerID)
-		// ★ P2P 和 P2PAvailable 都算"不走 TURN"
+		// P2P 和 P2PAvailable 都算"不走 TURN"
 		viaTURN = st != ConnP2P && st != ConnP2PAvailable
 	}
 	return p.UDPAddr, viaTURN
@@ -518,12 +552,39 @@ func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTU
 	safeGo("p2p-tx", func() { s.readLocalAndSend(m.edge) })
 }
 
+// handleFrame 处理收到的 P2P 帧。
+//
+// 分两条路径：
+//   - StreamID 匹配到已有 stream → 走 stream 状态机
+//   - StreamID=0（裸探针 PING/PONG）→ 简单处理，不涉及 stream
 func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
 	s := m.get(f.StreamID)
+
+	// ★ 无 stream 时的裸帧处理
 	if s == nil {
+		if f.Type == p2pTypePING {
+			// 收到 PING → 回 PONG
+			go func() {
+				resp := &p2pFrame{Type: p2pTypePONG, StreamID: 0}
+				tmp := &P2PStream{
+					ID:       0,
+					PeerID:   peerID,
+					peerAddr: peerAddr,
+					viaTURN:  viaTURN,
+				}
+				_ = m.edge.sendP2PFrame(tmp, resp)
+			}()
+			return
+		}
+		if f.Type == p2pTypePONG {
+			// PONG 只是响应，MarkP2P 已在 handleP2PFrame 完成
+			return
+		}
 		if f.Type == p2pTypeSYN {
 			safeGo("p2p-accept", func() { m.acceptSYN(peerID, peerAddr, viaTURN, f) })
+			return
 		}
+		// 其余（DATA/ACK/FIN/RST 但无 stream）：丢弃
 		return
 	}
 
