@@ -682,9 +682,6 @@ func (e *Edge) reportMetadata() {
 }
 
 // retryLANCollection 后台重试收集 LAN。
-//
-// 场景：ready 处理瞬间 net.Interfaces() 偶发返回空。后台每 500ms 重试，
-// 成功就重新上报 p2p_metadata。最多 20 次（10 秒）。
 func (e *Edge) retryLANCollection() {
 	safeGo("lan-retry", func() {
 		for i := 0; i < 20; i++ {
@@ -799,7 +796,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 
 		e.reportMetadata()
 
-		// 首次 LAN 为空 → 启动后台重试
 		if len(collectLANEndpoints(e.udpPort, vip)) == 0 {
 			log.Printf("[NAT] 首次 LAN 收集为空，启动后台重试")
 			e.retryLANCollection()
@@ -1238,21 +1234,78 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true, false)
 }
 
+// notePeerCommon 是打洞握手路径的统一入口。
+//
+// ★ 本次修复：匹配逻辑从"只认 UDPAddr 公网地址"改为 score 制，
+//   同时认三类源地址：
+//     - p.UDPAddr（最近记录的公网地址）    —— 分数 3~4
+//     - p.LanEndpoints（对端上报的 LAN）    —— 分数 2~5
+//     - p.AssistedEndpoints（STUN 反射）    —— 分数 1~4
+//
+//   之前只认 UDPAddr，导致对端从 LAN 发来的 Punch/ACK 被静默丢弃——
+//   "LAN 候选命中不了" 的根因就在这。
+//
+// 规则：
+//  1. Punch 与 ACK 分开处理，ACK **绝不回复**
+//  2. 收到 Punch 或 ACK 都升级到 P2PAvailable
+//  3. 只有收到真实 P2P 数据帧或 PONG 才升级到 P2P（在 handleP2PFrame 里）
+//  4. 首次进入 P2PAvailable 时主动发 P2P PING 探针 + 启动 30s 超时降级
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
 	e.peersMu.Lock()
 	var best *PeerInfo
-	bestScore := -1
+	bestScore := 0
+	addrIP := addr.IP
+	addrPort := addr.Port
+
 	for _, p := range e.peers {
-		if p.UDPAddr == nil || !p.UDPAddr.IP.Equal(addr.IP) {
-			continue
+		score := 0
+
+		// 1. 匹配已记录的公网 UDP 地址
+		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addrIP) {
+			if p.UDPAddr.Port == addrPort {
+				score = 4
+			} else {
+				score = 3
+			}
 		}
-		score := 1
-		if p.UDPAddr.Port == addr.Port {
-			score = 2
+
+		// 2. 匹配 peer 的 LAN 地址（★ 新增）
+		for _, lan := range p.LanEndpoints {
+			la, err := net.ResolveUDPAddr("udp", lan)
+			if err != nil || la == nil || la.IP == nil {
+				continue
+			}
+			if la.IP.Equal(addrIP) {
+				if la.Port == addrPort {
+					if score < 5 {
+						score = 5
+					}
+				} else if score < 2 {
+					score = 2
+				}
+			}
 		}
-		if score > bestScore {
+
+		// 3. 匹配 peer 的 assisted 地址（★ 新增）
+		for _, ass := range p.AssistedEndpoints {
+			aa, err := net.ResolveUDPAddr("udp", ass)
+			if err != nil || aa == nil || aa.IP == nil {
+				continue
+			}
+			if aa.IP.Equal(addrIP) {
+				if aa.Port == addrPort {
+					if score < 4 {
+						score = 4
+					}
+				} else if score < 1 {
+					score = 1
+				}
+			}
+		}
+
+		if score > 0 && score > bestScore {
 			best = p
 			bestScore = score
 		}
@@ -1509,12 +1562,10 @@ func readNameservers(path string) []string {
 
 // collectLANEndpoints 收集本机所有 LAN 端点。
 //
-// ★ 双路径：
+// 双路径：
 //   1. UDP connect 骗内核返回出口 IP —— Termux/Android 上
 //      net.Interfaces() 有时拿不到 WiFi 接口，这个路径永远可靠。
-//   2. 兜底遍历 net.Interfaces() —— 覆盖多网卡（WiFi + USB 网卡等）。
-//
-// 两条路径合并去重。
+//   2. 兜底遍历 net.Interfaces() —— 覆盖多网卡。
 func collectLANEndpoints(port int, selfVIP string) []string {
 	var result []string
 	seen := make(map[string]bool)
@@ -1579,12 +1630,6 @@ func collectLANEndpoints(port int, selfVIP string) []string {
 }
 
 // detectOutboundIP 用一个不真正发包的 UDP connect 骗内核选出出口网卡。
-//
-// 原理：connect UDP 只更新内核 socket 的路由缓存，不触发 ARP、不发包。
-// getsockname() 返回内核为该 socket 选定的本地 IP —— 即"出网卡"的 IP。
-//
-// 蜂窝下返回运营商分配的内网 IP（10.x / 100.64.x），会被 isPrivateIPv4 /
-// isCGNATOverlay 过滤掉。WiFi 下返回 192.168.x.x，正好是我们想要的。
 func detectOutboundIP() net.IP {
 	targets := []string{
 		"8.8.8.8:80",
