@@ -113,14 +113,17 @@ type Edge struct {
 
 func (e *Edge) Done() <-chan struct{} { return e.doneCh }
 
-// ============ UDP 保活（STUN 侧） ============
+// ============ UDP 保活 ============
 
 const keepaliveInterval = 5 * time.Second
 
+// ★ 修复：STUN 服务器从 3 个扩到 5 个
 var keepaliveServers = []string{
 	"74.125.250.129:19302",
+	"74.125.204.127:19302",
 	"162.159.207.0:3478",
 	"stun.miwifi.com:3478",
+	"stun.cloudflare.com:3478",
 }
 
 func buildSTUNBindingRequest() []byte {
@@ -139,6 +142,16 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
+// ★ 修复：UDP 保活无条件发送
+//
+// 旧版"仅在有 peer 时发送"，导致：
+//   1. 客户端启动到新 peer 加入的空窗期（可能 1-3 分钟）
+//   2. CGNAT 映射被回收，端口漂移（实测 42 秒漂移）
+//   3. 打洞时双方用过期端口，扫描范围暴涨（实测 3208 端口）
+//
+// 新逻辑无条件发送：
+//   - 流量代价：每设备每天 ~50 MB（可接受）
+//   - 收益：CGNAT 端口稳定，打洞一次命中
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -155,7 +168,7 @@ func (e *Edge) startKeepalive() {
 		return
 	}
 
-	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器（仅在有 peer 时）",
+	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器（无条件，保 CGNAT 映射）",
 		keepaliveInterval, len(addrs))
 
 	safeGo("keepalive", func() {
@@ -166,15 +179,8 @@ func (e *Edge) startKeepalive() {
 			}
 		}
 
-		hasPeers := func() bool {
-			e.peersMu.RLock()
-			defer e.peersMu.RUnlock()
-			return len(e.peers) > 0
-		}
-
-		if hasPeers() {
-			sendOnce()
-		}
+		// 立即发一次
+		sendOnce()
 
 		ticker := time.NewTicker(keepaliveInterval)
 		defer ticker.Stop()
@@ -184,9 +190,6 @@ func (e *Edge) startKeepalive() {
 				log.Printf("[Keepalive] 已停止")
 				return
 			case <-ticker.C:
-				if !hasPeers() {
-					continue
-				}
 				sendOnce()
 			}
 		}
@@ -1226,6 +1229,10 @@ func (e *Edge) notePeerProbeTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, false, true, false)
 }
 
+func (e *Edge) notePeerAckTURN(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false, true, true)
+}
+
 func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, false, false)
 }
@@ -1236,20 +1243,10 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 是打洞握手路径的统一入口。
 //
-// ★ 本次修复：匹配逻辑从"只认 UDPAddr 公网地址"改为 score 制，
-//   同时认三类源地址：
-//     - p.UDPAddr（最近记录的公网地址）    —— 分数 3~4
-//     - p.LanEndpoints（对端上报的 LAN）    —— 分数 2~5
-//     - p.AssistedEndpoints（STUN 反射）    —— 分数 1~4
-//
-//   之前只认 UDPAddr，导致对端从 LAN 发来的 Punch/ACK 被静默丢弃——
-//   "LAN 候选命中不了" 的根因就在这。
-//
-// 规则：
-//  1. Punch 与 ACK 分开处理，ACK **绝不回复**
-//  2. 收到 Punch 或 ACK 都升级到 P2PAvailable
-//  3. 只有收到真实 P2P 数据帧或 PONG 才升级到 P2P（在 handleP2PFrame 里）
-//  4. 首次进入 P2PAvailable 时主动发 P2P PING 探针 + 启动 30s 超时降级
+// score 制匹配：
+//   - p.UDPAddr         分数 3~4
+//   - p.LanEndpoints    分数 2~5
+//   - p.AssistedEndpoints 分数 1~4
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1262,7 +1259,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	for _, p := range e.peers {
 		score := 0
 
-		// 1. 匹配已记录的公网 UDP 地址
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addrIP) {
 			if p.UDPAddr.Port == addrPort {
 				score = 4
@@ -1271,7 +1267,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 			}
 		}
 
-		// 2. 匹配 peer 的 LAN 地址（★ 新增）
 		for _, lan := range p.LanEndpoints {
 			la, err := net.ResolveUDPAddr("udp", lan)
 			if err != nil || la == nil || la.IP == nil {
@@ -1288,7 +1283,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 			}
 		}
 
-		// 3. 匹配 peer 的 assisted 地址（★ 新增）
 		for _, ass := range p.AssistedEndpoints {
 			aa, err := net.ResolveUDPAddr("udp", ass)
 			if err != nil || aa == nil || aa.IP == nil {
