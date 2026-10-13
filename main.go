@@ -68,6 +68,14 @@ type Edge struct {
 	fallbackTimers   map[string]*time.Timer
 	fallbackTimersMu sync.Mutex
 
+	// ★ 新增：P2PAvailable 30 秒超时降级定时器。
+	//
+	// 打洞握手成功后进入 P2PAvailable，30 秒内如果没升到 P2P
+	// （没收到 PONG 或真实数据帧），强制降级到 TURN/WS。
+	// 用可取消的定时器替代之前匿名的 safeGo("p2p-avail-timeout")。
+	p2pAvailTimers   map[string]*time.Timer
+	p2pAvailTimersMu sync.Mutex
+
 	lastMetadataReportAt int64
 
 	streamMgr  *AppStreamManager
@@ -270,6 +278,55 @@ func (e *Edge) cancelFallbackTimer(peerID string) {
 	}
 }
 
+// ★ 新增：P2PAvailable 30 秒超时降级。
+//
+// 打洞握手成功后进入 P2PAvailable，30 秒内如果没有升到 P2P（即没有
+// 收到 PONG 或真实数据帧），强制降级到 TURN/WS。
+//
+// 场景：CGNAT hairpin 场景下握手成功但数据面永远过不去。没有这个
+// 兜底会永远停在 P2PAvailable，SOCKS5 每次都尝试建流 2 秒超时。
+//
+// 用可取消的定时器而非匿名 safeGo，原因：peer 断线重连后旧定时器
+// 会误降级新连接。
+func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
+	if e.relayMgr == nil || peerID == "" {
+		return
+	}
+
+	e.p2pAvailTimersMu.Lock()
+	if t, ok := e.p2pAvailTimers[peerID]; ok {
+		t.Stop()
+	}
+
+	t := time.AfterFunc(30*time.Second, func() {
+		e.p2pAvailTimersMu.Lock()
+		delete(e.p2pAvailTimers, peerID)
+		e.p2pAvailTimersMu.Unlock()
+
+		if e.relayMgr == nil {
+			return
+		}
+		if e.relayMgr.GetState(peerID) == ConnP2PAvailable {
+			log.Printf("[P2P] %s P2PAvailable 超时 30s 未验证数据面，强制降级", peerID)
+			e.relayMgr.ForceFallback(peerID, "p2p-avail-timeout")
+		}
+	})
+	e.p2pAvailTimers[peerID] = t
+	e.p2pAvailTimersMu.Unlock()
+}
+
+func (e *Edge) cancelP2PAvailTimeout(peerID string) {
+	if peerID == "" {
+		return
+	}
+	e.p2pAvailTimersMu.Lock()
+	defer e.p2pAvailTimersMu.Unlock()
+	if t, ok := e.p2pAvailTimers[peerID]; ok {
+		t.Stop()
+		delete(e.p2pAvailTimers, peerID)
+	}
+}
+
 // ============ 主函数 ============
 
 func main() {
@@ -328,6 +385,7 @@ func main() {
 		peers:          make(map[string]*PeerInfo),
 		udpPort:        udpPort,
 		fallbackTimers: make(map[string]*time.Timer),
+		p2pAvailTimers: make(map[string]*time.Timer), // ★ 新增
 		doneCh:         make(chan struct{}),
 		streamMgr:      NewAppStreamManager(),
 	}
@@ -378,6 +436,14 @@ func main() {
 		if edge.punchAckLimiter != nil {
 			edge.punchAckLimiter.clear()
 		}
+
+		// ★ 清理所有 P2PAvailable 超时定时器
+		edge.p2pAvailTimersMu.Lock()
+		for _, t := range edge.p2pAvailTimers {
+			t.Stop()
+		}
+		edge.p2pAvailTimers = make(map[string]*time.Timer)
+		edge.p2pAvailTimersMu.Unlock()
 
 		natHoleActiveMu.Lock()
 		failCount := len(failCounts)
@@ -518,6 +584,14 @@ func (e *Edge) Stop() {
 	}
 	e.fallbackTimers = make(map[string]*time.Timer)
 	e.fallbackTimersMu.Unlock()
+
+	// ★ 新增：清理 P2PAvailable 超时定时器
+	e.p2pAvailTimersMu.Lock()
+	for _, t := range e.p2pAvailTimers {
+		t.Stop()
+	}
+	e.p2pAvailTimers = make(map[string]*time.Timer)
+	e.p2pAvailTimersMu.Unlock()
 
 	if e.turnClient != nil {
 		e.turnClient.Close()
@@ -818,7 +892,9 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			if e.relayMgr.GetState(peerID) == ConnP2P {
 				continue
 			}
-			e.relayMgr.MarkFallback(peerID)
+			// ★ 用 ForceFallback 而非 MarkFallback：服务端明确要求降级时
+			//   应该绕过 P2PAvailable 保护，直接切到 TURN/WS。
+			e.relayMgr.ForceFallback(peerID, reason)
 		}
 
 	case "turn_peer_info":
@@ -851,6 +927,9 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		if e.relayMgr != nil {
 			e.relayMgr.ClearPeer(from)
 		}
+
+		// ★ 清理 P2PAvailable 超时定时器
+		e.cancelP2PAvailTimeout(from)
 
 		if e.punchAckLimiter != nil {
 			e.punchAckLimiter.forget(from)
@@ -1033,15 +1112,12 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 
 // runNatHole 执行一次打洞指令，并在成功时主动触发 P2P 数据面探针。
 //
-// ★ 修复：打洞成功后不等上层应用流量，立刻发一个 P2P PING 探针。
-//
-// 原因：打洞握手成功只证明 NAT 映射打开，状态升级到 P2PAvailable。
+// 打洞成功后不等上层应用流量，立刻发一个 P2P PING 探针。
+// 打洞握手成功只证明 NAT 映射打开，状态升级到 P2PAvailable。
 // 要升级到 P2P（数据面验证），必须有真实 P2P 数据帧到达。
-// SOCKS5 只在应用发起连接时建 stream，如果双方都没流量，就永远不会
-// 升级，服务端会以为打洞没成而反复下发指令，形成死循环。
 //
-// 主动发 PING 探针：对端收到会走 handleP2PFrame → MarkP2P 并回 PONG；
-// 本端收到 PONG 也 MarkP2P。双方在 1 个 RTT 内完成 P2P 升级。
+// 主动发 PING 探针：对端收到会回 PONG；本端收到 PONG 后
+// handleP2PFrame 会 MarkP2P。双方在 1 个 RTT 内完成 P2P 升级。
 func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	res := e.executeNatHole(instr)
 	if res == nil {
@@ -1051,7 +1127,7 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	if res.State == PunchStateSucceeded {
 		e.relayMgr.MarkP2PAvailable(instr.TargetMac)
 
-		// ★ 主动发 P2P PING 探针
+		// 主动发 P2P PING 探针
 		if e.p2pStreams != nil {
 			safeGo("p2p-probe", func() {
 				e.p2pStreams.sendP2PProbe(instr.TargetMac)
@@ -1061,14 +1137,16 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 		e.relayMgr.MarkFallback(instr.TargetMac)
 	}
 
+	// ★ 修复：TURN/Relay 不冒充 P2P。只有真正 P2P 才报 3，
+	//   打洞握手成功报 2，其余一律 0，避免误导服务端做交叉校验。
 	p2pStatus := 0
 	switch e.relayMgr.GetState(instr.TargetMac) {
 	case ConnP2P:
 		p2pStatus = 3
 	case ConnP2PAvailable:
 		p2pStatus = 2
-	case ConnTURN, ConnRelay:
-		p2pStatus = 2
+	default:
+		p2pStatus = 0
 	}
 
 	_ = e.ws.Send(map[string]interface{}{
@@ -1111,11 +1189,11 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 
 // notePeerCommon 是打洞握手路径的统一入口。
 //
-// 与项目一/二的 punch.go 对齐四件事：
+// 与 PC 端 punch.go 对齐四件事：
 //  1. Punch 与 ACK 分开处理，ACK **绝不回复**
 //  2. 收到 Punch 或 ACK 都升级到 P2PAvailable（打洞握手成功，未验证数据面）
-//  3. 只有收到真实 P2P 数据帧才升级到 P2P
-//  4. ★ 首次进入 P2PAvailable 时主动发 P2P PING 探针
+//  3. 只有收到真实 P2P 数据帧或 PONG 才升级到 P2P
+//  4. 首次进入 P2PAvailable 时主动发 P2P PING 探针
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1174,15 +1252,15 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		justUpgraded = true
 	}
 
-	// ★ 首次进入 P2PAvailable：主动发 P2P PING 探针，触发数据面验证。
-	//
-	// 打洞握手成功只证明 NAT 映射打开，不证明数据面能过。
-	// 上层应用未必立刻有流量，所以需要客户端自己发一个探针帧来
-	// 触发双向 MarkP2P。
-	if justUpgraded && e.p2pStreams != nil {
-		safeGo("p2p-probe", func() {
-			e.p2pStreams.sendP2PProbe(clientID)
-		})
+	// 首次进入 P2PAvailable：主动发 P2P PING 探针 + 启动超时降级定时器
+	if justUpgraded {
+		if e.p2pStreams != nil {
+			safeGo("p2p-probe", func() {
+				e.p2pStreams.sendP2PProbe(clientID)
+			})
+		}
+		// ★ 用可取消的定时器替代匿名 safeGo
+		e.scheduleP2PAvailTimeout(clientID)
 	}
 
 	// ---- 3. 只对 Punch 回 ACK，对 ACK 绝不回复 ----
