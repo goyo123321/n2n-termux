@@ -28,9 +28,7 @@ var (
 
 const DefaultVirtualCIDR = "10.64.0.0/24"
 
-// ★ LAN 缓存：reportMetadata 里实时收集为空时，回退用上次成功结果，
-//   避免 ready 处理瞬间 net.Interfaces() 返回空导致首次 p2p_metadata
-//   里 lanEndpoints 缺失。
+// LAN 缓存：reportMetadata 实时收集为空时回退用上次成功结果
 var (
 	lanCacheMu   sync.Mutex
 	lanCache     []string
@@ -50,7 +48,6 @@ func saveLANCache(lans []string) {
 func loadLANCache() []string {
 	lanCacheMu.Lock()
 	defer lanCacheMu.Unlock()
-	// 缓存超过 5 分钟不用（可能网络已切换）
 	if len(lanCache) == 0 || time.Since(lanCacheTime) > 5*time.Minute {
 		return nil
 	}
@@ -417,10 +414,12 @@ func main() {
 	edge.udpPort = actualPort
 	log.Printf("[P2P] UDP 监听端口 %d", actualPort)
 
-	// ★ 启动早期先预收集一次 LAN，让缓存就绪
+	// 启动早期预收集一次 LAN 到缓存
 	if lans := collectLANEndpoints(actualPort, ""); len(lans) > 0 {
 		saveLANCache(lans)
 		log.Printf("[NAT] 启动预收集 LAN: %v", lans)
+	} else {
+		log.Printf("[NAT] 启动预收集 LAN 为空（可能蜂窝网络，或 WiFi 未就绪）")
 	}
 
 	servers := []string{}
@@ -621,10 +620,7 @@ func (e *Edge) Stop() {
 	}
 }
 
-// reportMetadata 上报 p2p_metadata。
-//
-// ★ 修复：LAN 收集为空时回退用缓存，避免 ready 处理瞬间接口未就绪
-//   导致首次上报的 lanEndpoints 缺失。
+// reportMetadata 上报 p2p_metadata。LAN 实时收集为空时回退用缓存。
 func (e *Edge) reportMetadata() {
 	if e.ws == nil || e.natMeta == nil {
 		return
@@ -660,7 +656,7 @@ func (e *Edge) reportMetadata() {
 		metaPayload["assistedEndpoints"] = nm.AllEndpoints
 	}
 
-	// ★ LAN：优先实时收集；空则用缓存；非空则更新缓存
+	// LAN：实时收集优先；空则用缓存；非空则更新缓存
 	vip := e.getVirtualIPLocked()
 	lanEndpoints := collectLANEndpoints(e.udpPort, vip)
 	if len(lanEndpoints) > 0 {
@@ -685,9 +681,10 @@ func (e *Edge) reportMetadata() {
 	})
 }
 
-// ★ 新增：异步重试 LAN 收集。首次 ready 时如果 LAN 为空，
-//   后台每 500ms 重试一次，成功就重新上报 p2p_metadata。
-//   最多重试 20 次（10 秒）。
+// retryLANCollection 后台重试收集 LAN。
+//
+// 场景：ready 处理瞬间 net.Interfaces() 偶发返回空。后台每 500ms 重试，
+// 成功就重新上报 p2p_metadata。最多 20 次（10 秒）。
 func (e *Edge) retryLANCollection() {
 	safeGo("lan-retry", func() {
 		for i := 0; i < 20; i++ {
@@ -802,8 +799,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 
 		e.reportMetadata()
 
-		// ★ 如果 LAN 实时收集为空，异步重试。这是修复
-		//   "首次 p2p_metadata 里 lanEndpoints 缺失" 的关键。
+		// 首次 LAN 为空 → 启动后台重试
 		if len(collectLANEndpoints(e.udpPort, vip)) == 0 {
 			log.Printf("[NAT] 首次 LAN 收集为空，启动后台重试")
 			e.retryLANCollection()
@@ -1509,56 +1505,108 @@ func readNameservers(path string) []string {
 	return result
 }
 
-// ============ LAN 地址探测 ============
+// ============ LAN 地址探测（双路径） ============
 
+// collectLANEndpoints 收集本机所有 LAN 端点。
+//
+// ★ 双路径：
+//   1. UDP connect 骗内核返回出口 IP —— Termux/Android 上
+//      net.Interfaces() 有时拿不到 WiFi 接口，这个路径永远可靠。
+//   2. 兜底遍历 net.Interfaces() —— 覆盖多网卡（WiFi + USB 网卡等）。
+//
+// 两条路径合并去重。
 func collectLANEndpoints(port int, selfVIP string) []string {
 	var result []string
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
 	seen := make(map[string]bool)
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
+
+	add := func(ip4 net.IP) {
+		if ip4 == nil {
+			return
 		}
-		addrs, err := iface.Addrs()
+		if selfVIP != "" && ip4.String() == selfVIP {
+			return
+		}
+		if isCGNATOverlay(ip4) {
+			return
+		}
+		if !isPrivateIPv4(ip4) {
+			return
+		}
+		if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+			return
+		}
+		ep := net.JoinHostPort(ip4.String(), strconv.Itoa(port))
+		if seen[ep] {
+			return
+		}
+		seen[ep] = true
+		result = append(result, ep)
+	}
+
+	// 路径 1：UDP connect 骗内核
+	if ip := detectOutboundIP(); ip != nil {
+		add(ip)
+	}
+
+	// 路径 2：遍历接口
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				var ip net.IP
+				switch v := addr.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip == nil || ip.To4() == nil {
+					continue
+				}
+				add(ip.To4())
+			}
+		}
+	}
+
+	return result
+}
+
+// detectOutboundIP 用一个不真正发包的 UDP connect 骗内核选出出口网卡。
+//
+// 原理：connect UDP 只更新内核 socket 的路由缓存，不触发 ARP、不发包。
+// getsockname() 返回内核为该 socket 选定的本地 IP —— 即"出网卡"的 IP。
+//
+// 蜂窝下返回运营商分配的内网 IP（10.x / 100.64.x），会被 isPrivateIPv4 /
+// isCGNATOverlay 过滤掉。WiFi 下返回 192.168.x.x，正好是我们想要的。
+func detectOutboundIP() net.IP {
+	targets := []string{
+		"8.8.8.8:80",
+		"1.1.1.1:80",
+		"114.114.114.114:80",
+	}
+	for _, t := range targets {
+		conn, err := net.Dial("udp4", t)
 		if err != nil {
 			continue
 		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip == nil || ip.To4() == nil {
-				continue
-			}
-			ip4 := ip.To4()
-			if isCGNATOverlay(ip4) {
-				continue
-			}
-			if selfVIP != "" && ip4.String() == selfVIP {
-				continue
-			}
-			if !isPrivateIPv4(ip4) {
-				continue
-			}
-			if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
-				continue
-			}
-			ep := net.JoinHostPort(ip4.String(), strconv.Itoa(port))
-			if seen[ep] {
-				continue
-			}
-			seen[ep] = true
-			result = append(result, ep)
+		localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+		_ = conn.Close()
+		if !ok || localAddr == nil || localAddr.IP == nil {
+			continue
+		}
+		ip4 := localAddr.IP.To4()
+		if ip4 != nil {
+			return ip4
 		}
 	}
-	return result
+	return nil
 }
 
 func isPrivateIPv4(ip net.IP) bool {
