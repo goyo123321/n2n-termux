@@ -10,10 +10,13 @@
 
 - **无 root** — Termux 普通 App 权限即可运行
 - **无 TUN** — 不碰 `/dev/net/tun`，用 SOCKS5 代理接入
-- **三级降级** — `P2P → TURN → WS`，连接永远可用
+- **LAN 直连** — 同 WiFi 场景自动发现 LAN 地址，绕过 NAT 直接内网通信
+- **四级降级** — `LAN → P2P → TURN → WS`，连接永远可用
 - **P2P 直连** — UDP 打洞 + 自定义可靠流协议（`N2NS` 帧），延迟 10-50ms
 - **TURN 中继** — 手写 TURN-Lite 客户端，UDP 不通自动切 TCP
 - **WS 中继兜底** — 通过 Cloudflare Worker 转发，不消耗额外资源
+- **多目标打洞** — LAN + STUN 反射 + 观测 raddr 同时扫描，命中率大幅提升
+- **Keepalive 自愈** — 15 秒多目标 PING，NAT 端口漂移后自动重连
 - **DNS 内置修复** — 解决 Go 静态二进制读不到 Termux `/etc/resolv.conf` 的问题
 - **多架构** — arm64 / armv7 / amd64 三种二进制
 - **一键安装** — `curl | bash` 式脚本，全自动配置
@@ -30,14 +33,15 @@ Termux 是普通 App，Android 内核**不允许**其创建 TUN 设备，所以�
 ┌────────────────────────────────────────────────────────┐
 │  Termux 里的应用（curl / ssh / wget / …）              │
 │      │                                                  │
-│      │ SOCKS5 请求 "连 100.64.0.3:8080"                │
+│      │ SOCKS5 请求 "连 10.64.0.3:8080"                 │
 │      ▼                                                  │
 │  ┌──────────────┐    ┌────────────────┐                │
 │  │ SOCKS5 服务器 │───▶│ P2P 可靠流 /    │                │
 │  │ socks5.go    │    │ WS 应用流       │                │
 │  └──────────────┘    └────────┬───────┘                │
 │                               │                         │
-│                     三级数据通路：                       │
+│                     四级数据通路：                       │
+│                     ├─ LAN 直连（同 WiFi，<5ms）       │
 │                     ├─ P2P UDP（10-50ms）              │
 │                     ├─ TURN 中继（30-100ms）           │
 │                     └─ WebSocket（100-300ms）           │
@@ -65,7 +69,7 @@ Termux 是普通 App，Android 内核**不允许**其创建 TUN 设备，所以�
 
 | 通道 | 帧格式 | 传输 |
 |------|--------|------|
-| P2P / TURN | `N2NS` 自定义帧（SYN/DATA/ACK/FIN + 重传 + 窗口） | UDP |
+| LAN / P2P / TURN | `N2NS` 自定义帧（SYN/DATA/ACK/FIN + 重传 + 窗口） | UDP |
 | WS | JSON（`app_stream_open` / `app_stream_data` + base64） | WebSocket |
 
 ---
@@ -121,20 +125,20 @@ tail -f ~/n2n.log
 **单次命令**（curl 支持 `--socks5`）：
 
 ```bash
-curl --socks5 127.0.0.1:1080 http://100.64.0.3:8080/
+curl --socks5 127.0.0.1:1080 http://10.64.0.3:8080/
 ```
 
 **全局代理**（环境变量）：
 
 ```bash
 export ALL_PROXY=socks5://127.0.0.1:1080
-curl http://100.64.0.3:8080/
+curl http://10.64.0.3:8080/
 ```
 
 **SSH 通过 SOCKS5**：
 
 ```bash
-ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@100.64.0.3
+ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@10.64.0.3
 ```
 
 **其他 SOCKS5 客户端**：
@@ -152,7 +156,7 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@100.64.0.3
 
 ```bash
 # 从 PC 的 n2n-go-client
-curl http://100.64.0.2:8080/
+curl http://10.64.0.2:8080/
 ```
 
 ---
@@ -170,137 +174,205 @@ curl http://100.64.0.2:8080/
 | `STUN_SERVERS` | ❌ | 国内 STUN | STUN 服务器列表（逗号分隔） |
 | `UDP_PORT` | ❌ | `0` | P2P UDP 端口，`0`=自动分配 |
 
-**虚拟网段**由服务端 `VIRTUAL_NETWORK` 决定，客户端从 `ready` 消息自动接收。
+**虚拟网段**由服务端 `VIRTUAL_NETWORK` 决定，客户端从 `ready` 消息自动接收。默认 `10.64.0.0/24`。
 
 ---
 
 ## 📋 启动日志示例
 
-正常启动：
+正常启动（同 WiFi 场景）：
 
 ```
 [DNS] 使用 /data/data/com.termux/files/usr/etc/resolv.conf 的 2 个 nameserver: [8.8.8.8:53 8.8.4.4:53]
-n2n-termux v1.0.5 启动
+n2n-termux v1.1.0 启动
 [配置] 未设置 CONNECT_TOKEN
 [P2P] UDP 监听端口 37221
+[NAT] 启动预收集 LAN: [192.168.10.2:37221 192.168.10.11:37221]
 [NAT] STUN stun.chat.bilibili.com:3478 → 120.239.134.121:47877
 [NAT] STUN stun.hitv.com:3478 → 120.239.134.121:47878
 [NAT] HardNAT（对称），ports_diff=1 pub=120.239.134.121:47877 endpoints=2
 [WS] 连接 wss://url.jyece.kdns.fr/ws/testroom?cid=termux-a
 已连接信令，Client ID: termux-a，节点名: Termux-A
-分配虚拟 IP: 100.64.0.2（网段 100.64.0.0/16）
-[信令] 服务端看到的本机出口 IP: 47.76.28.111（WS/TCP 出口，仅参考）
-[信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="120.239.134.121:47877" multiExit=true assisted=2
+分配虚拟 IP: 10.64.0.2（网段 10.64.0.0/24）
+[信令] 服务端看到的本机出口 IP: 120.239.134.121（WS/TCP 出口，仅参考）
+[NAT] 上报 LAN 地址: [192.168.10.2:37221 192.168.10.11:37221]
+[信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="120.239.134.121:47877" multiExit=true assisted=2 lan=2
 [SOCKS5] 监听 127.0.0.1:1080（用 curl --socks5 或 ALL_PROXY 访问虚拟 IP）
 [TURN] endpoint: 111.171.194.230:3478 (scheme=turn transport=udp)
 [TURN-Lite] ✅ Allocation 成功: relay=111.171.194.230:63458
 [Keepalive] 启动，每 5s 刷新 3 个 STUN 服务器（仅在有 peer 时）
+[P2P-Keepalive] 启动，每 15s 刷新 P2P 通道
 
 ================= 本机信息 =================
   Client ID   : termux-a
   节点名       : Termux-A
-  虚拟 IP     : 100.64.0.2
-  虚拟网段    : 100.64.0.0/16
+  虚拟 IP     : 10.64.0.2
+  虚拟网段    : 10.64.0.0/24
   P2P 端口    : 37221
   模式         : proxy (SOCKS5)
 ==========================================
 ```
 
-P2P 打洞成功：
+**对端上线 + LAN 直连打洞**：
 
 ```
-[NAT-HOLE] 开始打洞 role=1 target=120.230.243.39:5417 rung=0 mode=3 ttl=7
-[NAT-HOLE] 模式：不同 STUN IP，全端口扫描
-[NAT-HOLE] ✅ 成功 (assisted) role=1 target=120.230.243.39 attempts=3
-[连接] termux-b → P2P 直连（prev=）
+[registerPeer] termux-b: 收到 assisted=1 个 [120.239.134.121:47742] lanEndpoints=1 个 [192.168.10.12:56629]
+[registerPeer] termux-b: sortedLAN=[192.168.10.12:56629] (prefixes=2)
+[信令] 节点上线: termux-b (vip=10.64.0.3)
+
+========== 节点就绪: termux-b ==========
+  虚拟 IP   : 10.64.0.3
+  公网地址  : 120.239.134.121:47742
+  LAN 地址  : [192.168.10.12:56629]
+  STUN 端点 : [120.239.134.121:47742]
+==========================================
+
+[NAT-HOLE] 开始打洞 role=1 target=192.168.10.12:56629
+[collectScanTargets] 去重后 2 个候选: [192.168.10.12:56629 120.239.134.121:47742]
+[NAT-HOLE] 优先扫描 2 个候选端点
+[P2P] 从 termux-b (192.168.10.12) 收到 Punch → P2PAvailable（等待数据帧验证）
+[P2P] 收到 PONG → P2P 直连（双向通道已验证）
+[连接] termux-b → P2P 直连（prev=p2p-avail，数据面已验证）
 ```
 
 **P2P 数据面成功**（真 P2P）：
 
 ```
-[SOCKS5] CONNECT 100.64.0.3:8080
-[SOCKS5] CONNECT 100.64.0.3:8080 → P2P 直连 (stream=2)
+[SOCKS5] CONNECT 10.64.0.3:8080
+[SOCKS5] CONNECT 10.64.0.3:8080 → P2P 直连 (stream=2)
 ```
 
 **P2P 失败回落 WS**：
 
 ```
-[SOCKS5] CONNECT 100.64.0.3:8080
+[SOCKS5] CONNECT 10.64.0.3:8080
 [P2P-STREAM] 2 建流超时（2s），保留 conn 让调用方回落
 [SOCKS5] P2P 建流失败(syn timeout)，回落 WS 中继
-[SOCKS5] CONNECT 100.64.0.3:8080 → WS 中继 (stream=termux-a-1)
+[SOCKS5] CONNECT 10.64.0.3:8080 → WS 中继 (stream=termux-a-1)
 ```
 
 ---
 
-## 🔥 三级降级
+## 🔥 四级降级
 
 ```
-① P2P UDP 直连（首选）
+① LAN 直连（同 WiFi 首选）
+   ├─ 延迟 <5ms
+   ├─ 零 NAT 穿越
+   ├─ 无流量计费
+   └─ 不同 LAN 则降级
+       │
+       ▼
+② P2P UDP 直连
    ├─ 延迟 10-50ms
    ├─ 不消耗任何资源
    └─ 打洞失败则降级
        │
        ▼
-② TURN 中继
+③ TURN 中继
    ├─ 延迟 30-100ms
    ├─ 消耗 TURN 服务器带宽（Cloudflare 1000GB/月免费）
    └─ TURN 不可用则降级
        │
        ▼
-③ WebSocket 中继
+④ WebSocket 中继
    ├─ 延迟 100-300ms
    ├─ 消耗 Worker 请求配额（每天 10 万）
    └─ 最后兜底
 ```
 
-**每对 peer 独立决策**：A↔B 可以走 P2P，A↔C 走 TURN，A↔D 走 WS。
+**每对 peer 独立决策**：A↔B 可以走 LAN，A↔C 走 P2P，A↔D 走 TURN。
 
 ---
 
 ## 🔍 P2P 数据流原理
 
-**发起方（A）**：
+### LAN 地址发现（双路径）
+
+**路径 1：UDP connect 骗内核**
+
+```go
+conn, _ := net.Dial("udp4", "8.8.8.8:80")
+localIP := conn.LocalAddr().(*net.UDPAddr).IP
+```
+
+原理：connect UDP **不真正发包**，只更新内核路由缓存。`getsockname()` 返回内核为该 socket 选定的出口 IP —— 即"出网卡"的 IP。
+
+- WiFi 下返回 `192.168.x.x` —— 直接可用
+- 蜂窝下返回运营商内网 IP（`10.x` / `100.64.x`）—— 会被过滤掉
+- **不触发 netlink 权限检查，Termux 里也能用**
+
+**路径 2：遍历 `net.Interfaces()`**
+
+覆盖多网卡场景（WiFi + USB 网卡）。两条路径结果合并去重。
+
+**上报链路**：`p2p_metadata` 里带 `lanEndpoints` → 服务端存储 → 广播 `joined` → 对端 `registerPeer` 时收到。
+
+### 打洞候选（score 制匹配）
+
+对端可能从**三个不同源地址**发来 Punch/ACK：
+
+| 源 | 分数 | 场景 |
+|:---|:---|:---|
+| `p.UDPAddr` 完全匹配 | 4 | 公网地址未变 |
+| `p.UDPAddr` IP 匹配 | 3 | 端口漂移 |
+| `p.LanEndpoints` 完全匹配 | **5（最高）** | 同 WiFi 直连 |
+| `p.LanEndpoints` IP 匹配 | 2 | LAN 端口漂移 |
+| `p.AssistedEndpoints` 完全匹配 | 4 | STUN 反射 |
+| `p.AssistedEndpoints` IP 匹配 | 1 | 反射端口漂移 |
+
+**最高分匹配**优先。
+
+### 发起方（A）
 
 ```
-curl 通过 SOCKS5 发起 → "连 100.64.0.3:8080"
+curl 通过 SOCKS5 发起 → "连 10.64.0.3:8080"
    ↓
 socks5.go 查 peer 表 → 找到 termux-b
    ↓
-relayMgr.IsP2P("termux-b") == true → 走 P2P
+relayMgr.IsP2P("termux-b") || IsP2PAvailable || IsTURN → true
    ↓
 p2p_stream.go: OpenP2PStream()
    ↓
 构造 N2NS SYN 帧（含 targetPort=8080）
    ↓
-udpConn.WriteToUDP() 直发 B 的公网地址
+collectN2NSTargets 收集所有候选：
+   ├─ LAN 地址（同 WiFi 优先）
+   ├─ AssistedEndpoints（STUN 反射）
+   ├─ lastRecvFrom（对端最近发来的源地址）
+   ├─ peerAddr（注册分配）
+   └─ peer.UDPAddr（观测 raddr）
+   ↓
+多目标发送（命中率大幅提升）
    ↓
 等 SYNACK（超时 2s）
 ```
 
-**接收方（B）**：
+### 接收方（B）
 
 ```
 udpReadLoop 收到 N2NS 帧
    ↓
-findPeerIDByAddr → 匹配 termux-a
+findPeerIDByAddr → score 制匹配 termux-a
    ↓
-acceptSYN → dial 127.0.0.1:8080
+acceptSYN（幂等：多目标重复 SYN 只建一个 stream）
+   ↓
+dial 127.0.0.1:8080
    ↓
 回 N2NS SYNACK (Ack=1)
    ↓
 启动数据泵：读 localConn → N2NS DATA → 发回 A
 ```
 
-**数据帧格式**（21 字节头 + payload）：
+### 数据帧格式（21 字节头 + payload）
 
 ```
 偏移  长度  字段
 ────────────────────────────
 0     4     "N2NS"      魔数
 4     1     ver         版本 1
-5     1     type        SYN=1 SYNACK=2 DATA=3 ACK=4 FIN=5 RST=6
-6     4     streamID    大端 uint32
+5     1     type        SYN=1 SYNACK=2 DATA=3 ACK=4 FIN=5 RST=6 PING=7 PONG=8
+6     4     streamID    大端 uint32（偶数）
 10    4     seq         本帧序列号
 14    4     ack         确认收到的对方 seq
 18    1     flags       保留
@@ -315,11 +387,36 @@ acceptSYN → dial 127.0.0.1:8080
 - 滑动窗口 16 帧
 - 乱序缓存后按序交付
 
-**关键代码路径**：`p2p_stream.go` 的 `sendP2PFrame` 里 `viaTURN=false` 分支：
+### P2P 通道状态机
+
+```
+Unknown → P2PAvailable → P2P
+           ↑                ↑
+      收到 Punch/ACK    收到 PONG 或
+      打洞握手成功      真实数据帧
+```
+
+**PING/PONG 语义**（关键）：
+
+- 收到 **PING** → 只回 PONG，**不升级本端状态**（单向证明）
+- 收到 **PONG** → 双向通道已验证 → **升级到 P2P**
+- 收到 **SYN/SYNACK/DATA/ACK/FIN/RST** → **升级到 P2P**（真实数据帧）
+
+**P2PAvailable 30 秒超时**：打洞握手成功但 30 秒内没升到 P2P → 强制降级到 TURN/WS，避免永远卡在中间态。
+
+### P2P Keepalive（NAT 映射保持）
+
+**问题**：CGNAT 的 UDP 端口映射老化时间通常 30-60 秒。P2P 建立后如果没流量，映射会消失，之后发包用新端口，对端识别不了。
+
+**方案**：每 15 秒用 **N2NS PING 多目标**发送（走 `collectN2NSTargets` 同一套候选），命中率比单目标高得多。PING 也刷新对端 NAT 映射，双向保活。
+
+**关键代码路径**：`p2p_stream.go` 的 `sendP2PFrame`：
 
 ```go
-// 不走 TURN —— 真 P2P 直发
-_, err := e.udpConn.WriteToUDP(buf, addr)
+targets := e.collectN2NSTargets(s)
+for _, addr := range targets {
+    e.udpConn.WriteToUDP(buf, addr)   // 多目标发送
+}
 ```
 
 ---
@@ -375,6 +472,45 @@ printf '\x05\x01\x00' | nc 127.0.0.1 1080 | xxd
 grep "节点上线\|节点离开" ~/n2n.log | tail -5
 ```
 
+### Q: 如何判断走的是 LAN / P2P / TURN / WS？
+
+**看日志**：
+
+```
+[SOCKS5] CONNECT 10.64.0.3:8080 → P2P 直连 (stream=2)       ← LAN 或 P2P
+[SOCKS5] CONNECT 10.64.0.3:8080 → TURN 中继 (...)           ← TURN
+[SOCKS5] CONNECT 10.64.0.3:8080 → WS 中继 (stream=...)      ← WS
+```
+
+**看服务端面板**：
+
+```
+连接状态：p2p-B      ← P2P（含 LAN）
+连接状态：TURN-B     ← TURN
+连接状态：ws-B       ← WS
+```
+
+**中继流量**：如果 P2P/LAN 生效，**TURN 中继流量保持 0 B**。
+
+### Q: 怎么知道走的是 LAN 不是公网 P2P？
+
+**看打洞日志的源 IP**：
+
+```
+[P2P] 从 termux-b (192.168.10.12) 收到 Punch    ← LAN
+[P2P] 从 termux-b (120.239.134.121) 收到 Punch  ← 公网 P2P
+```
+
+`192.168.x.x` = LAN 直连，`120.x.x.x` = 公网 P2P。
+
+**面板 NAT 类型显示 `LAN`** 也说明有 LAN 地址（打洞首选 LAN）。
+
+### Q: 面板 NAT 类型一直是"未知"？
+
+**正常**。STUN 探测有时只拿到一个样本（比如 `natType=unknown`），不影响功能。
+
+**有 LAN 地址时显示 `LAN`**，比 NAT 类型更直观——毕竟打洞首选就是 LAN。
+
 ### Q: curl 慢（3-5 秒）？
 
 **原因**：每次请求都先尝试 P2P，2 秒超时后才回落 WS。
@@ -384,24 +520,50 @@ grep "节点上线\|节点离开" ~/n2n.log | tail -5
 1. 看 A 端日志有没有 `[P2P-STREAM] 建流超时`
 2. 看 B 端日志有没有 `[P2P-STREAM] 收到 SYN`
 
-如果 A 建流超时但 B 没收到 SYN——**说明 UDP 单向不通**（CGNAT 特性）。
+**如果 A 建流超时但 B 没收到 SYN** —— UDP 单向不通（CGNAT hairpin）。
 
-**优化**：等 P2P 数据面修复后，TTFB 会掉到 50ms 左右。
+**如果走 LAN 直连但依然慢** —— 检查是否真在同 WiFi，`[P2P] 从 ... 收到 Punch` 的源 IP 应该是 `192.168.x.x`。
 
-### Q: P2P 打洞总失败？
+### Q: 打洞一直失败？
 
-**检查两个设备的 UDP 出口 IP 是否相同**：
+**检查 UDP 出口 IP 是否相同**：
 
 ```
 A: UDP 120.239.134.121:47877
 B: UDP 120.230.243.39:5417     ← 应不同
 ```
 
-**相同 = 同 CGNAT 出口（hairpin 场景），P2P 大概率失败**。
+**相同 = 同 CGNAT 出口**，P2P 大概率失败（需要 hairpin，运营商多半不支持）。
 
-**换不同网络**：一台用 4G，一台用 WiFi，出口 IP 就会不同。
+**换网络**：一台用 4G，一台用 WiFi，出口 IP 就会不同。
 
-**即使 P2P 失败，TURN 或 WS 依然能通**——只是延迟高一些。
+**如果两端在同一 WiFi**：应该走 LAN 直连（不受 CGNAT 影响）。
+
+**即使 P2P 失败，TURN / WS 依然能通**——只是延迟高一些。
+
+### Q: LAN 地址收集不到？
+
+**检查启动日志**：
+
+```
+[NAT] 启动预收集 LAN: [...]   ← 有这行说明能收集
+[NAT] 启动预收集 LAN 为空（可能蜂窝网络，或 WiFi 未就绪）  ← 说明收集失败
+```
+
+**常见原因**：
+
+1. **纯蜂窝网络** —— 没有 LAN 接口，`net.Interfaces()` 返回空，正常现象
+2. **手机在蜂窝下启动后切 WiFi** —— 后台每 500ms 重试一次，10 秒内自动补齐
+3. **A 的默认路由不在 WiFi 上** —— Android 系统把蜂窝当主网卡，`detectOutboundIP` 返回运营商 IP 被过滤
+
+**手工验证**（A 端 Termux 里跑）：
+
+```bash
+python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(('8.8.8.8',80)); print(s.getsockname()[0])"
+```
+
+- 输出 `192.168.x.x` → Go 也能拿到 LAN
+- 输出 `10.x` / `100.64.x` → A 的默认路由不在 WiFi，需要在 Android 设置里把 WiFi 设为主网卡
 
 ### Q: TURN 一直失败/刷屏？
 
@@ -462,9 +624,22 @@ chmod +x ~/.termux/boot/n2n.sh
 
 同一台手机可以跑多个（不同 `SOCKS5_LISTEN` 端口、不同 `CLIENT_ID`、不同 `UDP_PORT`）。
 
-**同机多实例测不出真 P2P**——两个实例出口 IP 相同，会走 hairpin 逻辑（大概率失败 → TURN/WS）。
+**同机多实例测不出真 P2P** —— 两个实例出口 IP 相同，会走 hairpin 逻辑（大概率失败 → TURN/WS）。
 
 **要验证 P2P 必须两台物理设备**，且出口 UDP IP 不同。
+
+### Q: 面板显示 `p2p-avail` 不是 `p2p`？
+
+**`p2p-avail`** = 打洞握手成功，但 PONG 或真实数据帧还没到，尚未确认双向通道。
+
+**正常情况 1-2 秒内**会升级到 `p2p`：
+
+```
+[P2P] 从 termux-b 收到 Punch → P2PAvailable（等待数据帧验证）
+[P2P] 收到 PONG → P2P 直连（双向通道已验证）       ← 这行出现就升 P2P
+```
+
+**如果一直停在 `p2p-avail`**：30 秒后会超时降级到 TURN/WS。
 
 ---
 
@@ -491,7 +666,7 @@ chmod +x ~/.termux/boot/n2n.sh
 | **UDP 应用** | SOCKS5 只代理 TCP，`UDP ASSOCIATE` 未实现 |
 | **性能** | 比 TUN 模式略慢（多一层 SOCKS5 和应用流封装） |
 | **单设备 P2P** | 同机多实例测不出真 P2P（CGNAT 特性） |
-| **CGNAT hairpin** | 运营商 CGNAT 通常不支持，同出口 IP 时 P2P 会失败 |
+| **CGNAT hairpin** | 运营商 CGNAT 通常不支持，同出口 IP 时 P2P 会失败。**同 WiFi 场景优先走 LAN** |
 
 ---
 
