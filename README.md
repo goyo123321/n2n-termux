@@ -173,6 +173,17 @@ NODE_NAME="Termux-A" \
 AUTO_START=1 \
 bash ~/install-n2n.sh
 ```
+## 验证p2p直连
+A开个窗口新建http监听
+```bash
+cd ~ && python3 -m http.server 8080
+```
+
+B开个新窗口做curl 测试
+
+```bash
+curl --socks5 127.0.0.1:1080 -v --max-time 15 http://10.64.0.2:8080/ -o /dev/null
+```
 
 没配就不写 CONNECT_TOKEN，脚本默认空。
 
