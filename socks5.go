@@ -24,19 +24,33 @@ const (
 	socks5RepAddrTypeNotSupported = 0x08
 )
 
+// p2pCooldownDuration P2P 建流失败后的冷却时间。
+//
+// 场景：CGNAT hairpin 单向（A→B 通，B→A 不通）。B 端每次请求都先
+// 尝试 P2P 2 秒超时才回落 WS → TTFB 2.3s。加冷却后，60 秒内的后续
+// 请求直接走 WS/TURN，TTFB 降到 0.3s；60 秒后再试 P2P，若对端网络
+// 恢复（或 NAT 表刷新）仍有机会走 P2P。
+const p2pCooldownDuration = 60 * time.Second
+
 type Socks5Server struct {
 	edge     *Edge
 	listen   string
 	ln       net.Listener
 	stopCh   chan struct{}
 	stopOnce sync.Once
+
+	// ★ P2P 建流失败冷却
+	//   peerID -> 冷却到期时间（unix ms）
+	p2pCooldownMu    sync.Mutex
+	p2pCooldownUntil map[string]time.Time
 }
 
 func NewSocks5Server(edge *Edge, listen string) *Socks5Server {
 	return &Socks5Server{
-		edge:   edge,
-		listen: listen,
-		stopCh: make(chan struct{}),
+		edge:             edge,
+		listen:           listen,
+		stopCh:           make(chan struct{}),
+		p2pCooldownUntil: make(map[string]time.Time),
 	}
 }
 
@@ -69,6 +83,32 @@ func (s *Socks5Server) Close() {
 	if s.ln != nil {
 		_ = s.ln.Close()
 	}
+}
+
+// isP2PCooling 检查 peer 是否处于 P2P 冷却期
+func (s *Socks5Server) isP2PCooling(peerID string) bool {
+	s.p2pCooldownMu.Lock()
+	defer s.p2pCooldownMu.Unlock()
+
+	until, ok := s.p2pCooldownUntil[peerID]
+	if !ok {
+		return false
+	}
+	if time.Now().Before(until) {
+		return true
+	}
+	// 冷却过期，清理
+	delete(s.p2pCooldownUntil, peerID)
+	return false
+}
+
+// setP2PCooldown 设置 peer 的 P2P 冷却
+func (s *Socks5Server) setP2PCooldown(peerID string, duration time.Duration) {
+	s.p2pCooldownMu.Lock()
+	s.p2pCooldownUntil[peerID] = time.Now().Add(duration)
+	s.p2pCooldownMu.Unlock()
+	log.Printf("[SOCKS5] %s P2P 冷却 %.0fs，期间直接走 WS/TURN（避免每次 2s 超时）",
+		peerID, duration.Seconds())
 }
 
 func (s *Socks5Server) handleConn(conn net.Conn) {
@@ -163,13 +203,20 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	// ★ 优先 P2P，失败回落 WS
+	// ★ 判断是否尝试 P2P
+	//   条件：P2P/TURN 状态可用 + 不在冷却期
 	useP2P := s.edge.p2pStreams != nil &&
 		s.edge.relayMgr != nil &&
-		(s.edge.relayMgr.IsP2P(peerID) || s.edge.relayMgr.IsTURN(peerID))
+		(s.edge.relayMgr.IsP2P(peerID) || s.edge.relayMgr.IsTURN(peerID)) &&
+		!s.isP2PCooling(peerID)
+
+	if !useP2P {
+		if s.isP2PCooling(peerID) {
+			log.Printf("[SOCKS5] %s 处于 P2P 冷却期，直接走 WS/TURN", peerID)
+		}
+	}
 
 	if useP2P {
-		// ★ 建流超时 5s → 2s，避免 P2P 失败时白等太久
 		p2s, err := s.edge.p2pStreams.OpenP2PStream(peerID, int(dstPort), conn, 2*time.Second)
 		if err == nil {
 			log.Printf("[SOCKS5] CONNECT %s:%d → P2P 直连 (stream=%d)", dstIP, dstPort, p2s.ID)
@@ -181,6 +228,8 @@ func (s *Socks5Server) handleConn(conn net.Conn) {
 			return
 		}
 		log.Printf("[SOCKS5] P2P 建流失败(%v)，回落 WS 中继", err)
+		// ★ 设置冷却，避免后续请求重复等待 2 秒超时
+		s.setP2PCooldown(peerID, p2pCooldownDuration)
 	}
 
 	// 回落：WS app_stream
