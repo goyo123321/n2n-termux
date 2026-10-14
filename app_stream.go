@@ -1,5 +1,19 @@
 package main
 
+// WS 应用层隧道（app_stream）。
+//
+// 与 n2n-go-client / n2n-android 完全一致。
+//
+// 使用场景：三级降级到 WS 中继时，对端主动向本机上的服务发起连接。
+// 此时数据面无法走 TUN（Termux 没有 TUN，只有 SOCKS5），改用
+// app_stream_* 消息把 TCP 字节流封装成 base64 隧道。
+//
+// 消息：
+//   app_stream_open      → 发起方 → 接收方，携带 targetPort
+//   app_stream_open_ack  ← 接收方 → 发起方，携带 ok
+//   app_stream_data      → 双向，携带 base64 编码的 TCP 数据
+//   app_stream_close     → 双向，携带 reason
+
 import (
 	"encoding/base64"
 	"fmt"
@@ -103,6 +117,9 @@ func (e *Edge) findPeerByVIP(vip string) (string, bool) {
 }
 
 func (e *Edge) openLocalStream(peerID string, targetPort int, conn net.Conn) (*AppStream, error) {
+	if e.streamMgr == nil {
+		return nil, fmt.Errorf("stream manager not initialized")
+	}
 	streamID := e.streamMgr.allocID(e.clientId)
 	s := &AppStream{
 		ID:        streamID,
@@ -166,21 +183,29 @@ func (e *Edge) closeStream(s *AppStream, reason string) {
 	if !s.closed.CompareAndSwap(false, true) {
 		return
 	}
-	e.streamMgr.remove(s.ID)
+	if e.streamMgr != nil {
+		e.streamMgr.remove(s.ID)
+	}
 	if s.LocalConn != nil {
 		_ = s.LocalConn.Close()
 	}
-	_ = e.ws.Send(map[string]interface{}{
-		"type":     "app_stream_close",
-		"to":       s.PeerID,
-		"streamId": s.ID,
-		"reason":   reason,
-	})
+	if e.ws != nil {
+		_ = e.ws.Send(map[string]interface{}{
+			"type":     "app_stream_close",
+			"to":       s.PeerID,
+			"streamId": s.ID,
+			"reason":   reason,
+		})
+	}
 	log.Printf("[STREAM] %s 关闭 (%s)", s.ID, reason)
 }
 
 // ============ 远端消息处理 ============
 
+// onRemoteStreamOpen 处理对端发起的应用层隧道。
+//
+// 本端作为"接收方"：dial 到 127.0.0.1:targetPort，成功回 open_ack=true，
+// 然后开始 pump。
 func (e *Edge) onRemoteStreamOpen(msg map[string]interface{}) {
 	from, _ := msg["from"].(string)
 	streamID, _ := msg["streamId"].(string)
@@ -189,6 +214,9 @@ func (e *Edge) onRemoteStreamOpen(msg map[string]interface{}) {
 		targetPort = int(f)
 	}
 	if from == "" || streamID == "" || targetPort <= 0 || targetPort > 65535 {
+		return
+	}
+	if e.streamMgr == nil {
 		return
 	}
 
@@ -227,6 +255,9 @@ func (e *Edge) onRemoteStreamOpen(msg map[string]interface{}) {
 }
 
 func (e *Edge) onRemoteStreamAck(msg map[string]interface{}) {
+	if e.streamMgr == nil {
+		return
+	}
 	streamID, _ := msg["streamId"].(string)
 	ok, _ := msg["ok"].(bool)
 	s := e.streamMgr.get(streamID)
@@ -237,6 +268,9 @@ func (e *Edge) onRemoteStreamAck(msg map[string]interface{}) {
 }
 
 func (e *Edge) onRemoteStreamData(msg map[string]interface{}) {
+	if e.streamMgr == nil {
+		return
+	}
 	streamID, _ := msg["streamId"].(string)
 	dataB64, _ := msg["data"].(string)
 	if streamID == "" || dataB64 == "" {
@@ -261,6 +295,9 @@ func (e *Edge) onRemoteStreamData(msg map[string]interface{}) {
 }
 
 func (e *Edge) onRemoteStreamClose(msg map[string]interface{}) {
+	if e.streamMgr == nil {
+		return
+	}
 	streamID, _ := msg["streamId"].(string)
 	reason, _ := msg["reason"].(string)
 	s := e.streamMgr.remove(streamID)
