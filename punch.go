@@ -1,14 +1,8 @@
 package main
 
-// NAT 打洞握手协议。
+// NAT 打洞握手 + 数据面探针。
 //
-// 与项目一/二（n2n-go）对齐的两条核心规则：
-//
-//  1. Punch 和 ACK 使用不同 prefix —— 接收方从消息类型就能区分。
-//
-//  2. 收到 Punch 回一个 ACK；收到 ACK **绝不回复**。
-//     否则两端互相 ACK，形成 1/RTT 的无限 echo loop
-//     （项目一里实测 ~90 pkt/s，把真实数据淹没）。
+// ★ 三端通用：PC / Termux / Android 内容完全一致。
 
 import (
 	"net"
@@ -21,8 +15,6 @@ var (
 	ackPrefix   = []byte{0x4E, 0x32, 0x4E, 0x41} // "N2NA"
 )
 
-// punchAckThrottle 是同一 peer 两次 ACK 的最小间隔。项目一/二的
-// punchAckThrottle 就是这个值。
 const punchAckThrottle = 500 * time.Millisecond
 
 func isPunchProbe(data []byte) bool {
@@ -37,8 +29,7 @@ func isPunchAck(data []byte) bool {
 		data[2] == ackPrefix[2] && data[3] == ackPrefix[3]
 }
 
-// buildPunchProbe 生成 32 字节 Punch。前 4 字节是 punchPrefix，
-// 5-8 字节携带本机虚拟 IP（接收方可不解析）。
+// buildPunchProbe 生成 32 字节 Punch。
 func buildPunchProbe(virtualIP string) []byte {
 	buf := make([]byte, 32)
 	copy(buf[0:4], punchPrefix)
@@ -56,9 +47,6 @@ func buildPunchAck() []byte {
 }
 
 // punchAckLimiter 按 peer 限流 ACK 发送。
-//
-// 场景：对端在快速重试时可能每秒发多次 Punch。若每次都回 ACK，
-// 会成比例放大流量。限流到 500ms/peer，与项目一/二一致。
 type punchAckLimiter struct {
 	mu   sync.Mutex
 	last map[string]time.Time
@@ -88,4 +76,15 @@ func (l *punchAckLimiter) clear() {
 	l.mu.Lock()
 	l.last = make(map[string]time.Time)
 	l.mu.Unlock()
+}
+
+// sendP2PProbe 用 N2NS PING 帧触发数据面验证。
+//
+// ★ 桥接到 P2PStreamManager.sendP2PProbe。
+//   PC / Termux / Android 三端一致。
+func (e *Edge) sendP2PProbe(peerID string) {
+	if e.p2pStreams == nil {
+		return
+	}
+	e.p2pStreams.sendP2PProbe(peerID)
 }
