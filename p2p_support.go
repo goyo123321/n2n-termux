@@ -1,0 +1,168 @@
+package main
+
+// P2P stream 依赖的跨平台辅助方法。
+//
+// 三个方法：
+//   - findPeerIDByAddr  ：按对端地址查 peerID（四层匹配）
+//   - peerAddrAndMode   ：取 peer 当前地址 + 是否走 TURN
+//   - handleP2PFrame    ：N2NS 帧入口（含 LAN 优先更新策略）
+
+import (
+	"log"
+	"net"
+	"time"
+)
+
+// findPeerIDByAddr 按对端地址查 peerID。
+//
+// 四层匹配（按优先级）：
+//   1. UDPAddr 精确（IP + 端口）
+//   2. LAN 精确（IP + 端口）
+//   3. Assisted 精确（IP + 端口）
+//   4. UDPAddr IP 相同（兜底，只匹配 IP）
+func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
+	if addr == nil {
+		return ""
+	}
+	e.peersMu.RLock()
+	defer e.peersMu.RUnlock()
+
+	for id, p := range e.peers {
+		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) && p.UDPAddr.Port == addr.Port {
+			return id
+		}
+	}
+	for id, p := range e.peers {
+		for _, lan := range p.LanEndpoints {
+			la, err := net.ResolveUDPAddr("udp", lan)
+			if err != nil {
+				continue
+			}
+			if la.IP.Equal(addr.IP) && la.Port == addr.Port {
+				return id
+			}
+		}
+	}
+	for id, p := range e.peers {
+		for _, ass := range p.AssistedEndpoints {
+			aa, err := net.ResolveUDPAddr("udp", ass)
+			if err != nil {
+				continue
+			}
+			if aa.IP.Equal(addr.IP) && aa.Port == addr.Port {
+				return id
+			}
+		}
+	}
+	for id, p := range e.peers {
+		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) {
+			return id
+		}
+	}
+	return ""
+}
+
+// peerAddrAndMode 取 peer 当前地址 + 判断是否走 TURN/Relay。
+//
+// 返回：
+//   - *net.UDPAddr：当前用于 P2P 发送的目标地址
+//   - bool：true = 走 TURN/Relay，false = 走直连（P2P/P2PAvailable）
+func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
+	e.peersMu.RLock()
+	p := e.peers[peerID]
+	e.peersMu.RUnlock()
+	if p == nil || p.UDPAddr == nil {
+		return nil, false
+	}
+	viaTURN := true
+	if e.relayMgr != nil {
+		st := e.relayMgr.GetState(peerID)
+		viaTURN = st != ConnP2P && st != ConnP2PAvailable
+	}
+	return p.UDPAddr, viaTURN
+}
+
+// handleP2PFrame 收到 N2NS 帧时的入口。
+//
+// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先"策略，避免公网地址
+// 覆盖 LAN 地址导致回程走 CGNAT 回环。
+//
+// 更新规则（peer 已有的 UDPAddr 称为 oldAddr，新收到包的源地址称 newAddr）：
+//   1. oldAddr 为空                → 直接设置
+//   2. old=公网, new=LAN           → 更新（LAN 优先）
+//   3. old=LAN,  new=公网          → 保留 LAN（除非 LAN 超过 10 秒无流量）
+//   4. old=LAN,  new=LAN           → 端口变了就更新
+//   5. old=公网, new=公网          → 端口变了就更新
+//
+// PING/PONG 语义区分：
+//   - 收到 PING  → 只证明"对端→本端"单向可达，不升级本端状态
+//   - 收到 PONG  → 双向通道已被证明 → MarkP2P
+//   - 其他帧（SYN/SYNACK/DATA/ACK/FIN/RST）→ 直接 MarkP2P
+func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
+	if e.p2pStreams == nil {
+		return
+	}
+	f, err := decodeP2PFrame(data)
+	if err != nil {
+		return
+	}
+	peerID := e.findPeerIDByAddr(peerAddr)
+	if peerID == "" {
+		return
+	}
+
+	if !viaTURN {
+		e.peersMu.Lock()
+		if p := e.peers[peerID]; p != nil {
+			now := time.Now().UnixMilli()
+			newIsLAN := isPrivateIPv4(peerAddr.IP)
+			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
+
+			shouldUpdate := false
+			if p.UDPAddr == nil {
+				// 无旧地址
+				shouldUpdate = true
+			} else if !oldIsLAN && newIsLAN {
+				// 旧公网 → 新 LAN（LAN 优先）
+				shouldUpdate = true
+			} else if oldIsLAN && !newIsLAN {
+				// 旧 LAN → 新公网（保留 LAN，除非 LAN 超过 10 秒无流量）
+				if now-p.lastRecvAt > 10000 {
+					shouldUpdate = true
+					log.Printf("[P2P] %s LAN 地址超过 10s 无流量，改用公网地址", peerID)
+				}
+			} else {
+				// 同类型，端口不同就更新
+				if p.UDPAddr.Port != peerAddr.Port {
+					shouldUpdate = true
+				}
+			}
+
+			if shouldUpdate {
+				p.UDPAddr = &net.UDPAddr{IP: peerAddr.IP, Port: peerAddr.Port}
+			}
+			p.lastRecvAt = now
+		}
+		e.peersMu.Unlock()
+	}
+
+	if e.relayMgr != nil {
+		switch f.Type {
+		case p2pTypePING:
+			// 单向证明，不升级本端状态
+		case p2pTypePONG:
+			if e.relayMgr.GetState(peerID) != ConnP2P {
+				log.Printf("[P2P] 收到 PONG → P2P 直连（双向通道已验证）")
+				e.relayMgr.MarkP2P(peerID)
+			}
+		default:
+			if e.relayMgr.GetState(peerID) != ConnP2P {
+				log.Printf("[P2P] 收到数据帧（stream=%d type=%d）→ P2P 直连",
+					f.StreamID, f.Type)
+				e.relayMgr.MarkP2P(peerID)
+			}
+		}
+	}
+
+	e.p2pStreams.handleFrame(peerID, peerAddr, viaTURN, f)
+}
