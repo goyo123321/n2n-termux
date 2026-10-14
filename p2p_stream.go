@@ -249,6 +249,13 @@ func (m *P2PStreamManager) sendP2PProbe(peerID string) {
 }
 
 // collectN2NSTargets 收集一个 stream 的所有候选发送地址。
+//
+// 优先级（保持顺序，去重保留首次）：
+//   1. LAN 地址（同 WiFi 场景）
+//   2. AssistedEndpoints（STUN 反射的多公网映射）
+//   3. lastRecvFrom（对端最近一次发来的源地址，最可信）
+//   4. peerAddr（注册时分配的地址 / SYN 来源地址）
+//   5. peer.UDPAddr（观测 raddr）
 func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	s.mu.Lock()
 	primary := s.peerAddr
@@ -300,11 +307,19 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
-// ★ 修复 1：如果 peer 最近从私网地址发过包（5 秒内），只发 LAN 地址，
-// 避免多路径发包导致对端 peer.UDPAddr 被公网地址覆盖，
-// 造成"去程走 LAN、回程走公网"的不对称延迟。
+// ★ 修复 1：LAN 优先。
 //
-// ★ Termux 端与 PC 端一致：e.udpConn 是 *net.UDPConn，用 WriteToUDP。
+//   - 旧判据：p.UDPAddr 是私网 且 lastRecvAt < 5s
+//     → p.UDPAddr 一旦被公网覆盖，就永远不再尝试 LAN
+//
+//   - 新判据：p.lastLANRecvAt < 60s（即 60 秒内收到过 LAN 帧）
+//     → 只要 LAN 通道存活，就优先走 LAN
+//
+// 背景：两端在同一 WiFi 时，多路径发包会导致对端 peer.UDPAddr
+// 被公网地址覆盖，回程走 CGNAT 回环（100~600ms）。用 lastLANRecvAt
+// 判据后，只要 LAN 存活 60 秒内收到过帧，就走 LAN（8~15ms）。
+//
+// ★ PC / Termux 特有：e.udpConn 是 *net.UDPConn，用 WriteToUDP。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -342,14 +357,15 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 		return errors.New("no udp")
 	}
 
-	// ★ 判断 peer 是否在 LAN：最近 5 秒从私网地址收到过包
+	// ★ 判断 peer 是否在 LAN：改用 lastLANRecvAt
+	//
+	// 只要 60 秒内收到过 LAN 帧，就只发 LAN——不再依赖 p.UDPAddr 是公网还是 LAN。
 	e.peersMu.RLock()
 	var lanPreferred bool
 	if p := e.peers[peerID]; p != nil {
-		if p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP) {
-			if time.Now().UnixMilli()-p.lastRecvAt < 5000 {
-				lanPreferred = true
-			}
+		if p.lastLANRecvAt > 0 &&
+			time.Now().UnixMilli()-p.lastLANRecvAt < 60000 {
+			lanPreferred = true
 		}
 	}
 	e.peersMu.RUnlock()
