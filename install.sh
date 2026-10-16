@@ -5,40 +5,40 @@
 # 用法：
 #   bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh)
 #
-# 环境变量：
-#   SIGNALING_URL     WSS 地址
-#   CONNECT_TOKEN     连接密码
-#   ROOM_ID           房间名
-#   CLIENT_ID         客户端 ID
-#   NODE_NAME         显示名
-#   SOCKS5_LISTEN     SOCKS5 监听地址
-#   VERSION           指定版本
-#   INSTALL_DIR       安装目录，默认 ~/.n2n-termux
-#   FORCE_UPDATE      =1 强制重装
-#   NO_LAUNCH         =1 只安装不启动
-#   AUTO_START        =1 静默自动启动
-#   CHECK_ONLY        =1 只检查
-#
 
 set -euo pipefail
 
+# ★ 修复：set -u 下未定义变量会报错
 REPO="goyo123321/n2n-termux"
 BIN_NAME="n2n-client"
+
+SIGNALING_URL="${SIGNALING_URL:-}"
+CONNECT_TOKEN="${CONNECT_TOKEN:-}"
+ROOM_ID="${ROOM_ID:-}"
+CLIENT_ID="${CLIENT_ID:-}"
+NODE_NAME="${NODE_NAME:-}"
+SOCKS5_LISTEN="${SOCKS5_LISTEN:-127.0.0.1:1080}"
+VERSION="${VERSION:-}"
+FORCE_UPDATE="${FORCE_UPDATE:-0}"
+NO_LAUNCH="${NO_LAUNCH:-0}"
+AUTO_START="${AUTO_START:-0}"
+CHECK_ONLY="${CHECK_ONLY:-0}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.n2n-termux}"
+
 BIN_DIR="$INSTALL_DIR/bin"
 BIN_PATH="$BIN_DIR/$BIN_NAME"
 VERSION_FILE="$INSTALL_DIR/.version"
 CONFIG_FILE="$INSTALL_DIR/config.env"
 LAUNCHER="$INSTALL_DIR/start.sh"
 
-FORCE_UPDATE="${FORCE_UPDATE:-0}"
-NO_LAUNCH="${NO_LAUNCH:-0}"
-AUTO_START="${AUTO_START:-0}"
-CHECK_ONLY="${CHECK_ONLY:-0}"
-
 GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
-FALLBACK_VERSION="v1.0.0"
+FALLBACK_VERSION="v1.1.18"
+
+# ★ 修复：curl | bash 场景下 stdin 被管道占用，重定向到 tty
+if [ ! -t 0 ] && [ -r /dev/tty ]; then
+    exec < /dev/tty || true
+fi
 
 # 颜色
 RED='\033[0;31m'; GREEN='\033[0;32m'
@@ -57,15 +57,20 @@ check_env() {
         warn "看起来不是 Termux 环境"
     fi
 
-    for cmd in curl uname; do
+    for cmd in uname; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             err "缺少依赖: $cmd"
-            info "安装: pkg install $cmd"
             exit 1
         fi
     done
 
-    # ★ Termux 特有：检查 CA 证书（否则 WSS 会报 x509 错误）
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        err "缺少 curl 或 wget"
+        info "安装: pkg install curl wget"
+        exit 1
+    fi
+
+    # ★ Termux 特有：检查 CA 证书
     if [ ! -f "$PREFIX/etc/tls/cert.pem" ] && [ ! -f "$PREFIX/etc/ca-certificates/ca-bundle.crt" ]; then
         warn "未找到 CA 证书，尝试安装..."
         if command -v pkg >/dev/null 2>&1; then
@@ -102,7 +107,7 @@ detect_arch() {
 }
 
 # ============================================================
-# ★ 版本管理
+# 版本管理
 # ============================================================
 read_installed_version() {
     if [ -f "$VERSION_FILE" ]; then
@@ -118,18 +123,26 @@ write_installed_version() {
 }
 
 resolve_latest_version() {
-    if [ -n "${VERSION:-}" ]; then
+    if [ -n "$VERSION" ]; then
         echo "$VERSION"
         return 0
     fi
 
     local resp code body tag
-    resp=$(curl -sSL -w "\n__HTTP_CODE__:%{http_code}" \
-        "${GITHUB_API}/releases/latest" 2>&1) || {
-        warn "无法访问 GitHub API，使用内置版本: $FALLBACK_VERSION"
-        echo "$FALLBACK_VERSION"
-        return 0
-    }
+    if command -v curl >/dev/null 2>&1; then
+        resp=$(curl -sSL -w "\n__HTTP_CODE__:%{http_code}" \
+            "${GITHUB_API}/releases/latest" 2>&1) || {
+            warn "无法访问 GitHub API，使用内置版本: $FALLBACK_VERSION"
+            echo "$FALLBACK_VERSION"
+            return 0
+        }
+    elif command -v wget >/dev/null 2>&1; then
+        resp=$(wget -qO- --timeout=20 "${GITHUB_API}/releases/latest" 2>&1; echo -e "\n__HTTP_CODE__:200") || {
+            warn "无法访问 GitHub API，使用内置版本: $FALLBACK_VERSION"
+            echo "$FALLBACK_VERSION"
+            return 0
+        }
+    fi
 
     code=$(echo "$resp" | grep -oE '__HTTP_CODE__:[0-9]+' | cut -d: -f2 | tail -1)
     body=$(echo "$resp" | sed 's/__HTTP_CODE__:[0-9]*$//')
@@ -164,7 +177,7 @@ stop_running_client() {
     fi
 
     local pids
-    pids=$(pgrep -f "${BIN_DIR}/${BIN_NAME}|${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null || true)
+    pids=$(pgrep -f "${BIN_DIR}/${BIN_NAME}" 2>/dev/null || true)
     if [ -z "$pids" ]; then
         return 0
     fi
@@ -174,7 +187,7 @@ stop_running_client() {
     kill $pids 2>/dev/null || true
     sleep 1
 
-    pids=$(pgrep -f "${BIN_DIR}/${BIN_NAME}|${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null || true)
+    pids=$(pgrep -f "${BIN_DIR}/${BIN_NAME}" 2>/dev/null || true)
     if [ -n "$pids" ]; then
         warn "进程未响应 SIGTERM，使用 SIGKILL"
         # shellcheck disable=SC2086
@@ -197,7 +210,19 @@ download_binary() {
 
     log "下载: $tag / $file"
 
-    if ! curl -L --fail --progress-bar -o "$BIN_PATH" "$url"; then
+    local dl_ok=0
+    if command -v wget >/dev/null 2>&1; then
+        if wget -O "$BIN_PATH" "$url"; then
+            dl_ok=1
+        fi
+    fi
+    if [ "$dl_ok" = "0" ] && command -v curl >/dev/null 2>&1; then
+        if curl -L --fail --progress-bar -o "$BIN_PATH" "$url"; then
+            dl_ok=1
+        fi
+    fi
+
+    if [ "$dl_ok" = "0" ]; then
         err "下载失败"
         echo ""
         echo "可能原因："
@@ -223,14 +248,16 @@ download_binary() {
 
     # 可选 sha256
     local expected actual
-    if expected=$(curl -sSL --fail "$sha_url" 2>/dev/null | awk '{print $1}') && [ -n "$expected" ]; then
-        actual=$(sha256sum "$BIN_PATH" | awk '{print $1}')
-        if [ "$expected" = "$actual" ]; then
-            ok "sha256 校验通过"
-        else
-            warn "sha256 不匹配！"
-            info "期望: $expected"
-            info "实际: $actual"
+    if command -v curl >/dev/null 2>&1; then
+        if expected=$(curl -sSL --fail "$sha_url" 2>/dev/null | awk '{print $1}') && [ -n "$expected" ]; then
+            actual=$(sha256sum "$BIN_PATH" | awk '{print $1}')
+            if [ "$expected" = "$actual" ]; then
+                ok "sha256 校验通过"
+            else
+                warn "sha256 不匹配！"
+                info "期望: $expected"
+                info "实际: $actual"
+            fi
         fi
     fi
 
@@ -324,7 +351,7 @@ create_launcher() {
     cat > "$LAUNCHER" <<'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 # n2n-termux 启动脚本（由 install.sh 生成）
-set -e
+set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.n2n-termux}"
 CONFIG_FILE="$INSTALL_DIR/config.env"
@@ -364,7 +391,6 @@ main() {
     check_env
     detect_arch
 
-    # 版本检测
     local installed latest need_update
     installed="$(read_installed_version)"
 
@@ -386,7 +412,7 @@ main() {
     if [ "$CHECK_ONLY" = "1" ]; then
         echo ""
         if [ "$need_update" = "1" ]; then
-            ok "有新版本可更新: $installed → $latest"
+            ok "有新版本可更新: ${installed:-无} → $latest"
             info "不带 CHECK_ONLY=1 即可升级"
         else
             ok "已是最新版本: $latest"
@@ -394,9 +420,9 @@ main() {
         exit 0
     fi
 
-    # 配置阶段：优先环境变量 > 已有 config > 交互
+    # 配置阶段
     if [ "$AUTO_START" = "1" ]; then
-        if [ -n "${SIGNALING_URL:-}" ]; then
+        if [ -n "$SIGNALING_URL" ]; then
             log "非交互模式：使用环境变量"
             save_config
         elif [ -f "$CONFIG_FILE" ]; then
@@ -410,7 +436,7 @@ main() {
             err "  至少: SIGNALING_URL=wss://... AUTO_START=1 bash install.sh"
             exit 1
         fi
-    elif [ -f "$CONFIG_FILE" ] && [ -z "${SIGNALING_URL:-}" ]; then
+    elif [ -f "$CONFIG_FILE" ] && [ -z "$SIGNALING_URL" ]; then
         warn "已存在配置: $CONFIG_FILE"
         read -rp "重新配置？(y/N): " input
         if [[ ! "$input" =~ ^[Yy]$ ]]; then
@@ -428,7 +454,7 @@ main() {
         save_config
     fi
 
-    # 下载或跳过
+    # 下载
     if [ "$need_update" = "0" ]; then
         ok "已是最新版本: $latest（跳过下载，FORCE_UPDATE=1 强制重装）"
     else
