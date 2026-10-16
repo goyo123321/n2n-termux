@@ -336,7 +336,7 @@ func (f *PacketForwarder) handleTCP(pkt []byte) {
 	srcPort := binary.BigEndian.Uint16(pkt[tcpOff : tcpOff+2])
 	dstPort := binary.BigEndian.Uint16(pkt[tcpOff+2 : tcpOff+4])
 	seq := binary.BigEndian.Uint32(pkt[tcpOff+4 : tcpOff+8])
-	ack := binary.BigEndian.Uint32(pkt[tcpOff+8 : tcpOff+12])
+	// 注：简化实现不处理对端 ACK（无重传机制）
 	dataOff := int(pkt[tcpOff+12]>>4) * 4
 	flags := pkt[tcpOff+13]
 	tcpLen := len(pkt) - tcpOff
@@ -365,12 +365,10 @@ func (f *PacketForwarder) handleTCP(pkt []byte) {
 
 	// --- SYN：新连接 ---
 	if flags&tcpFlagSYN != 0 && conn == nil {
-		// dial 本地服务
 		localAddr := net.JoinHostPort("127.0.0.1", itoa(int(dstPort)))
 		localConn, err := net.DialTimeout("tcp", localAddr, tcpDialTimeout)
 		if err != nil {
 			log.Printf("[FWD-TCP] dial %s 失败: %v", localAddr, err)
-			// 回 RST
 			f.sendTCP(srcIP, dstPort, srcPort, 0, seq+1, tcpFlagRST|tcpFlagACK, nil)
 			return
 		}
@@ -380,8 +378,8 @@ func (f *PacketForwarder) handleTCP(pkt []byte) {
 			key:        key,
 			localConn:  localConn,
 			iss:        iss,
-			sndNxt:     iss + 1, // SYN 消耗 1
-			rcvNxt:     seq + 1, // 对端 SYN 消耗 1
+			sndNxt:     iss + 1,
+			rcvNxt:     seq + 1,
 			lastActive: time.Now(),
 		}
 		f.mu.Lock()
@@ -391,7 +389,6 @@ func (f *PacketForwarder) handleTCP(pkt []byte) {
 		log.Printf("[FWD-TCP] + %s:%d → 127.0.0.1:%d (iss=%08x, rcv=%08x)",
 			srcIP, srcPort, dstPort, iss, seq+1)
 
-		// 回 SYN-ACK，带 MSS
 		f.sendTCPWithMSS(srcIP, dstPort, srcPort, iss, seq+1,
 			tcpFlagSYN|tcpFlagACK, nil)
 		return
@@ -400,7 +397,8 @@ func (f *PacketForwarder) handleTCP(pkt []byte) {
 	// 其余情况必须有 conn
 	if conn == nil {
 		// 未知连接，回 RST
-		f.sendTCP(srcIP, dstPort, srcPort, 0, seq+len(payload), tcpFlagRST|tcpFlagACK, nil)
+		f.sendTCP(srcIP, dstPort, srcPort, 0,
+			seq+uint32(len(payload)), tcpFlagRST|tcpFlagACK, nil)
 		return
 	}
 
@@ -412,16 +410,11 @@ func (f *PacketForwarder) handleTCP(pkt []byte) {
 	}
 	conn.lastActive = time.Now()
 
-	// --- ACK 处理（更新窗口）---
-	// 简化：不主动重传，只需记录
-
 	// --- FIN：对端关闭 ---
 	if flags&tcpFlagFIN != 0 {
 		conn.rcvNxt = seq + uint32(len(payload)) + 1
-		// 回 ACK
 		f.sendTCP(srcIP, dstPort, srcPort, conn.sndNxt, conn.rcvNxt, tcpFlagACK, nil)
 		conn.finRecv = true
-		// 关闭本地 socket 的写方向
 		if tcpConn, ok := conn.localConn.(*net.TCPConn); ok {
 			_ = tcpConn.CloseWrite()
 		}
@@ -434,7 +427,6 @@ func (f *PacketForwarder) handleTCP(pkt []byte) {
 	// --- DATA ---
 	if len(payload) > 0 {
 		if seq == conn.rcvNxt {
-			// 顺序正确
 			if _, err := conn.localConn.Write(payload); err != nil {
 				log.Printf("[FWD-TCP] write 失败: %v", err)
 				f.sendTCP(srcIP, dstPort, srcPort, conn.sndNxt, conn.rcvNxt,
@@ -444,7 +436,6 @@ func (f *PacketForwarder) handleTCP(pkt []byte) {
 			}
 			conn.rcvNxt += uint32(len(payload))
 		}
-		// 无论顺序如何都回 ACK（告诉对端我们的期望）
 		f.sendTCP(srcIP, dstPort, srcPort, conn.sndNxt, conn.rcvNxt, tcpFlagACK, nil)
 	}
 
@@ -484,12 +475,12 @@ func (f *PacketForwarder) tcpReadFromLocal(conn *tcpConn, key tcpConnKey) {
 			}
 			seq := conn.sndNxt
 			conn.sndNxt += uint32(n)
-			ack := conn.rcvNxt
+			ackVal := conn.rcvNxt
 			conn.lastActive = time.Now()
 			conn.mu.Unlock()
 
 			f.sendTCP(remoteIP, conn.key.serverPort, conn.key.clientPort,
-				seq, ack, tcpFlagACK|tcpFlagPSH, buf[:n])
+				seq, ackVal, tcpFlagACK|tcpFlagPSH, buf[:n])
 		}
 
 		if err != nil {
@@ -516,14 +507,14 @@ func (f *PacketForwarder) tcpReadFromLocal(conn *tcpConn, key tcpConnKey) {
 			}
 			seq := conn.sndNxt
 			conn.sndNxt++
-			ack := conn.rcvNxt
+			ackVal := conn.rcvNxt
 			conn.finSent = true
 			shouldRemove := conn.finRecv
 			conn.mu.Unlock()
 
 			log.Printf("[FWD-TCP] ← FIN %s:%d", remoteIP, conn.key.clientPort)
 			f.sendTCP(remoteIP, conn.key.serverPort, conn.key.clientPort,
-				seq, ack, tcpFlagFIN|tcpFlagACK, nil)
+				seq, ackVal, tcpFlagFIN|tcpFlagACK, nil)
 
 			if shouldRemove {
 				go f.removeTCP(key, "both FIN")
@@ -559,60 +550,37 @@ func (f *PacketForwarder) removeTCP(key tcpConnKey, reason string) {
 // ============================================================
 
 // sendTCP 构造并发送一个 TCP 段。
+//
+// 参数语义：
+//   clientIP:  要发给谁（client 的虚拟 IP）
+//   srcPort:   Termux 侧端口（TCP header 里的 src）
+//   dstPort:   client 侧端口（TCP header 里的 dst）
 func (f *PacketForwarder) sendTCP(
-	srcIP net.IP, srcPort, dstPort uint16,
+	clientIP net.IP, srcPort, dstPort uint16,
 	seq, ack uint32,
 	flags uint8,
 	payload []byte,
 ) {
-	f.sendTCPInternal(srcIP, srcPort, dstPort, seq, ack, flags, payload, false)
+	f.sendTCPInternal(clientIP, srcPort, dstPort, seq, ack, flags, payload, false)
 }
 
 // sendTCPWithMSS 带 MSS option（用于 SYN-ACK）。
 func (f *PacketForwarder) sendTCPWithMSS(
-	srcIP net.IP, srcPort, dstPort uint16,
+	clientIP net.IP, srcPort, dstPort uint16,
 	seq, ack uint32,
 	flags uint8,
 	payload []byte,
 ) {
-	f.sendTCPInternal(srcIP, srcPort, dstPort, seq, ack, flags, payload, true)
+	f.sendTCPInternal(clientIP, srcPort, dstPort, seq, ack, flags, payload, true)
 }
 
 func (f *PacketForwarder) sendTCPInternal(
-	srcIP net.IP, srcPort, dstPort uint16,
+	clientIP net.IP, srcPort, dstPort uint16,
 	seq, ack uint32,
 	flags uint8,
 	payload []byte,
 	withMSS bool,
 ) {
-	if f.edge == nil || f.edge.relayMgr == nil {
-		return
-	}
-
-	// 找目标 peer（dst 是 TCP 包的对端，即 client）
-	// 注意：这里的 srcIP 是"我们"（Termux VIP），dst 是 client
-	// 但我们通过 peer 表反查：clientIP = ?
-	// 简化：调用方传入的 srcIP 是 Termux VIP，
-	//       但我们需要的是 client 的虚拟 IP
-	//       —— 由调用方负责传对的地址
-
-	// 实际上，sendTCP 的语义是：从 Termux 发给某个 client
-	// srcIP 应该是 Termux 的 VIP，dst 应该是 client 的 IP
-	// 但为了找 peer，我们需要 client 的 IP
-	// 
-	// 所以调用方需要传入正确的 IP。
-
-	// 重新设计：参数是 (dstIP, srcPort, dstPort, ...)
-	// srcPort 是 Termux 的监听端口（client 的 dstPort）
-	// dstPort 是 client 的源端口
-
-	// 但为了简单，我保持原来的签名，并假设调用方传入的 srcIP 是 Termux VIP
-	// 但这样我们无法找到 peer！
-	
-	// 最终方案：把 srcIP 视作 "client IP"，即"我们要把包发给谁"
-	// 因为调用方都传的是 client 的 IP（readLocalFromTCP 里是 remoteIP）
-	
-	clientIP := srcIP  // 参数名误导，实际是 client IP
 	clientIP4 := clientIP.To4()
 	if clientIP4 == nil {
 		return
@@ -645,8 +613,8 @@ func (f *PacketForwarder) sendTCPInternal(
 	binary.BigEndian.PutUint16(pkt[6:8], 0x4000)
 	pkt[8] = 64
 	pkt[9] = protoTCP
-	copy(pkt[12:16], selfVIP4)    // src = Termux VIP
-	copy(pkt[16:20], clientIP4)   // dst = client
+	copy(pkt[12:16], selfVIP4)   // src = Termux VIP
+	copy(pkt[16:20], clientIP4)  // dst = client
 	binary.BigEndian.PutUint16(pkt[10:12], ipChecksum(pkt[:20]))
 
 	// TCP 头
@@ -676,7 +644,6 @@ func (f *PacketForwarder) sendTCPInternal(
 	// TCP 校验和
 	binary.BigEndian.PutUint16(tcp[16:18], tcpChecksum(selfVIP4, clientIP4, tcp))
 
-	// 发送
 	f.sendToPeer(clientIP4, pkt)
 }
 
@@ -775,7 +742,7 @@ func (f *PacketForwarder) Stop() {
 }
 
 // ============================================================
-// 工具函数
+// IP 包构造 & 校验和
 // ============================================================
 
 func buildUDPResponsePacket(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16, payload []byte) []byte {
