@@ -1,92 +1,93 @@
 #!/data/data/com.termux/files/usr/bin/bash
 #
-# n2n-termux 一键部署脚本
-# 适用：Android Termux（无 root，SOCKS5 模式）
+# n2n-termux 一键部署 + 自动升级
 #
 # 用法：
-#   curl -fsSL https://raw.githubusercontent.com/<你>/n2n-termux/main/install.sh | bash
+#   bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh)
 #
-# 非交互式（自动跳过所有提问）：
-#   SIGNALING_URL="wss://xxx" ROOM_ID="myroom" CLIENT_ID="termux-a" \
-#     AUTO_START=1 bash install.sh
+# 环境变量：
+#   SIGNALING_URL     WSS 地址
+#   CONNECT_TOKEN     连接密码
+#   ROOM_ID           房间名
+#   CLIENT_ID         客户端 ID
+#   NODE_NAME         显示名
+#   SOCKS5_LISTEN     SOCKS5 监听地址
+#   VERSION           指定版本
+#   INSTALL_DIR       安装目录，默认 ~/.n2n-termux
+#   FORCE_UPDATE      =1 强制重装
+#   NO_LAUNCH         =1 只安装不启动
+#   AUTO_START        =1 静默自动启动
+#   CHECK_ONLY        =1 只检查
 #
-# 指定版本（跳过 GitHub API）：
-#   VERSION=v1.1.10 bash install.sh
-#
-set -e
 
-# ============================================================
-# 颜色
-# ============================================================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+set -euo pipefail
 
-log()  { echo -e "${BLUE}[*]${NC} $1"; }
-ok()   { echo -e "${GREEN}[✓]${NC} $1"; }
-warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-err()  { echo -e "${RED}[✗]${NC} $1" >&2; }
-
-# ============================================================
-# 配置
-# ============================================================
-REPO="${REPO:-goyo123321/n2n-termux}"
-VERSION="${VERSION:-latest}"
-
+REPO="goyo123321/n2n-termux"
+BIN_NAME="n2n-client"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.n2n-termux}"
 BIN_DIR="$INSTALL_DIR/bin"
-BIN="$BIN_DIR/n2n-client"
+BIN_PATH="$BIN_DIR/$BIN_NAME"
+VERSION_FILE="$INSTALL_DIR/.version"
 CONFIG_FILE="$INSTALL_DIR/config.env"
+LAUNCHER="$INSTALL_DIR/start.sh"
 
-SIGNALING_URL="${SIGNALING_URL:-}"
-CONNECT_TOKEN="${CONNECT_TOKEN:-}"
-ROOM_ID="${ROOM_ID:-}"
-CLIENT_ID="${CLIENT_ID:-}"
-NODE_NAME="${NODE_NAME:-}"
-SOCKS5_LISTEN="${SOCKS5_LISTEN:-127.0.0.1:1080}"
+FORCE_UPDATE="${FORCE_UPDATE:-0}"
+NO_LAUNCH="${NO_LAUNCH:-0}"
 AUTO_START="${AUTO_START:-0}"
+CHECK_ONLY="${CHECK_ONLY:-0}"
+
+GITHUB_API="https://api.github.com/repos/${REPO}"
+GITHUB_DL="https://github.com/${REPO}/releases/download"
+FALLBACK_VERSION="v1.0.0"
+
+# 颜色
+RED='\033[0;31m'; GREEN='\033[0;32m'
+YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+log()  { printf "${BLUE}[*]${NC} %s\n" "$*"; }
+ok()   { printf "${GREEN}[✓]${NC} %s\n" "$*"; }
+warn() { printf "${YELLOW}[!]${NC} %s\n" "$*"; }
+err()  { printf "${RED}[✗]${NC} %s\n" "$*" >&2; }
+info() { printf "${CYAN}  %s${NC}\n" "$*"; }
 
 # ============================================================
 # 环境检查
 # ============================================================
 check_env() {
     if [ ! -d "/data/data/com.termux" ]; then
-        warn "看起来不是 Termux 环境（/data/data/com.termux 不存在）"
-        warn "脚本仍会继续，但路径假设是 Termux 的"
-        echo ""
+        warn "看起来不是 Termux 环境"
     fi
 
     for cmd in curl uname; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             err "缺少依赖: $cmd"
-            echo "  安装: pkg install $cmd"
+            info "安装: pkg install $cmd"
             exit 1
         fi
     done
+
+    # ★ Termux 特有：检查 CA 证书（否则 WSS 会报 x509 错误）
+    if [ ! -f "$PREFIX/etc/tls/cert.pem" ] && [ ! -f "$PREFIX/etc/ca-certificates/ca-bundle.crt" ]; then
+        warn "未找到 CA 证书，尝试安装..."
+        if command -v pkg >/dev/null 2>&1; then
+            pkg install -y ca-certificates || {
+                warn "ca-certificates 安装失败，请手动执行: pkg install ca-certificates"
+            }
+        fi
+    fi
 }
 
 # ============================================================
 # 架构检测
 # ============================================================
+GOARCH=""
 detect_arch() {
     local arch
     arch="$(uname -m)"
 
     case "$arch" in
-        aarch64|arm64)
-            GOARCH="arm64"
-            ;;
-        armv7l|armv7)
-            GOARCH="armv7"
-            ;;
-        x86_64|amd64)
-            GOARCH="amd64"
-            ;;
-        armv8l)
-            GOARCH="armv7"
-            ;;
+        aarch64|arm64)  GOARCH="arm64" ;;
+        armv7l|armv7|armv8l) GOARCH="armv7" ;;
+        x86_64|amd64)   GOARCH="amd64" ;;
         i686|i386)
             err "不支持的架构: $arch（32 位 x86 无 Go 官方支持）"
             exit 1
@@ -97,7 +98,143 @@ detect_arch() {
             ;;
     esac
 
-    log "检测到架构: $arch → linux/$GOARCH"
+    log "架构: $arch → linux/$GOARCH"
+}
+
+# ============================================================
+# ★ 版本管理
+# ============================================================
+read_installed_version() {
+    if [ -f "$VERSION_FILE" ]; then
+        cat "$VERSION_FILE" 2>/dev/null | tr -d '[:space:]'
+    else
+        echo ""
+    fi
+}
+
+write_installed_version() {
+    mkdir -p "$INSTALL_DIR"
+    echo "$1" > "$VERSION_FILE"
+}
+
+resolve_latest_version() {
+    if [ -n "${VERSION:-}" ]; then
+        echo "$VERSION"
+        return 0
+    fi
+
+    local resp code body tag
+    resp=$(curl -sSL -w "\n__HTTP_CODE__:%{http_code}" \
+        "${GITHUB_API}/releases/latest" 2>&1) || {
+        warn "无法访问 GitHub API，使用内置版本: $FALLBACK_VERSION"
+        echo "$FALLBACK_VERSION"
+        return 0
+    }
+
+    code=$(echo "$resp" | grep -oE '__HTTP_CODE__:[0-9]+' | cut -d: -f2 | tail -1)
+    body=$(echo "$resp" | sed 's/__HTTP_CODE__:[0-9]*$//')
+
+    case "$code" in
+        200)
+            tag=$(echo "$body" | grep -m1 '"tag_name"' | sed 's/.*: "\(.*\)".*/\1/')
+            if [ -z "$tag" ]; then
+                warn "解析 tag_name 失败，使用内置版本"
+                echo "$FALLBACK_VERSION"
+            else
+                echo "$tag"
+            fi
+            ;;
+        404)
+            warn "仓库 $REPO 无 Release，使用内置版本: $FALLBACK_VERSION"
+            echo "$FALLBACK_VERSION"
+            ;;
+        *)
+            warn "GitHub API 失败（HTTP $code），使用内置版本: $FALLBACK_VERSION"
+            echo "$FALLBACK_VERSION"
+            ;;
+    esac
+}
+
+# ============================================================
+# 停止运行中的客户端
+# ============================================================
+stop_running_client() {
+    if ! command -v pgrep >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local pids
+    pids=$(pgrep -f "${BIN_DIR}/${BIN_NAME}|${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null || true)
+    if [ -z "$pids" ]; then
+        return 0
+    fi
+
+    log "检测到运行中的 n2n-client (PID: $pids)，停止..."
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    sleep 1
+
+    pids=$(pgrep -f "${BIN_DIR}/${BIN_NAME}|${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+        warn "进程未响应 SIGTERM，使用 SIGKILL"
+        # shellcheck disable=SC2086
+        kill -9 $pids 2>/dev/null || true
+        sleep 0.5
+    fi
+    ok "旧进程已停止"
+}
+
+# ============================================================
+# 下载二进制
+# ============================================================
+download_binary() {
+    local tag="$1"
+    local file="n2n-client-linux-$GOARCH"
+    local url="https://github.com/$REPO/releases/download/$tag/$file"
+    local sha_url="$url.sha256"
+
+    mkdir -p "$BIN_DIR"
+
+    log "下载: $tag / $file"
+
+    if ! curl -L --fail --progress-bar -o "$BIN_PATH" "$url"; then
+        err "下载失败"
+        echo ""
+        echo "可能原因："
+        echo "  1. 版本号不存在: $tag"
+        echo "  2. Release 未上传 $file"
+        echo "  3. GitHub 网络问题"
+        echo ""
+        echo "手动检查: https://github.com/$REPO/releases/tag/$tag"
+        exit 1
+    fi
+
+    # 校验 ELF 头
+    local magic
+    magic=$(head -c 4 "$BIN_PATH" | od -An -tx1 | tr -d ' \n')
+    if [ "$magic" != "7f454c46" ]; then
+        err "下载的文件不是 ELF 二进制（可能是错误页）"
+        head -c 64 "$BIN_PATH" | od -c
+        rm -f "$BIN_PATH"
+        exit 1
+    fi
+
+    chmod +x "$BIN_PATH"
+
+    # 可选 sha256
+    local expected actual
+    if expected=$(curl -sSL --fail "$sha_url" 2>/dev/null | awk '{print $1}') && [ -n "$expected" ]; then
+        actual=$(sha256sum "$BIN_PATH" | awk '{print $1}')
+        if [ "$expected" = "$actual" ]; then
+            ok "sha256 校验通过"
+        else
+            warn "sha256 不匹配！"
+            info "期望: $expected"
+            info "实际: $actual"
+        fi
+    fi
+
+    ok "已安装: $BIN_PATH ($(du -h "$BIN_PATH" | cut -f1))"
 }
 
 # ============================================================
@@ -109,7 +246,6 @@ ask_config() {
     echo "（直接回车 = 使用括号里的默认值）"
     echo ""
 
-    # WSS 地址
     while [ -z "$SIGNALING_URL" ]; do
         echo -e "${YELLOW}Worker WSS 地址（必填）${NC}"
         echo "  示例: wss://edge-signal.xxx.workers.dev"
@@ -131,12 +267,10 @@ ask_config() {
     ok "WSS: $SIGNALING_URL"
     echo ""
 
-    # CONNECT_TOKEN
     if [ -z "$CONNECT_TOKEN" ]; then
         read -rp "连接密码 CONNECT_TOKEN (无则回车): " CONNECT_TOKEN
     fi
 
-    # ROOM_ID
     while [ -z "$ROOM_ID" ]; do
         read -rp "房间名 ROOM_ID (default-room): " input
         input="${input:-default-room}"
@@ -147,7 +281,6 @@ ask_config() {
         ROOM_ID="$input"
     done
 
-    # CLIENT_ID
     if [ -z "$CLIENT_ID" ]; then
         local default_id
         default_id="$(hostname)"
@@ -155,13 +288,11 @@ ask_config() {
         CLIENT_ID="${input:-$default_id}"
     fi
 
-    # NODE_NAME
     if [ -z "$NODE_NAME" ]; then
         read -rp "显示名 NODE_NAME ($(hostname)): " input
         NODE_NAME="${input:-$(hostname)}"
     fi
 
-    # SOCKS5 监听地址
     read -rp "SOCKS5 监听地址 ($SOCKS5_LISTEN): " input
     SOCKS5_LISTEN="${input:-$SOCKS5_LISTEN}"
 
@@ -169,178 +300,28 @@ ask_config() {
     echo ""
 }
 
-# ============================================================
-# 保存配置
-# ============================================================
 save_config() {
-    mkdir -p "$INSTALL_DIR" "$BIN_DIR"
-
+    mkdir -p "$INSTALL_DIR"
     cat > "$CONFIG_FILE" <<EOF
 # n2n-termux 配置
 # 由 install.sh 生成于 $(date)
 
-SIGNALING_URL="$SIGNALING_URL"
-CONNECT_TOKEN="$CONNECT_TOKEN"
-ROOM_ID="$ROOM_ID"
-CLIENT_ID="$CLIENT_ID"
-NODE_NAME="$NODE_NAME"
-SOCKS5_LISTEN="$SOCKS5_LISTEN"
+SIGNALING_URL="$(printf '%s' "${SIGNALING_URL:-}" | sed 's/"/\\"/g')"
+CONNECT_TOKEN="$(printf '%s' "${CONNECT_TOKEN:-}" | sed 's/"/\\"/g')"
+ROOM_ID="$(printf '%s' "${ROOM_ID:-default-room}" | sed 's/"/\\"/g')"
+CLIENT_ID="$(printf '%s' "${CLIENT_ID:-}" | sed 's/"/\\"/g')"
+NODE_NAME="$(printf '%s' "${NODE_NAME:-}" | sed 's/"/\\"/g')"
+SOCKS5_LISTEN="$(printf '%s' "${SOCKS5_LISTEN:-127.0.0.1:1080}" | sed 's/"/\\"/g')"
 EOF
-
     chmod 600 "$CONFIG_FILE"
     ok "配置已保存: $CONFIG_FILE"
-}
-
-# ============================================================
-# 获取版本号
-# ============================================================
-resolve_version() {
-    if [ "$VERSION" != "latest" ]; then
-        echo "$VERSION"
-        return
-    fi
-
-    log "查询最新版本..."
-
-    local resp code body tag
-    # 抓 HTTP 状态码 + body
-    resp=$(curl -sSL -w "\n__HTTP_CODE__:%{http_code}" \
-        "https://api.github.com/repos/$REPO/releases/latest" 2>&1) || {
-        err "无法访问 GitHub API（网络问题？）"
-        err "  测试网络: curl -I https://api.github.com"
-        err "  手动指定：VERSION=v1.1.10 bash install.sh"
-        exit 1
-    }
-
-    code=$(echo "$resp" | grep -oE '__HTTP_CODE__:[0-9]+' | cut -d: -f2 | tail -1)
-    body=$(echo "$resp" | sed 's/__HTTP_CODE__:[0-9]*$//')
-
-    case "$code" in
-        200)
-            tag=$(echo "$body" | grep -m1 '"tag_name"' | sed 's/.*: "\(.*\)".*/\1/')
-            if [ -z "$tag" ]; then
-                err "GitHub API 返回 200 但解析不出 tag_name"
-                err "  响应前 200 字节："
-                echo "$body" | head -c 200
-                echo ""
-                err "  手动指定：VERSION=v1.1.10 bash install.sh"
-                exit 1
-            fi
-            echo "$tag"
-            ;;
-        404)
-            err "仓库 $REPO 没有任何 Release"
-            err ""
-            err "解决方法（三选一）："
-            err "  1. 去 GitHub 发布 Release："
-            err "     https://github.com/$REPO/releases/new"
-            err "     上传 Actions Artifact 里的二进制（n2n-client-linux-*）"
-            err "  2. 手动下载二进制放到 $BIN/n2n-client"
-            err "  3. 指定已有版本：VERSION=v1.1.10 bash install.sh"
-            exit 1
-            ;;
-        403)
-            err "GitHub API 限流（HTTP 403）"
-            err "  稍后重试，或指定版本：VERSION=v1.1.10 bash install.sh"
-            exit 1
-            ;;
-        000|"")
-            err "无法连接 GitHub API（网络不通）"
-            err "  测试：curl -I https://api.github.com"
-            err "  手动指定：VERSION=v1.1.10 bash install.sh"
-            exit 1
-            ;;
-        *)
-            err "GitHub API 请求失败（HTTP $code）"
-            echo "$body" | head -c 200
-            echo ""
-            exit 1
-            ;;
-    esac
-}
-
-# ============================================================
-# 下载二进制
-# ============================================================
-download_binary() {
-    local tag="$1"
-    local file="n2n-client-linux-$GOARCH"
-    local url="https://github.com/$REPO/releases/download/$tag/$file"
-    local sha_url="$url.sha256"
-
-    # 已有同名二进制且大小 > 1MB → 跳过
-    if [ -f "$BIN" ]; then
-        local size
-        size=$(stat -c%s "$BIN" 2>/dev/null || echo 0)
-        if [ "$size" -gt 1000000 ]; then
-            ok "二进制已存在: $BIN（跳过下载）"
-            return
-        fi
-    fi
-
-    mkdir -p "$BIN_DIR"
-
-    log "下载 $tag / $file"
-    log "  URL: $url"
-
-    if ! curl -L --fail --progress-bar -o "$BIN" "$url"; then
-        err "下载失败"
-        echo ""
-        echo "可能原因："
-        echo "  1. 版本号不存在: $tag"
-        echo "  2. Release 未上传对应架构的二进制: $file"
-        echo "  3. GitHub 网络问题"
-        echo ""
-        echo "手动检查 Release Assets："
-        echo "  https://github.com/$REPO/releases/tag/$tag"
-        exit 1
-    fi
-
-    # ★ 校验是不是真 ELF（\x7fELF = 7f 45 4c 46）
-    local magic
-    magic=$(head -c 4 "$BIN" | od -An -tx1 | tr -d ' \n')
-    if [ "$magic" != "7f454c46" ]; then
-        err "下载的文件不是 ELF 二进制（可能是 HTML 错误页）"
-        echo "  文件头 64 字节："
-        head -c 64 "$BIN" | od -c
-        echo ""
-        echo "  文件实际内容前 200 字节："
-        head -c 200 "$BIN"
-        echo ""
-        rm -f "$BIN"
-        exit 1
-    fi
-
-    chmod +x "$BIN"
-
-    # 校验 sha256（可选，失败不阻断）
-    local expected actual
-    if expected=$(curl -sSL --fail "$sha_url" 2>/dev/null | awk '{print $1}') && [ -n "$expected" ]; then
-        actual=$(sha256sum "$BIN" | awk '{print $1}')
-        if [ "$expected" = "$actual" ]; then
-            ok "sha256 校验通过"
-        else
-            warn "sha256 不匹配！"
-            echo "  期望: $expected"
-            echo "  实际: $actual"
-            warn "文件可能损坏或被篡改，建议手动确认"
-        fi
-    else
-        log "跳过 sha256 校验（.sha256 文件不存在）"
-    fi
-
-    local size
-    size=$(du -h "$BIN" | cut -f1)
-    ok "下载完成: $BIN ($size)"
 }
 
 # ============================================================
 # 生成启动脚本
 # ============================================================
 create_launcher() {
-    local launcher="$INSTALL_DIR/start.sh"
-
-    cat > "$launcher" <<'EOF'
+    cat > "$LAUNCHER" <<'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 # n2n-termux 启动脚本（由 install.sh 生成）
 set -e
@@ -351,13 +332,10 @@ BIN="$INSTALL_DIR/bin/n2n-client"
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "配置文件不存在: $CONFIG_FILE"
-    echo "请先运行 install.sh"
     exit 1
 fi
-
 if [ ! -x "$BIN" ]; then
     echo "二进制不存在: $BIN"
-    echo "请先运行 install.sh"
     exit 1
 fi
 
@@ -366,11 +344,10 @@ set -a
 source "$CONFIG_FILE"
 set +a
 
-exec "$BIN"
+exec "$BIN" "$@"
 EOF
-
-    chmod +x "$launcher"
-    ok "启动脚本: $launcher"
+    chmod +x "$LAUNCHER"
+    ok "启动脚本: $LAUNCHER"
 }
 
 # ============================================================
@@ -380,33 +357,60 @@ main() {
     echo ""
     echo "========================================="
     echo "   n2n-termux 一键部署"
+    echo "   https://github.com/$REPO"
     echo "========================================="
     echo ""
 
     check_env
     detect_arch
 
-    # ★ 配置阶段：AUTO_START 优先级最高
+    # 版本检测
+    local installed latest need_update
+    installed="$(read_installed_version)"
+
+    log "查询最新版本..."
+    latest="$(resolve_latest_version)"
+
+    if [ -n "$installed" ]; then
+        log "本地已装: $installed"
+    else
+        log "本地未装"
+    fi
+    log "远端最新: $latest"
+
+    need_update=1
+    if [ -n "$installed" ] && [ "$installed" = "$latest" ] && [ "$FORCE_UPDATE" != "1" ]; then
+        need_update=0
+    fi
+
+    if [ "$CHECK_ONLY" = "1" ]; then
+        echo ""
+        if [ "$need_update" = "1" ]; then
+            ok "有新版本可更新: $installed → $latest"
+            info "不带 CHECK_ONLY=1 即可升级"
+        else
+            ok "已是最新版本: $latest"
+        fi
+        exit 0
+    fi
+
+    # 配置阶段：优先环境变量 > 已有 config > 交互
     if [ "$AUTO_START" = "1" ]; then
-        # 非交互模式
-        if [ -n "$SIGNALING_URL" ]; then
-            # 环境变量齐全 → 保存覆盖
-            log "非交互模式：使用环境变量配置"
+        if [ -n "${SIGNALING_URL:-}" ]; then
+            log "非交互模式：使用环境变量"
             save_config
         elif [ -f "$CONFIG_FILE" ]; then
-            # 无环境变量但有配置文件 → 用现成的
             log "非交互模式：使用已有配置 $CONFIG_FILE"
             set -a
             # shellcheck disable=SC1090
             source "$CONFIG_FILE"
             set +a
         else
-            err "AUTO_START=1 但既没有 SIGNALING_URL 也没有配置文件"
-            err "  至少提供: SIGNALING_URL=wss://... AUTO_START=1 bash install.sh"
+            err "AUTO_START=1 但既无环境变量也无配置文件"
+            err "  至少: SIGNALING_URL=wss://... AUTO_START=1 bash install.sh"
             exit 1
         fi
-    elif [ -f "$CONFIG_FILE" ] && [ -z "$SIGNALING_URL" ]; then
-        # 交互模式 + 已有配置
+    elif [ -f "$CONFIG_FILE" ] && [ -z "${SIGNALING_URL:-}" ]; then
         warn "已存在配置: $CONFIG_FILE"
         read -rp "重新配置？(y/N): " input
         if [[ ! "$input" =~ ^[Yy]$ ]]; then
@@ -420,18 +424,26 @@ main() {
             save_config
         fi
     else
-        # 交互模式 + 没有配置 / 有环境变量
         ask_config
         save_config
     fi
 
-    # 下载
-    local tag
-    tag=$(resolve_version)
-    log "使用版本: $tag"
-    download_binary "$tag"
+    # 下载或跳过
+    if [ "$need_update" = "0" ]; then
+        ok "已是最新版本: $latest（跳过下载，FORCE_UPDATE=1 强制重装）"
+    else
+        if [ -n "$installed" ]; then
+            log "升级中: $installed → $latest"
+        else
+            log "首次安装: $latest"
+        fi
 
-    # 启动脚本
+        stop_running_client
+        download_binary "$latest"
+        write_installed_version "$latest"
+        ok "版本已更新: $latest"
+    fi
+
     create_launcher
 
     echo ""
@@ -439,39 +451,31 @@ main() {
     ok "部署完成！"
     echo "========================================="
     echo ""
-    echo "  二进制:  $BIN"
-    echo "  配置:    $CONFIG_FILE"
+    info "二进制:  $BIN_PATH"
+    info "版本:    $latest"
+    info "配置:    $CONFIG_FILE"
     echo ""
-    echo "  前台启动:"
-    echo -e "    ${GREEN}$INSTALL_DIR/start.sh${NC}"
-    echo ""
-    echo "  后台启动:"
-    echo -e "    ${GREEN}nohup $INSTALL_DIR/start.sh > ~/n2n.log 2>&1 &${NC}"
-    echo ""
-    echo "  停止:"
-    echo -e "    ${GREEN}pkill -f n2n-client${NC}"
-    echo ""
-    echo "  用 SOCKS5:"
-    echo "    curl --socks5 127.0.0.1:1080 http://<对端虚拟IP>:port/"
-    echo "    export ALL_PROXY=socks5://127.0.0.1:1080"
+    info "前台启动: $LAUNCHER"
+    info "后台启动: nohup $LAUNCHER > ~/n2n.log 2>&1 &"
+    info "停止:     pkill -f n2n-client"
     echo ""
 
-    # 自动启动判断
     if [ "$AUTO_START" = "1" ]; then
         log "AUTO_START=1，直接启动"
-        exec "$INSTALL_DIR/start.sh"
+        exec "$LAUNCHER"
     fi
 
-    read -rp "现在启动？(Y/n): " input
+    printf "现在启动？(Y/n): "
+    read -rp "" input
     if [[ "$input" =~ ^[Nn]$ ]]; then
         log "已跳过启动"
         echo ""
-        echo "  手动启动: $INSTALL_DIR/start.sh"
+        info "手动启动: $LAUNCHER"
         echo ""
         exit 0
     fi
 
-    exec "$INSTALL_DIR/start.sh"
+    exec "$LAUNCHER"
 }
 
 main "$@"
