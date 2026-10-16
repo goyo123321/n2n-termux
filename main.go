@@ -28,6 +28,7 @@ var (
 
 const DefaultVirtualCIDR = "10.64.0.0/24"
 
+// LAN 缓存：reportMetadata 实时收集为空时回退用上次成功结果
 var (
 	lanCacheMu   sync.Mutex
 	lanCache     []string
@@ -62,7 +63,7 @@ type PeerInfo struct {
 	TurnRelayAddr     string
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
-	lastLANRecvAt     int64
+	lastLANRecvAt     int64 // ★ 最近一次收到 LAN 帧的时间
 	loggedReady       bool
 	hasRealData       bool
 	probeReplied      bool
@@ -1002,8 +1003,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			return
 		}
 
-		// ★★★ 适配（本次修复）：已 P2P 时，主动上报 p2p_status=3，
-		//     让服务端 punchState.anySucceeded=true，停止每 15 秒重发指令。
+		// ★★★ 适配：已 P2P 时主动上报 p2p_status=3，停止服务端每 15 秒重发
 		if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
 			log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P），上报 p2p_status=3",
 				instr.TargetMac)
@@ -1181,9 +1181,9 @@ func (e *Edge) peerExists(peerID string) bool {
 
 // registerPeer 注册/更新一个 peer。
 //
-// ★ LAN 优先保护 UDPAddr
+// ★ 修复：LAN 优先保护 UDPAddr
 //
-// ★★ 适配（本次修复）：新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
+// ★★ 适配：新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
 		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
@@ -1266,9 +1266,9 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 
 // ensureTargetPeer 记录指令里的目标 peer 信息。
 //
-// ★ LAN 优先保护 UDPAddr
+// ★ 修复：LAN 优先保护 UDPAddr
 //
-// ★★ 适配（本次修复）：新建时优先用 LAN 端点初始化 UDPAddr。
+// ★★ 适配：新建时优先用 LAN 端点初始化 UDPAddr。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1359,15 +1359,8 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 
 // reportP2PStatus 主动上报当前 P2P 状态，让服务端停止重发 nat_hole_instruction。
 //
-// ★★★ 适配（本次修复）：
-//
-// 场景：客户端在收到指令前就已经通过 PING/PONG 建立了 P2P。此时客户端会跳过
-// 打洞指令，但服务端不知道——punchState 里 aState/bState 一直是 0，
-// anySucceeded = false，服务端每 15 秒重发一次 nat_hole_instruction。
-//
-// 主动上报 state=3 + p2pStatus=3 后，服务端 recordPunchResult：
-//   - state=3 → 交叉校验（self >= P2P_AVAILABLE(2) 通过）
-//   - entry.aState = 3 → anySucceeded = true → 停止重发
+// ★★★ 适配：客户端在收到指令前已经 P2P 时，主动上报 state=3，
+//     让服务端 punchState.anySucceeded=true，停止每 15 秒重发。
 func (e *Edge) reportP2PStatus(peerID string, status int) {
 	if e.ws == nil || peerID == "" {
 		return
@@ -1389,6 +1382,251 @@ func (e *Edge) reportP2PStatus(peerID string, status int) {
 			},
 		},
 	})
+}
+
+// ============ peer 探测处理 ============
+
+func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false, false, false)
+}
+
+func (e *Edge) notePeerAck(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false, false, true)
+}
+
+func (e *Edge) notePeerProbeTURN(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false, true, false)
+}
+
+func (e *Edge) notePeerAckTURN(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, false, true, true)
+}
+
+func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, true, false, false)
+}
+
+func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
+	e.notePeerCommon(addr, true, true, false)
+}
+
+// notePeerCommon 是打洞握手路径的统一入口。
+//
+// ★ LAN 优先 + 30 秒窗口 + lastLANRecvAt > 0 检查
+//
+// ★★ 适配：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
+func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
+	now := time.Now().UnixMilli()
+
+	e.peersMu.Lock()
+	var best *PeerInfo
+	bestScore := 0
+	addrIP := addr.IP
+	addrPort := addr.Port
+
+	for _, p := range e.peers {
+		score := 0
+
+		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addrIP) {
+			if p.UDPAddr.Port == addrPort {
+				score = 4
+			} else {
+				score = 3
+			}
+		}
+
+		for _, lan := range p.LanEndpoints {
+			la, err := net.ResolveUDPAddr("udp", lan)
+			if err != nil || la == nil || la.IP == nil {
+				continue
+			}
+			if la.IP.Equal(addrIP) {
+				if la.Port == addrPort {
+					if score < 5 {
+						score = 5
+					}
+				} else if score < 2 {
+					score = 2
+				}
+			}
+		}
+
+		for _, ass := range p.AssistedEndpoints {
+			aa, err := net.ResolveUDPAddr("udp", ass)
+			if err != nil || aa == nil || aa.IP == nil {
+				continue
+			}
+			if aa.IP.Equal(addrIP) {
+				if aa.Port == addrPort {
+					if score < 4 {
+						score = 4
+					}
+				} else if score < 1 {
+					score = 1
+				}
+			}
+		}
+
+		if score > 0 && score > bestScore {
+			best = p
+			bestScore = score
+		}
+	}
+	if best == nil {
+		e.peersMu.Unlock()
+		return
+	}
+
+	// ★ LAN 优先更新 UDPAddr
+	newIsLAN := isPrivateIPv4(addr.IP)
+	oldIsLAN := best.UDPAddr != nil && isPrivateIPv4(best.UDPAddr.IP)
+
+	shouldUpdate := false
+	if best.UDPAddr == nil {
+		shouldUpdate = true
+	} else if !oldIsLAN && newIsLAN {
+		shouldUpdate = true
+	} else if oldIsLAN && !newIsLAN {
+		// ★★ 适配：5 分钟 → 30 秒
+		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 30000 {
+			shouldUpdate = true
+			log.Printf("[P2P] %s (note) LAN 超过 30s 无流量，改用公网地址", best.ClientID)
+		}
+	} else {
+		if best.UDPAddr.Port != addrPort {
+			shouldUpdate = true
+		}
+	}
+
+	if newIsLAN {
+		best.lastLANRecvAt = now
+	}
+
+	if shouldUpdate {
+		best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
+	}
+
+	best.lastRecvAt = now
+	if isRealData {
+		best.hasRealData = true
+	}
+	clientID := best.ClientID
+	ip := addr.IP.String()
+	e.peersMu.Unlock()
+
+	if e.relayMgr == nil {
+		return
+	}
+
+	if isRealData {
+		if e.relayMgr.GetState(clientID) != ConnP2P {
+			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧 → P2P 直连", clientID, ip)
+			e.relayMgr.MarkP2P(clientID)
+		}
+		return
+	}
+
+	curState := e.relayMgr.GetState(clientID)
+	justUpgraded := false
+	if curState != ConnP2P && curState != ConnP2PAvailable {
+		kind := "Punch"
+		if isAck {
+			kind = "ACK"
+		}
+		log.Printf("[P2P] 从 %s (%s) 收到 %s → P2PAvailable（等待数据帧验证）", clientID, ip, kind)
+		e.relayMgr.MarkP2PAvailable(clientID)
+		justUpgraded = true
+	}
+
+	if justUpgraded {
+		if e.p2pStreams != nil {
+			safeGo("p2p-probe", func() {
+				e.p2pStreams.sendP2PProbe(clientID)
+			})
+		}
+		e.scheduleP2PAvailTimeout(clientID)
+	}
+
+	if isAck {
+		return
+	}
+	if e.punchAckLimiter == nil || !e.punchAckLimiter.allow(clientID, time.Now()) {
+		return
+	}
+
+	safeGo("punch-ack", func() {
+		ack := buildPunchAck()
+		e.writeProbe(addr, ack, viaTURN)
+	})
+}
+
+func (e *Edge) writeProbe(addr *net.UDPAddr, probe []byte, viaTURN bool) {
+	if addr == nil {
+		return
+	}
+	if viaTURN {
+		if e.turnClient == nil || !e.turnClient.IsReady() {
+			return
+		}
+		_ = e.turnClient.Send(probe, addr)
+		return
+	}
+	if e.udpConn == nil {
+		return
+	}
+	_, _ = e.udpConn.WriteToUDP(probe, addr)
+}
+
+func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
+	if e.udpConn == nil || addr == nil {
+		return
+	}
+	probe := buildPunchProbe(e.getVirtualIPLocked())
+	e.writeProbe(addr, probe, false)
+}
+
+// ============ 多 STUN 端点收集 ============
+
+func (e *Edge) addAssistedEndpoint(ip string, port int) {
+	if ip == "" || port <= 0 {
+		return
+	}
+	ep := net.JoinHostPort(ip, strconv.Itoa(port))
+
+	e.mu.Lock()
+	if e.natMeta == nil {
+		e.mu.Unlock()
+		return
+	}
+	for _, existing := range e.natMeta.AllEndpoints {
+		if existing == ep {
+			e.mu.Unlock()
+			return
+		}
+	}
+	if len(e.natMeta.AllEndpoints) >= 5 {
+		e.natMeta.AllEndpoints = e.natMeta.AllEndpoints[1:]
+	}
+	e.natMeta.AllEndpoints = append(e.natMeta.AllEndpoints, ep)
+	count := len(e.natMeta.AllEndpoints)
+	e.mu.Unlock()
+
+	e.maybeResetOwnFailCounts(ep)
+
+	log.Printf("[NAT] +assisted: %s (total=%d)", ep, count)
+	e.reportMetadataThrottled()
+}
+
+func (e *Edge) reportMetadataThrottled() {
+	now := time.Now().UnixMilli()
+	last := atomic.LoadInt64(&e.lastMetadataReportAt)
+	if now-last < 30000 {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&e.lastMetadataReportAt, last, now) {
+		return
+	}
+	e.reportMetadata()
 }
 
 // ============ 环境变量 / CSV ============
