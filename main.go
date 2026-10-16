@@ -87,6 +87,8 @@ type Edge struct {
 	udpConn *net.UDPConn
 	udpPort int
 
+	netstack *NetStack // ★ 用户态 TCP/IP 栈
+
 	peers   map[string]*PeerInfo
 	peersMu sync.RWMutex
 
@@ -609,6 +611,11 @@ func main() {
 
 			if buf[0]>>4 == 4 {
 				edge.notePeerTraffic(addr)
+
+				// ★★★ 喂给 netstack 处理（PC/Android → Termux 的 TCP/UDP 转发）
+				if edge.netstack != nil {
+					edge.netstack.InjectPacket(buf[:n])
+				}
 			}
 		}
 	})
@@ -681,6 +688,10 @@ func (e *Edge) Stop() {
 	}
 	if e.p2pStreams != nil {
 		e.p2pStreams.closeAll()
+	}
+	// ★★★ 关闭 netstack
+	if e.netstack != nil {
+		e.netstack.Stop()
 	}
 }
 
@@ -773,7 +784,7 @@ func (e *Edge) printNodeSummary() {
 	log.Printf("  虚拟 IP     : %s", e.getVirtualIPLocked())
 	log.Printf("  虚拟网段    : %s", e.virtualCIDR)
 	log.Printf("  P2P 端口    : %d", e.udpPort)
-	log.Printf("  模式         : SOCKS5")
+	log.Printf("  模式         : SOCKS5 + netstack（双向互通）")
 	log.Println("==========================================")
 	log.Println("")
 }
@@ -876,6 +887,16 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 		e.reportMetadata()
+
+		// ★★★ 初始化 netstack（让 PC/Android 可主动访问本机 TCP/UDP）
+		if e.netstack == nil && vip != "" {
+			ns, err := NewNetStack(e, vip, cidr)
+			if err != nil {
+				log.Printf("[NETSTACK] 初始化失败: %v（PC/Android 将无法主动访问本机）", err)
+			} else {
+				e.netstack = ns
+			}
+		}
 
 		if len(collectLANEndpoints(e.udpPort, vip)) == 0 {
 			log.Printf("[NAT] 首次 LAN 收集为空，启动后台重试")
@@ -1003,7 +1024,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			return
 		}
 
-		// ★★★ 适配：已 P2P 时主动上报 p2p_status=3，停止服务端每 15 秒重发
+		// 已 P2P 时主动上报 p2p_status=3，停止服务端每 15 秒重发
 		if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
 			log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P），上报 p2p_status=3",
 				instr.TargetMac)
@@ -1181,9 +1202,8 @@ func (e *Edge) peerExists(peerID string) bool {
 
 // registerPeer 注册/更新一个 peer。
 //
-// ★ 修复：LAN 优先保护 UDPAddr
-//
-// ★★ 适配：新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
+// ★ LAN 优先保护 UDPAddr
+// ★★ 新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
 		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
@@ -1231,7 +1251,7 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
-		// ★★ 适配：新建 peer 时优先用 LAN 初始化 UDPAddr
+		// ★★ 新建 peer 时优先用 LAN 初始化 UDPAddr
 		var initialUDP *net.UDPAddr
 		if len(sortedLAN) > 0 {
 			for _, lan := range sortedLAN {
@@ -1265,10 +1285,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 }
 
 // ensureTargetPeer 记录指令里的目标 peer 信息。
-//
-// ★ 修复：LAN 优先保护 UDPAddr
-//
-// ★★ 适配：新建时优先用 LAN 端点初始化 UDPAddr。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1280,7 +1296,6 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	e.peersMu.Lock()
 	defer e.peersMu.Unlock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
-		// ★ LAN 优先保护
 		if udpAddr != nil {
 			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
 			if !oldIsLAN {
@@ -1291,7 +1306,6 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 			p.VirtualIP = instr.TargetVirtualIp
 		}
 	} else {
-		// ★★ 适配：优先使用 LAN 端点
 		var initialUDP *net.UDPAddr
 		if len(instr.TargetLanEndpoints) > 0 {
 			for _, lan := range instr.TargetLanEndpoints {
@@ -1358,9 +1372,6 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 }
 
 // reportP2PStatus 主动上报当前 P2P 状态，让服务端停止重发 nat_hole_instruction。
-//
-// ★★★ 适配：客户端在收到指令前已经 P2P 时，主动上报 state=3，
-//     让服务端 punchState.anySucceeded=true，停止每 15 秒重发。
 func (e *Edge) reportP2PStatus(peerID string, status int) {
 	if e.ws == nil || peerID == "" {
 		return
@@ -1413,8 +1424,6 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 // notePeerCommon 是打洞握手路径的统一入口。
 //
 // ★ LAN 优先 + 30 秒窗口 + lastLANRecvAt > 0 检查
-//
-// ★★ 适配：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1487,7 +1496,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	} else if !oldIsLAN && newIsLAN {
 		shouldUpdate = true
 	} else if oldIsLAN && !newIsLAN {
-		// ★★ 适配：5 分钟 → 30 秒
+		// 5 分钟 → 30 秒
 		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 30000 {
 			shouldUpdate = true
 			log.Printf("[P2P] %s (note) LAN 超过 30s 无流量，改用公网地址", best.ClientID)
