@@ -87,7 +87,7 @@ type Edge struct {
 	udpConn *net.UDPConn
 	udpPort int
 
-	netstack *NetStack // ★ 用户态 TCP/IP 栈
+	pktFwd *PacketForwarder // ★ TCP 中继 + UDP 转发 + ICMP 响应
 
 	peers   map[string]*PeerInfo
 	peersMu sync.RWMutex
@@ -457,6 +457,7 @@ func main() {
 	}
 	edge.punchAckLimiter = newPunchAckLimiter()
 	edge.streamMgr = NewAppStreamManager()
+	edge.pktFwd = NewPacketForwarder(edge) // ★ TCP 中继 + UDP 转发 + ICMP 响应
 
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: udpPort}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
@@ -612,9 +613,9 @@ func main() {
 			if buf[0]>>4 == 4 {
 				edge.notePeerTraffic(addr)
 
-				// ★★★ 喂给 netstack 处理（PC/Android → Termux 的 TCP/UDP 转发）
-				if edge.netstack != nil {
-					edge.netstack.InjectPacket(buf[:n])
+				// ★ 喂给 packet forwarder 处理（TCP/UDP/ICMP）
+				if edge.pktFwd != nil {
+					edge.pktFwd.HandlePacket(buf[:n])
 				}
 			}
 		}
@@ -689,9 +690,9 @@ func (e *Edge) Stop() {
 	if e.p2pStreams != nil {
 		e.p2pStreams.closeAll()
 	}
-	// ★★★ 关闭 netstack
-	if e.netstack != nil {
-		e.netstack.Stop()
+	// ★ 关闭 packet forwarder
+	if e.pktFwd != nil {
+		e.pktFwd.Stop()
 	}
 }
 
@@ -784,7 +785,7 @@ func (e *Edge) printNodeSummary() {
 	log.Printf("  虚拟 IP     : %s", e.getVirtualIPLocked())
 	log.Printf("  虚拟网段    : %s", e.virtualCIDR)
 	log.Printf("  P2P 端口    : %d", e.udpPort)
-	log.Printf("  模式         : SOCKS5 + netstack（双向互通）")
+	log.Printf("  模式         : SOCKS5 + packet-forwarder（双向互通）")
 	log.Println("==========================================")
 	log.Println("")
 }
@@ -887,16 +888,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 		e.reportMetadata()
-
-		// ★★★ 初始化 netstack（让 PC/Android 可主动访问本机 TCP/UDP）
-		if e.netstack == nil && vip != "" {
-			ns, err := NewNetStack(e, vip, cidr)
-			if err != nil {
-				log.Printf("[NETSTACK] 初始化失败: %v（PC/Android 将无法主动访问本机）", err)
-			} else {
-				e.netstack = ns
-			}
-		}
 
 		if len(collectLANEndpoints(e.udpPort, vip)) == 0 {
 			log.Printf("[NAT] 首次 LAN 收集为空，启动后台重试")
