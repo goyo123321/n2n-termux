@@ -56,8 +56,6 @@ const (
 
 const maxConsecutiveFails = 5
 
-// probePrefix / buildPunchProbe 定义在 punch.go
-
 var (
 	natHoleActiveMu sync.Mutex
 	natHoleActive   map[string]bool
@@ -167,19 +165,9 @@ func (e *Edge) chooseScanTiers(targetAddr *net.UDPAddr) (tiers []int, sameStun b
 	return buildTiers(hw), true, diff, hw
 }
 
-// collectScanTargets 收集本轮打洞的全部候选地址。
-//
-// ★ 本次修复：加诊断日志，打印 4 个来源的原始值。
-//
-// 四类候选（去重，保持首次出现顺序）：
-//   1. 本机 peer 记录里的 LAN 地址
-//   2. 观测 raddr（最高优先）
-//   3. 服务端下发的 TargetAssistedEndpoints
-//   4. 服务端下发的 TargetLanEndpoints
 func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 	var raw []*net.UDPAddr
 
-	// ★ 诊断：打印所有候选来源
 	e.peersMu.RLock()
 	var pLan, pAssisted []string
 	if p := e.peers[instr.TargetMac]; p != nil {
@@ -190,35 +178,30 @@ func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 	log.Printf("[collectScanTargets] target=%s p.Lan=%v p.Assisted=%v instr.TargetLan=%v instr.TargetAssisted=%v TargetPubSocket=%q",
 		instr.TargetMac, pLan, pAssisted, instr.TargetLanEndpoints, instr.TargetAssistedEndpoints, instr.TargetPubSocket)
 
-	// 1. 本机 peer 记录里的 LAN 地址
 	for _, lan := range pLan {
 		if addr := parseSockAddr(lan); addr != nil {
 			raw = append(raw, addr)
 		}
 	}
 
-	// 2. 观测 raddr
 	e.peersMu.RLock()
 	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
 		raw = append(raw, &net.UDPAddr{IP: p.UDPAddr.IP, Port: p.UDPAddr.Port})
 	}
 	e.peersMu.RUnlock()
 
-	// 3. 服务端下发的 assisted
 	for _, ep := range instr.TargetAssistedEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			raw = append(raw, addr)
 		}
 	}
 
-	// 4. 服务端下发的 LAN
 	for _, ep := range instr.TargetLanEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
 			raw = append(raw, addr)
 		}
 	}
 
-	// 去重
 	seen := make(map[string]bool)
 	var out []*net.UDPAddr
 	for _, a := range raw {
@@ -305,7 +288,7 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		time.Sleep(time.Duration(instr.SendDelayMs) * time.Millisecond)
 	}
 
-	probe := buildPunchProbe(e.virtualIP)
+	probe := buildPunchProbe(e.getVirtualIPLocked())
 	var attempts uint32
 
 	tiers, sameStun, portDiff, halfWidth := e.chooseScanTiers(targetAddr)
@@ -332,7 +315,6 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] 模式：不同 STUN IP，全端口扫描，分级 %v", tiers)
 	}
 
-	// 优先扫候选列表
 	if len(assistedTargets) > 0 {
 		log.Printf("[NAT-HOLE] 优先扫描 %d 个候选端点", len(assistedTargets))
 		for _, t := range assistedTargets {
@@ -467,11 +449,42 @@ func (e *Edge) resetFailCount(peerID string) {
 	natHoleActiveMu.Unlock()
 }
 
+// recordP2PSuccess 打洞成功时更新 peer 地址。
+//
+// ★ LAN 优先保护
+//
+// ★★ 适配（本次修复）：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
-		p.UDPAddr = targetAddr
-		p.lastRecvAt = time.Now().UnixMilli()
+		newIsLAN := isPrivateIPv4(targetAddr.IP)
+		oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
+		now := time.Now().UnixMilli()
+
+		shouldUpdate := false
+		if p.UDPAddr == nil {
+			shouldUpdate = true
+		} else if !oldIsLAN && newIsLAN {
+			shouldUpdate = true
+		} else if oldIsLAN && !newIsLAN {
+			// ★★ 适配：5 分钟 → 30 秒
+			if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 30000 {
+				shouldUpdate = true
+			}
+		} else {
+			if p.UDPAddr.Port != targetAddr.Port {
+				shouldUpdate = true
+			}
+		}
+
+		if newIsLAN {
+			p.lastLANRecvAt = now
+		}
+
+		if shouldUpdate {
+			p.UDPAddr = targetAddr
+		}
+		p.lastRecvAt = now
 	} else {
 		e.peers[instr.TargetMac] = &PeerInfo{
 			ClientID:   instr.TargetMac,
@@ -525,9 +538,6 @@ func parseSockAddr(s string) *net.UDPAddr {
 	return &net.UDPAddr{IP: ip, Port: port}
 }
 
-// resolveTarget 决定这次打洞往哪个地址发包。
-//
-// 优先使用本机观测过的 raddr（已被证明可达）。
 func (e *Edge) resolveTarget(instr *NatHoleInstruction) *net.UDPAddr {
 	e.peersMu.RLock()
 	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
