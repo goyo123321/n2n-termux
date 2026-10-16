@@ -63,7 +63,7 @@ type PeerInfo struct {
 	TurnRelayAddr     string
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
-	lastLANRecvAt     int64 // ★ 最近一次收到 LAN 帧的时间
+	lastLANRecvAt     int64
 	loggedReady       bool
 	hasRealData       bool
 	probeReplied      bool
@@ -560,6 +560,13 @@ func main() {
 			edge.notePeerAckTURN(ua)
 			return
 		}
+		// ★ TURN 中继收到的裸 IPv4 包交给 packet forwarder
+		if len(data) > 0 && data[0]>>4 == 4 {
+			if edge.pktFwd != nil {
+				edge.pktFwd.HandlePacket(data)
+			}
+			return
+		}
 	}
 
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
@@ -568,7 +575,10 @@ func main() {
 	ws.SetHandlers(
 		edge.handleSignaling,
 		func(data []byte) {
-			// Termux 端：WS 中继收到的二进制数据（原始 IPv4）无法处理，忽略
+			// ★ WS 中继收到的裸 IPv4 包交给 packet forwarder
+			if edge.pktFwd != nil {
+				edge.pktFwd.HandlePacket(data)
+			}
 		},
 	)
 
@@ -690,7 +700,6 @@ func (e *Edge) Stop() {
 	if e.p2pStreams != nil {
 		e.p2pStreams.closeAll()
 	}
-	// ★ 关闭 packet forwarder
 	if e.pktFwd != nil {
 		e.pktFwd.Stop()
 	}
@@ -1015,7 +1024,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			return
 		}
 
-		// 已 P2P 时主动上报 p2p_status=3，停止服务端每 15 秒重发
 		if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
 			log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P），上报 p2p_status=3",
 				instr.TargetMac)
@@ -1192,9 +1200,6 @@ func (e *Edge) peerExists(peerID string) bool {
 }
 
 // registerPeer 注册/更新一个 peer。
-//
-// ★ LAN 优先保护 UDPAddr
-// ★★ 新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
 		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
@@ -1224,7 +1229,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.PubPort = pubPort
 		}
 
-		// ★ LAN 优先保护
 		if udpAddr != nil {
 			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
 			if !oldIsLAN {
@@ -1242,7 +1246,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
-		// ★★ 新建 peer 时优先用 LAN 初始化 UDPAddr
 		var initialUDP *net.UDPAddr
 		if len(sortedLAN) > 0 {
 			for _, lan := range sortedLAN {
@@ -1487,7 +1490,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	} else if !oldIsLAN && newIsLAN {
 		shouldUpdate = true
 	} else if oldIsLAN && !newIsLAN {
-		// 5 分钟 → 30 秒
 		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 30000 {
 			shouldUpdate = true
 			log.Printf("[P2P] %s (note) LAN 超过 30s 无流量，改用公网地址", best.ClientID)
