@@ -28,6 +28,58 @@ var (
 
 const DefaultVirtualCIDR = "10.64.0.0/24"
 
+// ============================================================
+// ★ Termux CA 证书自动检测
+//
+// 问题：Go 标准库在 Linux 上只查 /etc/ssl/certs 等系统路径。
+//       Termux 没有这些路径，导致所有 HTTPS/WSS 报
+//       "x509: certificate signed by unknown authority"。
+//
+// 解决：探测 Termux 的 CA 证书文件路径，若存在则设置 SSL_CERT_FILE。
+//       必须在任何网络连接之前执行（init 函数保证这一点）。
+// ============================================================
+
+func init() {
+	initTermuxCA()
+}
+
+func initTermuxCA() {
+	if os.Getenv("SSL_CERT_FILE") != "" {
+		// 用户已显式设置，不覆盖
+		return
+	}
+
+	prefix := os.Getenv("PREFIX")
+	if prefix == "" {
+		prefix = os.Getenv("TERMUX_PREFIX")
+	}
+	if prefix == "" {
+		prefix = "/data/data/com.termux/files/usr"
+	}
+
+	candidates := []string{
+		prefix + "/etc/tls/cert.pem",
+		prefix + "/etc/ca-certificates/ca-bundle.crt",
+		prefix + "/etc/ssl/certs/ca-certificates.crt",
+		prefix + "/etc/ssl/cert.pem",
+		"/data/data/com.termux/files/usr/etc/tls/cert.pem",
+		"/data/data/com.termux/files/usr/etc/ssl/certs/ca-certificates.crt",
+		"/etc/ssl/certs/ca-certificates.crt",
+		"/etc/pki/tls/certs/ca-bundle.crt",
+	}
+
+	for _, p := range candidates {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Size() > 0 {
+			_ = os.Setenv("SSL_CERT_FILE", p)
+			fmt.Fprintf(os.Stderr, "[TLS] CA 证书: %s (%d bytes)\n", p, st.Size())
+			return
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "[TLS] ⚠️ 未找到 CA 证书，HTTPS/WSS 可能失败\n")
+	fmt.Fprintf(os.Stderr, "[TLS]    修复: pkg install ca-certificates\n")
+}
+
 // LAN 缓存：reportMetadata 实时收集为空时回退用上次成功结果
 var (
 	lanCacheMu   sync.Mutex
@@ -87,7 +139,7 @@ type Edge struct {
 	udpConn *net.UDPConn
 	udpPort int
 
-	pktFwd *PacketForwarder // ★ TCP 中继 + UDP 转发 + ICMP 响应
+	pktFwd *PacketForwarder
 
 	peers   map[string]*PeerInfo
 	peersMu sync.RWMutex
@@ -457,7 +509,7 @@ func main() {
 	}
 	edge.punchAckLimiter = newPunchAckLimiter()
 	edge.streamMgr = NewAppStreamManager()
-	edge.pktFwd = NewPacketForwarder(edge) // ★ TCP 中继 + UDP 转发 + ICMP 响应
+	edge.pktFwd = NewPacketForwarder(edge)
 
 	udpAddr := &net.UDPAddr{IP: net.IPv4zero, Port: udpPort}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
@@ -560,7 +612,6 @@ func main() {
 			edge.notePeerAckTURN(ua)
 			return
 		}
-		// ★ TURN 中继收到的裸 IPv4 包交给 packet forwarder
 		if len(data) > 0 && data[0]>>4 == 4 {
 			if edge.pktFwd != nil {
 				edge.pktFwd.HandlePacket(data)
@@ -575,7 +626,6 @@ func main() {
 	ws.SetHandlers(
 		edge.handleSignaling,
 		func(data []byte) {
-			// ★ WS 中继收到的裸 IPv4 包交给 packet forwarder
 			if edge.pktFwd != nil {
 				edge.pktFwd.HandlePacket(data)
 			}
@@ -622,8 +672,6 @@ func main() {
 
 			if buf[0]>>4 == 4 {
 				edge.notePeerTraffic(addr)
-
-				// ★ 喂给 packet forwarder 处理（TCP/UDP/ICMP）
 				if edge.pktFwd != nil {
 					edge.pktFwd.HandlePacket(buf[:n])
 				}
@@ -1199,7 +1247,6 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
-// registerPeer 注册/更新一个 peer。
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
 		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
@@ -1278,7 +1325,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 	}
 }
 
-// ensureTargetPeer 记录指令里的目标 peer 信息。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1365,7 +1411,6 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
-// reportP2PStatus 主动上报当前 P2P 状态，让服务端停止重发 nat_hole_instruction。
 func (e *Edge) reportP2PStatus(peerID string, status int) {
 	if e.ws == nil || peerID == "" {
 		return
@@ -1415,9 +1460,6 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true, false)
 }
 
-// notePeerCommon 是打洞握手路径的统一入口。
-//
-// ★ LAN 优先 + 30 秒窗口 + lastLANRecvAt > 0 检查
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1480,7 +1522,6 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
-	// ★ LAN 优先更新 UDPAddr
 	newIsLAN := isPrivateIPv4(addr.IP)
 	oldIsLAN := best.UDPAddr != nil && isPrivateIPv4(best.UDPAddr.IP)
 
