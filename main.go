@@ -28,7 +28,6 @@ var (
 
 const DefaultVirtualCIDR = "10.64.0.0/24"
 
-// LAN 缓存：reportMetadata 实时收集为空时回退用上次成功结果
 var (
 	lanCacheMu   sync.Mutex
 	lanCache     []string
@@ -63,7 +62,7 @@ type PeerInfo struct {
 	TurnRelayAddr     string
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
-	lastLANRecvAt     int64 // ★ 最近一次收到 LAN 帧的时间
+	lastLANRecvAt     int64
 	loggedReady       bool
 	hasRealData       bool
 	probeReplied      bool
@@ -566,7 +565,6 @@ func main() {
 		edge.handleSignaling,
 		func(data []byte) {
 			// Termux 端：WS 中继收到的二进制数据（原始 IPv4）无法处理，忽略
-			// SOCKS5 模式走 app_stream_* 消息
 		},
 	)
 
@@ -610,7 +608,6 @@ func main() {
 
 			if buf[0]>>4 == 4 {
 				edge.notePeerTraffic(addr)
-				// Termux 端不处理 IPv4 数据
 			}
 		}
 	})
@@ -1004,6 +1001,16 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			log.Printf("[NAT-HOLE] 忽略指令 target=%s（peer 不在线）", instr.TargetMac)
 			return
 		}
+
+		// ★★★ 适配（本次修复）：已 P2P 时，主动上报 p2p_status=3，
+		//     让服务端 punchState.anySucceeded=true，停止每 15 秒重发指令。
+		if e.relayMgr != nil && e.relayMgr.GetState(instr.TargetMac) == ConnP2P {
+			log.Printf("[NAT-HOLE] 跳过指令 target=%s（已 P2P），上报 p2p_status=3",
+				instr.TargetMac)
+			e.reportP2PStatus(instr.TargetMac, 3)
+			return
+		}
+
 		e.ensureTargetPeer(&instr)
 		e.scheduleFallbackTimer(instr.TargetMac)
 		instrCopy := instr
@@ -1174,7 +1181,9 @@ func (e *Edge) peerExists(peerID string) bool {
 
 // registerPeer 注册/更新一个 peer。
 //
-// ★ 修复：LAN 优先保护 UDPAddr
+// ★ LAN 优先保护 UDPAddr
+//
+// ★★ 适配（本次修复）：新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
 		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
@@ -1222,12 +1231,27 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
+		// ★★ 适配：新建 peer 时优先用 LAN 初始化 UDPAddr
+		var initialUDP *net.UDPAddr
+		if len(sortedLAN) > 0 {
+			for _, lan := range sortedLAN {
+				if ra, err := net.ResolveUDPAddr("udp", lan); err == nil && ra != nil && ra.IP != nil {
+					initialUDP = ra
+					log.Printf("[P2P] %s 新建 peer，初始 UDPAddr 用 LAN: %s", peerID, lan)
+					break
+				}
+			}
+		}
+		if initialUDP == nil {
+			initialUDP = udpAddr
+		}
+
 		e.peers[peerID] = &PeerInfo{
 			ClientID:          peerID,
 			VirtualIP:         virtualIP,
 			PubIP:             pubIP,
 			PubPort:           pubPort,
-			UDPAddr:           udpAddr,
+			UDPAddr:           initialUDP,
 			NATType:           natType,
 			AssistedEndpoints: assisted,
 			LanEndpoints:      sortedLAN,
@@ -1242,7 +1266,9 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 
 // ensureTargetPeer 记录指令里的目标 peer 信息。
 //
-// ★ 修复：LAN 优先保护 UDPAddr
+// ★ LAN 优先保护 UDPAddr
+//
+// ★★ 适配（本次修复）：新建时优先用 LAN 端点初始化 UDPAddr。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1265,10 +1291,27 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 			p.VirtualIP = instr.TargetVirtualIp
 		}
 	} else {
+		// ★★ 适配：优先使用 LAN 端点
+		var initialUDP *net.UDPAddr
+		if len(instr.TargetLanEndpoints) > 0 {
+			for _, lan := range instr.TargetLanEndpoints {
+				if ra, err := net.ResolveUDPAddr("udp", lan); err == nil && ra != nil && ra.IP != nil {
+					initialUDP = ra
+					log.Printf("[P2P] %s 新建 peer（ensureTargetPeer），初始 UDPAddr 用 LAN: %s",
+						instr.TargetMac, lan)
+					break
+				}
+			}
+		}
+		if initialUDP == nil {
+			initialUDP = udpAddr
+		}
+
 		e.peers[instr.TargetMac] = &PeerInfo{
-			ClientID:  instr.TargetMac,
-			VirtualIP: instr.TargetVirtualIp,
-			UDPAddr:   udpAddr,
+			ClientID:     instr.TargetMac,
+			VirtualIP:    instr.TargetVirtualIp,
+			UDPAddr:      initialUDP,
+			LanEndpoints: instr.TargetLanEndpoints,
 		}
 	}
 }
@@ -1314,246 +1357,38 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
-// ============ peer 探测处理 ============
-
-func (e *Edge) notePeerProbe(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, false, false, false)
-}
-
-func (e *Edge) notePeerAck(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, false, false, true)
-}
-
-func (e *Edge) notePeerProbeTURN(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, false, true, false)
-}
-
-func (e *Edge) notePeerAckTURN(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, false, true, true)
-}
-
-func (e *Edge) notePeerTraffic(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, true, false, false)
-}
-
-func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
-	e.notePeerCommon(addr, true, true, false)
-}
-
-// notePeerCommon 是打洞握手路径的统一入口。
+// reportP2PStatus 主动上报当前 P2P 状态，让服务端停止重发 nat_hole_instruction。
 //
-// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先"策略。
-func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
-	now := time.Now().UnixMilli()
-
-	e.peersMu.Lock()
-	var best *PeerInfo
-	bestScore := 0
-	addrIP := addr.IP
-	addrPort := addr.Port
-
-	for _, p := range e.peers {
-		score := 0
-
-		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addrIP) {
-			if p.UDPAddr.Port == addrPort {
-				score = 4
-			} else {
-				score = 3
-			}
-		}
-
-		for _, lan := range p.LanEndpoints {
-			la, err := net.ResolveUDPAddr("udp", lan)
-			if err != nil || la == nil || la.IP == nil {
-				continue
-			}
-			if la.IP.Equal(addrIP) {
-				if la.Port == addrPort {
-					if score < 5 {
-						score = 5
-					}
-				} else if score < 2 {
-					score = 2
-				}
-			}
-		}
-
-		for _, ass := range p.AssistedEndpoints {
-			aa, err := net.ResolveUDPAddr("udp", ass)
-			if err != nil || aa == nil || aa.IP == nil {
-				continue
-			}
-			if aa.IP.Equal(addrIP) {
-				if aa.Port == addrPort {
-					if score < 4 {
-						score = 4
-					}
-				} else if score < 1 {
-					score = 1
-				}
-			}
-		}
-
-		if score > 0 && score > bestScore {
-			best = p
-			bestScore = score
-		}
-	}
-	if best == nil {
-		e.peersMu.Unlock()
+// ★★★ 适配（本次修复）：
+//
+// 场景：客户端在收到指令前就已经通过 PING/PONG 建立了 P2P。此时客户端会跳过
+// 打洞指令，但服务端不知道——punchState 里 aState/bState 一直是 0，
+// anySucceeded = false，服务端每 15 秒重发一次 nat_hole_instruction。
+//
+// 主动上报 state=3 + p2pStatus=3 后，服务端 recordPunchResult：
+//   - state=3 → 交叉校验（self >= P2P_AVAILABLE(2) 通过）
+//   - entry.aState = 3 → anySucceeded = true → 停止重发
+func (e *Edge) reportP2PStatus(peerID string, status int) {
+	if e.ws == nil || peerID == "" {
 		return
 	}
-
-	// ★ LAN 优先更新 UDPAddr
-	newIsLAN := isPrivateIPv4(addr.IP)
-	oldIsLAN := best.UDPAddr != nil && isPrivateIPv4(best.UDPAddr.IP)
-
-	shouldUpdate := false
-	if best.UDPAddr == nil {
-		shouldUpdate = true
-	} else if !oldIsLAN && newIsLAN {
-		shouldUpdate = true
-	} else if oldIsLAN && !newIsLAN {
-		if best.lastLANRecvAt > 0 && now-best.lastLANRecvAt > 300000 {
-			shouldUpdate = true
-			log.Printf("[P2P] %s (note) LAN 超过 300s 无流量，改用公网地址", best.ClientID)
-		}
-	} else {
-		if best.UDPAddr.Port != addrPort {
-			shouldUpdate = true
-		}
-	}
-
-	if newIsLAN {
-		best.lastLANRecvAt = now
-	}
-
-	if shouldUpdate {
-		best.UDPAddr = &net.UDPAddr{IP: addr.IP, Port: addr.Port}
-	}
-
-	best.lastRecvAt = now
-	if isRealData {
-		best.hasRealData = true
-	}
-	clientID := best.ClientID
-	ip := addr.IP.String()
-	e.peersMu.Unlock()
-
-	if e.relayMgr == nil {
-		return
-	}
-
-	if isRealData {
-		if e.relayMgr.GetState(clientID) != ConnP2P {
-			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧 → P2P 直连", clientID, ip)
-			e.relayMgr.MarkP2P(clientID)
-		}
-		return
-	}
-
-	curState := e.relayMgr.GetState(clientID)
-	justUpgraded := false
-	if curState != ConnP2P && curState != ConnP2PAvailable {
-		kind := "Punch"
-		if isAck {
-			kind = "ACK"
-		}
-		log.Printf("[P2P] 从 %s (%s) 收到 %s → P2PAvailable（等待数据帧验证）", clientID, ip, kind)
-		e.relayMgr.MarkP2PAvailable(clientID)
-		justUpgraded = true
-	}
-
-	if justUpgraded {
-		if e.p2pStreams != nil {
-			safeGo("p2p-probe", func() {
-				e.p2pStreams.sendP2PProbe(clientID)
-			})
-		}
-		e.scheduleP2PAvailTimeout(clientID)
-	}
-
-	if isAck {
-		return
-	}
-	if e.punchAckLimiter == nil || !e.punchAckLimiter.allow(clientID, time.Now()) {
-		return
-	}
-
-	safeGo("punch-ack", func() {
-		ack := buildPunchAck()
-		e.writeProbe(addr, ack, viaTURN)
+	_ = e.ws.Send(map[string]interface{}{
+		"type": "p2p_state_info",
+		"payload": map[string]interface{}{
+			"to": []map[string]interface{}{
+				{
+					"macAddr": peerID,
+					"punchResult": map[string]interface{}{
+						"state":    3,
+						"attempts": 0,
+						"detail":   "already-p2p",
+					},
+					"punchResultPeerMac": peerID,
+					"p2pStatus":          status,
+				},
+			},
+		},
 	})
-}
-
-func (e *Edge) writeProbe(addr *net.UDPAddr, probe []byte, viaTURN bool) {
-	if addr == nil {
-		return
-	}
-	if viaTURN {
-		if e.turnClient == nil || !e.turnClient.IsReady() {
-			return
-		}
-		_ = e.turnClient.Send(probe, addr)
-		return
-	}
-	if e.udpConn == nil {
-		return
-	}
-	_, _ = e.udpConn.WriteToUDP(probe, addr)
-}
-
-func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
-	if e.udpConn == nil || addr == nil {
-		return
-	}
-	probe := buildPunchProbe(e.getVirtualIPLocked())
-	e.writeProbe(addr, probe, false)
-}
-
-// ============ 多 STUN 端点收集 ============
-
-func (e *Edge) addAssistedEndpoint(ip string, port int) {
-	if ip == "" || port <= 0 {
-		return
-	}
-	ep := net.JoinHostPort(ip, strconv.Itoa(port))
-
-	e.mu.Lock()
-	if e.natMeta == nil {
-		e.mu.Unlock()
-		return
-	}
-	for _, existing := range e.natMeta.AllEndpoints {
-		if existing == ep {
-			e.mu.Unlock()
-			return
-		}
-	}
-	if len(e.natMeta.AllEndpoints) >= 5 {
-		e.natMeta.AllEndpoints = e.natMeta.AllEndpoints[1:]
-	}
-	e.natMeta.AllEndpoints = append(e.natMeta.AllEndpoints, ep)
-	count := len(e.natMeta.AllEndpoints)
-	e.mu.Unlock()
-
-	e.maybeResetOwnFailCounts(ep)
-
-	log.Printf("[NAT] +assisted: %s (total=%d)", ep, count)
-	e.reportMetadataThrottled()
-}
-
-func (e *Edge) reportMetadataThrottled() {
-	now := time.Now().UnixMilli()
-	last := atomic.LoadInt64(&e.lastMetadataReportAt)
-	if now-last < 30000 {
-		return
-	}
-	if !atomic.CompareAndSwapInt64(&e.lastMetadataReportAt, last, now) {
-		return
-	}
-	e.reportMetadata()
 }
 
 // ============ 环境变量 / CSV ============
