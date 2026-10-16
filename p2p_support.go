@@ -67,7 +67,9 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ 修复：更新 peer.UDPAddr 时采用"LAN 优先 + 300 秒窗口"策略。
+// ★ LAN 优先 + 30 秒窗口 + lastLANRecvAt > 0 检查
+//
+// ★★ 适配（本次修复）：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -98,9 +100,10 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 				shouldUpdate = true
 				p.lastLANRecvAt = now
 			} else if oldIsLAN && !newIsLAN {
-				if now-p.lastLANRecvAt > 300000 {
+				// ★★ 适配：5 分钟 → 30 秒
+				if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 30000 {
 					shouldUpdate = true
-					log.Printf("[P2P] %s LAN 地址超过 300s 无流量，改用公网地址", peerID)
+					log.Printf("[P2P] %s LAN 地址超过 30s 无流量，改用公网地址", peerID)
 				}
 			} else if oldIsLAN && newIsLAN {
 				if p.UDPAddr.Port != peerAddr.Port {
