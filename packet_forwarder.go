@@ -432,7 +432,6 @@ func (f *PacketForwarder) handleTCP(pkt []byte) {
 	}
 }
 
-// tcpReadFromLocal 从本地服务读数据，发 TCP 段给 PC。
 func (f *PacketForwarder) tcpReadFromLocal(conn *tcpConn, key tcpConnKey) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -621,24 +620,8 @@ func (f *PacketForwarder) sendTCPInternal(
 }
 
 // ============================================================
-// ★★ 核心修复：ICMP 绕过状态机，优先 LAN
+// ★★ ICMP 绕过状态机：LAN → UDPAddr → TURN → WS
 // ============================================================
-//
-// 问题：ICMP 走 relayMgr 的状态机时，P2P ↔ TURN 状态切换导致
-//      RTT 在 6ms ↔ 150ms 之间跳（状态抖一次 ping 就跳一次）。
-//
-// 修复：ICMP 无视状态机，直接尝试：
-//   1. LAN 优先（同 WiFi 场景 6-10ms）
-//   2. UDPAddr（可能 LAN 或公网）
-//   3. TURN 兜底
-//   4. WS 中继（最后兜底）
-//
-// 效果：
-//   - LAN 通：稳定 6-10ms（不再受状态机影响）
-//   - LAN 单向不通：60-90ms（公网 hairpin 或 TURN）
-//   - 全部失败：100-300ms（WS 中继）
-//
-// 非 ICMP（TCP/UDP 数据面）：保持原样，走 relayMgr 状态机。
 func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 	if f.edge == nil {
 		return
@@ -666,7 +649,7 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 	// ICMP：绕过状态机，直接按 LAN → UDPAddr → TURN → WS 顺序发送
 	// ============================================================
 	if isICMP {
-		// 1. LAN 优先（核心修复）
+		// 1. LAN 优先
 		if len(target.LanEndpoints) > 0 && f.edge.udpConn != nil {
 			for _, lan := range target.LanEndpoints {
 				ra, err := net.ResolveUDPAddr("udp", lan)
@@ -674,14 +657,12 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 					continue
 				}
 				if _, err := f.edge.udpConn.WriteToUDP(pkt, ra); err == nil {
-					// LAN 发送成功（内核接受），返回
-					// 注：内核接受不等于对端收到，但 LAN 通时 99% 会到达
 					return
 				}
 			}
 		}
 
-		// 2. UDPAddr（可能是 LAN，也可能是公网）
+		// 2. UDPAddr
 		if target.UDPAddr != nil && f.edge.udpConn != nil {
 			if _, err := f.edge.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
 				return
@@ -707,7 +688,7 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 	}
 
 	// ============================================================
-	// 非 ICMP：走 relayMgr 状态机（原有逻辑，保持不变）
+	// 非 ICMP：走 relayMgr 状态机（TCP/UDP 数据面）
 	// ============================================================
 	if f.edge.relayMgr == nil {
 		return
