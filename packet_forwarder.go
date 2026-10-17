@@ -626,6 +626,9 @@ func (f *PacketForwarder) sendTCPInternal(
 //
 // 优先走 relayMgr（LAN / P2P / TURN）。如果返回 false（不可用/失败），
 // 则降级到 ws.SendBinary（Worker 兜底）。
+//
+// ★ 与 edge-signal / n2n-android 对齐：WS 中继路径发 N2NW 帧，显式携带
+//   目标 clientId，让服务端精确路由（多 peer 房间下不广播）。
 func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 	if f.edge == nil || f.edge.relayMgr == nil {
 		return
@@ -648,10 +651,12 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 
 	// 1. 尝试 P2P / LAN / TURN 发送
 	sent := f.edge.relayMgr.SendToPeer(target.ClientID, pkt, target)
-	
+
 	// 2. 如果发送失败（状态为 Unknown 或 Relay，或底层报错），走 WS 中继
 	if !sent && f.edge.ws != nil {
-		_ = f.edge.ws.SendBinary(pkt)
+		// ★ 用 N2NW 帧：显式携带目标 clientId，服务端无需解析 IPv4 头
+		frame := buildN2NWFrame(target.ClientID, pkt)
+		_ = f.edge.ws.SendBinary(frame)
 	}
 }
 
