@@ -46,7 +46,6 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 	}
 }
 
-// MarkP2PAvailable 从 Unknown / Relay 升级到"打洞握手成功"。
 func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 	rm.mu.Lock()
 	cur := rm.states[peerID]
@@ -60,13 +59,11 @@ func (rm *RelayManager) MarkP2PAvailable(peerID string) {
 	log.Printf("[连接] %s → P2PAvailable（打洞握手成功，等待数据帧验证）", peerID)
 	rm.cancelFallbackTimer(peerID)
 
-	// ★ 取消旧的超时降级定时器（如果之前进过 P2PAvailable）
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerID)
 	}
 }
 
-// MarkP2P 只有收到真实数据帧或 PONG 才应调用。
 func (rm *RelayManager) MarkP2P(peerId string) {
 	rm.mu.Lock()
 	if rm.states[peerId] == ConnP2P {
@@ -80,13 +77,11 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	log.Printf("[连接] %s → P2P 直连（prev=%s，数据面已验证）", peerId, prev)
 	rm.cancelFallbackTimer(peerId)
 
-	// ★ P2P 已升级，取消 P2PAvailable 超时降级定时器
 	if rm.edge != nil {
 		rm.edge.cancelP2PAvailTimeout(peerId)
 	}
 }
 
-// MarkFallback 常规降级路径。保护 P2PAvailable 状态。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -145,15 +140,6 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.cancelFallbackTimer(peerId)
 }
 
-// ForceFallback 强制降级，允许从 P2PAvailable 降级。
-//
-// 与 MarkFallback 的区别：
-//   - MarkFallback：常规路径（打洞失败 / UDP 发送失败 / 心跳超时），
-//                   保护 P2PAvailable（给它 30s 验证窗口）
-//   - ForceFallback：特殊路径，允许从 P2PAvailable 直接降级
-//     使用场景：
-//       1. 服务端下发 force_fallback（同 STUN IP 已失败）
-//       2. P2PAvailable 30s 超时兜底
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -288,21 +274,63 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 //
 // ★ 适配 N2NW：所有 WS 中继路径都发 N2NW 帧（而非裸 IPv4），
 //   让服务端精确按 clientId 路由，多 peer 房间下不广播。
+//
+// ★★ 补丁（本次修复）：ConnP2P 分支加入 LAN 优先。
+//
+//	问题：Termux 端此前只发 UDPAddr。同 WiFi 场景下，如果 UDPAddr
+//	已被切到公网（如 30 秒 lastLANRecvAt 窗口过期），回包会走
+//	CGNAT hairpin（50-100ms），而非 LAN（5ms）。
+//
+//	Android → Termux ping 场景实测：
+//	  - 去程 5ms（Android 端 LAN 优先，正常）
+//	  - 回程 50-100ms（Termux 端只发 UDPAddr，走了公网）
+//	  - 总 RTT 平均 50-70ms，大量样本落在 30-70ms 区间
+//
+//	修复后：与 PC / Android 端 SendToPeer 完全对齐，回程优先走 LAN，
+//	预期 RTT 降到 10-15ms。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
 	switch state {
 	case ConnP2P, ConnP2PAvailable:
-		if target != nil && target.UDPAddr != nil {
+		if target == nil {
+			rm.MarkFallback(peerId)
+			return false
+		}
+		if rm.edge == nil || rm.edge.udpConn == nil {
+			rm.MarkFallback(peerId)
+			return false
+		}
+
+		// ★★ 补丁：LAN 优先
+		//
+		// 条件：UDPAddr 存在且是公网（非 RFC1918），且 peer 有 LAN 端点。
+		// 动作：先尝试所有 LAN 端点；成功一个即返回 true。
+		//       全失败才回退 UDPAddr。
+		if target.UDPAddr != nil &&
+			!isPrivateIPv4(target.UDPAddr.IP) &&
+			len(target.LanEndpoints) > 0 {
+			for _, lan := range target.LanEndpoints {
+				ra, err := net.ResolveUDPAddr("udp", lan)
+				if err != nil || ra == nil || ra.IP == nil {
+					continue
+				}
+				if _, err := rm.edge.udpConn.WriteToUDP(data, ra); err == nil {
+					return true
+				}
+			}
+			// 所有 LAN 端点都发送失败，继续走 UDPAddr
+		}
+
+		// 常规路径：发 UDPAddr（可能是 LAN，也可能是公网）
+		if target.UDPAddr != nil {
 			_, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr)
 			if err == nil {
 				return true
 			}
 			log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 WS", peerId, err)
-			rm.MarkFallback(peerId)
-		} else {
-			rm.MarkFallback(peerId)
 		}
+		rm.MarkFallback(peerId)
 		// ★ 用 N2NW 帧
 		return rm.ws.SendBinary(buildN2NWFrame(peerId, data)) == nil
 
