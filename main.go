@@ -12,7 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"          // ← 加回这一行
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,22 +30,13 @@ const DefaultVirtualCIDR = "10.64.0.0/24"
 
 // ============================================================
 // ★ Termux CA 证书自动检测
-//
-// 问题：Go 标准库在 Linux 上只查 /etc/ssl/certs 等系统路径。
-//       Termux 没有这些路径，导致所有 HTTPS/WSS 报
-//       "x509: certificate signed by unknown authority"。
-//
-// 解决：探测 Termux 的 CA 证书文件路径，若存在则设置 SSL_CERT_FILE。
-//       必须在任何网络连接之前执行（init 函数保证这一点）。
 // ============================================================
-
 func init() {
 	initTermuxCA()
 }
 
 func initTermuxCA() {
 	if os.Getenv("SSL_CERT_FILE") != "" {
-		// 用户已显式设置，不覆盖
 		return
 	}
 
@@ -80,7 +71,7 @@ func initTermuxCA() {
 	fmt.Fprintf(os.Stderr, "[TLS]    修复: pkg install ca-certificates\n")
 }
 
-// LAN 缓存：reportMetadata 实时收集为空时回退用上次成功结果
+// LAN 缓存
 var (
 	lanCacheMu   sync.Mutex
 	lanCache     []string
@@ -247,8 +238,9 @@ func (e *Edge) startKeepalive() {
 
 // ============ P2P 通道保活 + 活性检测 ============
 
-const p2pKeepaliveInterval = 15 * time.Second
-const p2pIdleDeadMs = 60000
+// ★ 修复：15s → 10s，60s → 30s
+const p2pKeepaliveInterval = 10 * time.Second
+const p2pIdleDeadMs = 30000
 
 func (e *Edge) startP2PKeepalive() {
 	log.Printf("[P2P-Keepalive] 启动，每 %v 刷新 P2P 通道", p2pKeepaliveInterval)
@@ -286,6 +278,7 @@ func (e *Edge) sendP2PKeepalive() {
 
 		if st == ConnP2P || st == ConnP2PAvailable {
 			idleMs := now - p.lastRecvAt
+			// ★ 60s → 30s
 			if p.lastRecvAt > 0 && idleMs > p2pIdleDeadMs {
 				deadPeers = append(deadPeers, id)
 				continue
@@ -297,8 +290,10 @@ func (e *Edge) sendP2PKeepalive() {
 	e.peersMu.RUnlock()
 
 	for _, id := range deadPeers {
-		log.Printf("[P2P] %s 60s 无任何流量，判定 P2P 失效，强制降级", id)
-		e.relayMgr.ForceFallback(id, "no-traffic-60s")
+		// ★ 日志用常量，文案自动匹配（30s）
+		log.Printf("[P2P] %s %ds 无任何流量，判定 P2P 失效，强制降级",
+			id, p2pIdleDeadMs/1000)
+		e.relayMgr.ForceFallback(id, "no-traffic-30s")
 	}
 
 	for _, id := range alivePeers {
@@ -392,6 +387,7 @@ func (e *Edge) cancelFallbackTimer(peerID string) {
 	}
 }
 
+// ★ 修复：30s → 60s（给 TCP 更多验证时间）
 func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
 	if e.relayMgr == nil || peerID == "" {
 		return
@@ -402,7 +398,7 @@ func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
 		t.Stop()
 	}
 
-	t := time.AfterFunc(30*time.Second, func() {
+	t := time.AfterFunc(60*time.Second, func() {
 		e.p2pAvailTimersMu.Lock()
 		delete(e.p2pAvailTimers, peerID)
 		e.p2pAvailTimersMu.Unlock()
@@ -411,7 +407,7 @@ func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
 			return
 		}
 		if e.relayMgr.GetState(peerID) == ConnP2PAvailable {
-			log.Printf("[P2P] %s P2PAvailable 超时 30s 未验证数据面，强制降级", peerID)
+			log.Printf("[P2P] %s P2PAvailable 超时 60s 未验证数据面，强制降级", peerID)
 			e.relayMgr.ForceFallback(peerID, "p2p-avail-timeout")
 		}
 	})
@@ -623,15 +619,14 @@ func main() {
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
 	edge.relayMgr.Report(10 * time.Second)
 
+	// ★ N2NW 二进制拦截
 	ws.SetHandlers(
 		edge.handleSignaling,
 		func(data []byte) {
-			// ★ 拦截 N2NW 二进制帧（WS 中继数据面）
 			if len(data) >= 4 && string(data[:4]) == "N2NW" {
 				edge.handleAppStreamBinary(data)
 				return
 			}
-			// 裸 IPv4 包（兼容旧服务端 / 无目标 ID 的广播）
 			if edge.pktFwd != nil {
 				edge.pktFwd.HandlePacket(data)
 			}
@@ -1255,12 +1250,7 @@ func (e *Edge) peerExists(peerID string) bool {
 
 // registerPeer 注册/更新一个 peer。
 //
-// ★★ 补丁 3（本次修复）：新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
-//
-//	旧版新建 peer 时 UDPAddr 直接用服务端下发的公网地址（pubIP:pubPort），
-//	导致连接刚建立时前几个包走 CGNAT hairpin（50-100ms + DUP），
-//	直到收到第一个 LAN 帧才切回 LAN。
-//	新版优先用 sortedLAN[0] 初始化，LAN 不可达时回退公网地址。
+// ★ 新建 peer 时优先用 LAN 初始化 UDPAddr（补丁 3）
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
 		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
@@ -1290,7 +1280,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.PubPort = pubPort
 		}
 
-		// ★ LAN 优先保护
 		if udpAddr != nil {
 			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
 			if !oldIsLAN {
@@ -1308,7 +1297,7 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
-		// ★★ 补丁 3：新建 peer 时优先用 LAN 初始化 UDPAddr
+		// ★ 补丁 3：新建 peer 时优先用 LAN 初始化 UDPAddr
 		var initialUDP *net.UDPAddr
 		if len(sortedLAN) > 0 {
 			for _, lan := range sortedLAN {
@@ -1343,7 +1332,7 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 
 // ensureTargetPeer 记录指令里的目标 peer 信息。
 //
-// ★★ 补丁 3（本次修复）：新建时优先用 LAN 端点初始化 UDPAddr。
+// ★ 新建 peer 时优先用 LAN 端点初始化 UDPAddr（补丁 3）
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1355,7 +1344,6 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	e.peersMu.Lock()
 	defer e.peersMu.Unlock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
-		// ★ LAN 优先保护
 		if udpAddr != nil {
 			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
 			if !oldIsLAN {
@@ -1366,7 +1354,7 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 			p.VirtualIP = instr.TargetVirtualIp
 		}
 	} else {
-		// ★★ 补丁 3：优先使用 LAN 端点
+		// ★ 补丁 3：优先使用 LAN 端点
 		var initialUDP *net.UDPAddr
 		if len(instr.TargetLanEndpoints) > 0 {
 			for _, lan := range instr.TargetLanEndpoints {
