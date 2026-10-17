@@ -2,25 +2,17 @@
 #
 # n2n-termux 一键部署 + 自动升级
 #
-# 用法：
+# 用法（推荐）：
 #   curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh -o ~/install_n2n_termux.sh
 #   bash ~/install_n2n_termux.sh
 #
-# 环境变量：
-#   SIGNALING_URL     WSS 地址（必填，支持省略 wss:// 自动补全）
-#   CONNECT_TOKEN     连接密码（可选）
-#   ROOM_ID           房间名，默认 default-room
-#   CLIENT_ID         客户端 ID，留空自动生成
-#   NODE_NAME         显示名，默认 hostname
-#   SOCKS5_LISTEN     SOCKS5 监听，默认 127.0.0.1:1080
-#   UDP_PORT          P2P UDP 端口，默认 0（内核分配）
-#   STUN_SERVERS      自定义 STUN（可选）
-#   VERSION           指定版本；留空自动获取最新
-#   INSTALL_DIR       安装目录，默认当前工作目录下的 .n2n-termux
-#   FORCE_UPDATE      =1 强制重装
-#   NO_LAUNCH         =1 只安装不启动
-#   AUTO_START        =1 静默后台启动
-#   CHECK_ONLY        =1 只检查版本
+# 安装路径：默认在当前工作目录下创建 .n2n-termux（可用 INSTALL_DIR 覆盖）
+#
+# 重新配置：
+#   bash ~/install_n2n_termux.sh                  # 交互式询问
+#   RECONFIG=1 bash ~/install_n2n_termux.sh       # 强制重新配置
+#   KEEP_CONFIG=1 bash ~/install_n2n_termux.sh    # 强制使用现有配置
+#   RESET=1 bash ~/install_n2n_termux.sh          # 完全重置
 #
 
 set -eu
@@ -28,11 +20,10 @@ set -eu
 REPO="goyo123321/n2n-termux"
 BIN_NAME="n2n-termux"
 
-# ★ 安装目录：默认在当前工作目录下创建 .n2n-termux
+# ★ 安装目录：默认当前工作目录下的 .n2n-termux
 if [ -z "${INSTALL_DIR:-}" ]; then
     INSTALL_DIR="$(pwd)/.n2n-termux"
 fi
-# 相对路径转绝对（防止后续 cd 影响）
 case "$INSTALL_DIR" in
     /*) ;;
     *)  INSTALL_DIR="$(pwd)/$INSTALL_DIR" ;;
@@ -51,6 +42,9 @@ FORCE_UPDATE="${FORCE_UPDATE:-0}"
 NO_LAUNCH="${NO_LAUNCH:-0}"
 AUTO_START="${AUTO_START:-0}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
+RECONFIG="${RECONFIG:-0}"
+KEEP_CONFIG="${KEEP_CONFIG:-0}"
+RESET="${RESET:-0}"
 
 BIN_PATH="$INSTALL_DIR/$BIN_NAME"
 VERSION_FILE="$INSTALL_DIR/.version"
@@ -65,7 +59,6 @@ GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
 FALLBACK_VERSION="v1.2.1"
 
-# 非交互式（curl | bash）时把 stdin 重定向到 tty
 if [ ! -t 0 ] && [ -r /dev/tty ]; then
     exec < /dev/tty || true
 fi
@@ -87,9 +80,23 @@ warn() { printf "${YELLOW}[!]${NC} %s\n" "$*"; }
 err()  { printf "${RED}[✗]${NC} %s\n" "$*" >&2; }
 info() { printf "${CYAN}  %s${NC}\n" "$*"; }
 
-# ============================================================
-# 环境检测
-# ============================================================
+read_tty() {
+    local var="$1"
+    local prompt="${2:-}"
+    local silent="${3:-0}"
+    [ -n "$prompt" ] && printf "%s" "$prompt"
+    local val=""
+    if [ -r /dev/tty ]; then
+        if [ "$silent" = "1" ]; then read -rs val < /dev/tty || true
+        else read -r val < /dev/tty || true; fi
+    else
+        if [ "$silent" = "1" ]; then read -rs val || true
+        else read -r val || true; fi
+    fi
+    [ "$silent" = "1" ] && [ -n "$prompt" ] && echo
+    eval "$var=\"\$val\""
+}
+
 detect_env() {
     if [ -n "${PREFIX:-}" ] && [[ "$PREFIX" == *"com.termux"* ]]; then
         IS_TERMUX=1
@@ -121,9 +128,6 @@ detect_env() {
     log "二进制名: $BIN_FILE"
 }
 
-# ============================================================
-# CA 证书检查（Termux 特有，WSS 必备）
-# ============================================================
 ensure_ca_certs() {
     if [ "$IS_TERMUX" != "1" ]; then
         return 0
@@ -158,9 +162,24 @@ ensure_ca_certs() {
     warn "手动修复: pkg install ca-certificates"
 }
 
-# ============================================================
-# 迁移旧版二进制（v1.2.0 及之前叫 n2n-client）
-# ============================================================
+fix_termux_dns() {
+    if [ "$IS_TERMUX" != "1" ]; then return 0; fi
+    local resolv="${PREFIX:-/data/data/com.termux/files/usr}/etc/resolv.conf"
+
+    if [ -f "$resolv" ] && grep -q "nameserver ::1" "$resolv" 2>/dev/null; then
+        warn "Termux DNS 指向 [::1]，正在修复..."
+        echo "nameserver 8.8.8.8" > "$resolv"
+        echo "nameserver 1.1.1.1" >> "$resolv"
+        ok "DNS 已修复: $resolv"
+    elif [ ! -f "$resolv" ] || ! grep -q "nameserver" "$resolv" 2>/dev/null; then
+        warn "Termux 缺少 DNS 配置，正在创建..."
+        mkdir -p "$(dirname "$resolv")"
+        echo "nameserver 8.8.8.8" > "$resolv"
+        echo "nameserver 1.1.1.1" >> "$resolv"
+        ok "DNS 配置已创建: $resolv"
+    fi
+}
+
 migrate_legacy_binary() {
     local old_bin="$INSTALL_DIR/n2n-client"
 
@@ -188,9 +207,6 @@ migrate_legacy_binary() {
     fi
 }
 
-# ============================================================
-# 版本管理
-# ============================================================
 read_installed_version() {
     [ -f "$VERSION_FILE" ] && cat "$VERSION_FILE" 2>/dev/null | tr -d '[:space:]' || echo ""
 }
@@ -201,11 +217,7 @@ write_installed_version() {
 }
 
 resolve_latest_version() {
-    if [ -n "$VERSION" ]; then
-        echo "$VERSION"
-        return 0
-    fi
-
+    if [ -n "$VERSION" ]; then echo "$VERSION"; return 0; fi
     local latest=""
     if command -v curl >/dev/null 2>&1; then
         latest=$(curl -fsSL --connect-timeout 8 --max-time 20 \
@@ -217,18 +229,10 @@ resolve_latest_version() {
             | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
             | head -1 || true)
     fi
-
-    if [ -n "$latest" ]; then
-        echo "$latest"
-    else
-        warn "GitHub API 请求失败，回退到 $FALLBACK_VERSION" >&2
-        echo "$FALLBACK_VERSION"
-    fi
+    if [ -n "$latest" ]; then echo "$latest"
+    else warn "GitHub API 请求失败，回退到 $FALLBACK_VERSION" >&2; echo "$FALLBACK_VERSION"; fi
 }
 
-# ============================================================
-# 停止运行中的客户端
-# ============================================================
 stop_running_client() {
     local stopped=0
 
@@ -266,14 +270,9 @@ stop_running_client() {
         fi
     fi
 
-    if [ "$stopped" = "1" ]; then
-        ok "旧进程已停止"
-    fi
+    [ "$stopped" = "1" ] && ok "旧进程已停止"
 }
 
-# ============================================================
-# 下载二进制
-# ============================================================
 install_binary() {
     local version="$1"
     mkdir -p "$INSTALL_DIR"
@@ -285,8 +284,7 @@ install_binary() {
     trap 'rm -f "$tmp"' EXIT
 
     if command -v curl >/dev/null 2>&1; then
-        if ! curl -fL --connect-timeout 10 --max-time 300 \
-            -o "$tmp" "$url" 2>&1; then
+        if ! curl -fL --connect-timeout 10 --max-time 300 -o "$tmp" "$url" 2>&1; then
             err "下载失败: $url"
             err ""
             err "可能的原因："
@@ -314,26 +312,6 @@ install_binary() {
     ok "已安装: $BIN_PATH ($(du -h "$BIN_PATH" 2>/dev/null | cut -f1 || echo '?'))"
 }
 
-# ============================================================
-# 交互式配置
-# ============================================================
-read_tty() {
-    local var="$1"
-    local prompt="${2:-}"
-    local silent="${3:-0}"
-    [ -n "$prompt" ] && printf "%s" "$prompt"
-    local val=""
-    if [ -r /dev/tty ]; then
-        if [ "$silent" = "1" ]; then read -rs val < /dev/tty || true
-        else read -r val < /dev/tty || true; fi
-    else
-        if [ "$silent" = "1" ]; then read -rs val || true
-        else read -r val || true; fi
-    fi
-    [ "$silent" = "1" ] && [ -n "$prompt" ] && echo
-    eval "$var=\"\$val\""
-}
-
 normalize_signaling_url() {
     local url="$SIGNALING_URL"
     url="$(echo "$url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -352,23 +330,69 @@ normalize_signaling_url() {
     fi
 }
 
+# ============================================================
+# 交互式配置（含重新配置选项）
+# ============================================================
 prompt_config() {
     if [ "$NO_LAUNCH" = "1" ]; then
         return 0
     fi
 
     if [ -f "$CONFIG_FILE" ] && [ -z "$SIGNALING_URL" ]; then
-        log "使用已有配置: $CONFIG_FILE"
-        set -a
-        # shellcheck disable=SC1090
-        source "$CONFIG_FILE"
-        set +a
-        normalize_signaling_url
-        return 0
+        # RESET
+        if [ "$RESET" = "1" ]; then
+            warn "RESET=1，完全重置配置"
+            rm -f "$CONFIG_FILE"
+            rm -f "$INSTALL_DIR/client_id"
+            log "已删除 config.env 和 client_id"
+        fi
+
+        # KEEP_CONFIG
+        if [ -f "$CONFIG_FILE" ] && [ "$KEEP_CONFIG" = "1" ]; then
+            log "KEEP_CONFIG=1，强制使用已有配置"
+            set -a
+            # shellcheck disable=SC1090
+            source "$CONFIG_FILE"
+            set +a
+            normalize_signaling_url
+            return 0
+        fi
+
+        # RECONFIG or 交互询问
+        if [ -f "$CONFIG_FILE" ] && [ "$RECONFIG" = "1" ]; then
+            log "RECONFIG=1，强制重新配置"
+        elif [ -f "$CONFIG_FILE" ]; then
+            log "检测到已有配置: $CONFIG_FILE"
+            echo ""
+            info "当前配置摘要："
+            grep -E '^(SIGNALING_URL|ROOM_ID|CLIENT_ID|NODE_NAME|SOCKS5_LISTEN)=' "$CONFIG_FILE" 2>/dev/null \
+                | sed 's/^/    /' || true
+            if grep -q '^CONNECT_TOKEN="[^"]\+"' "$CONFIG_FILE" 2>/dev/null; then
+                echo '    CONNECT_TOKEN="***"（已设置）'
+            fi
+            echo ""
+
+            local answer=""
+            read_tty answer "是否重新配置？(Y=重新配置 / n=使用现有) [y/N] "
+            case "$answer" in
+                y|Y|yes|Yes|YES)
+                    log "重新配置..."
+                    ;;
+                *)
+                    log "使用现有配置"
+                    set -a
+                    # shellcheck disable=SC1090
+                    source "$CONFIG_FILE"
+                    set +a
+                    normalize_signaling_url
+                    return 0
+                    ;;
+            esac
+        fi
     fi
 
     echo ""
-    log "配置客户端（直接回车用默认值）"
+    log "配置客户端（直接回车用默认值，输入 - 清空该字段）"
 
     if [ -z "$SIGNALING_URL" ]; then
         read_tty SIGNALING_URL "SIGNALING_URL (wss://xxx.workers.dev): "
@@ -382,17 +406,23 @@ prompt_config() {
 
     if [ -z "$ROOM_ID" ]; then
         read_tty input "ROOM_ID [default-room]: "
-        ROOM_ID="${input:-default-room}"
+        if [ "$input" = "-" ]; then ROOM_ID="default-room"
+        else ROOM_ID="${input:-default-room}"; fi
     fi
 
     if [ -z "$CLIENT_ID" ]; then
         if [ -f "$INSTALL_DIR/client_id" ]; then
-            CLIENT_ID=$(tr -d '[:space:]' < "$INSTALL_DIR/client_id" 2>/dev/null || echo "")
-            [ -n "$CLIENT_ID" ] && log "复用已有 CLIENT_ID: $CLIENT_ID"
+            local existing_cid
+            existing_cid=$(tr -d '[:space:]' < "$INSTALL_DIR/client_id" 2>/dev/null || echo "")
+            if [ -n "$existing_cid" ]; then
+                log "复用已有 CLIENT_ID: $existing_cid"
+                CLIENT_ID="$existing_cid"
+            fi
         fi
         if [ -z "$CLIENT_ID" ]; then
             read_tty input "CLIENT_ID [自动生成]: "
-            CLIENT_ID="$input"
+            if [ "$input" = "-" ]; then CLIENT_ID=""
+            else CLIENT_ID="$input"; fi
         fi
     fi
 
@@ -400,17 +430,20 @@ prompt_config() {
         local hostname_default
         hostname_default="$(hostname 2>/dev/null || echo 'termux')"
         read_tty input "NODE_NAME [$hostname_default]: "
-        NODE_NAME="${input:-$hostname_default}"
+        if [ "$input" = "-" ]; then NODE_NAME="$hostname_default"
+        else NODE_NAME="${input:-$hostname_default}"; fi
     fi
 
     if [ -z "$CONNECT_TOKEN" ]; then
         read_tty input "CONNECT_TOKEN [留空]: " 1
-        CONNECT_TOKEN="$input"
+        if [ "$input" = "-" ]; then CONNECT_TOKEN=""
+        else CONNECT_TOKEN="$input"; fi
     fi
 
     if [ -z "$SOCKS5_LISTEN" ]; then
         read_tty input "SOCKS5_LISTEN [127.0.0.1:1080]: "
-        SOCKS5_LISTEN="${input:-127.0.0.1:1080}"
+        if [ "$input" = "-" ]; then SOCKS5_LISTEN="127.0.0.1:1080"
+        else SOCKS5_LISTEN="${input:-127.0.0.1:1080}"; fi
     fi
 }
 
@@ -433,17 +466,12 @@ EOF
     ok "配置已保存: $CONFIG_FILE"
 }
 
-# ============================================================
-# ★ 三个启动脚本：INSTALL_DIR 用自身所在目录推导
-#   - 从任意目录调用都能工作
-#   - 用户显式设置 INSTALL_DIR 环境变量时优先
-# ============================================================
 write_launcher() {
     cat > "$LAUNCHER" <<EOF
 #!/usr/bin/env bash
-# n2n-termux 前台启动（Ctrl+C 停止）
 set -eu
 
+# 自动推导安装目录（start.sh 所在目录）
 if [ -z "\${INSTALL_DIR:-}" ]; then
     INSTALL_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
 fi
@@ -467,7 +495,6 @@ EOF
 write_background_launcher() {
     cat > "$BACKGROUND" <<EOF
 #!/usr/bin/env bash
-# n2n-termux 后台启动（nohup）
 set -eu
 
 if [ -z "\${INSTALL_DIR:-}" ]; then
@@ -482,7 +509,6 @@ LOG_FILE="\$INSTALL_DIR/n2n.log"
 if [ ! -f "\$CONFIG_FILE" ]; then echo "配置文件不存在: \$CONFIG_FILE"; exit 1; fi
 if [ ! -x "\$BIN" ]; then echo "二进制不存在: \$BIN"; exit 1; fi
 
-# 已在运行？
 if [ -f "\$PID_FILE" ]; then
     oldpid=\$(cat "\$PID_FILE" 2>/dev/null | tr -d '[:space:]')
     if [ -n "\$oldpid" ] && kill -0 "\$oldpid" 2>/dev/null; then
@@ -515,7 +541,6 @@ EOF
 write_stopper() {
     cat > "$STOPPER" <<EOF
 #!/usr/bin/env bash
-# n2n-termux 停止
 set -eu
 
 if [ -z "\${INSTALL_DIR:-}" ]; then
@@ -523,7 +548,6 @@ if [ -z "\${INSTALL_DIR:-}" ]; then
 fi
 
 PID_FILE="\$INSTALL_DIR/n2n.pid"
-
 stopped=0
 
 if [ -f "\$PID_FILE" ]; then
@@ -540,7 +564,6 @@ if [ -f "\$PID_FILE" ]; then
     rm -f "\$PID_FILE"
 fi
 
-# 兜底 pgrep
 if command -v pgrep >/dev/null 2>&1; then
     pids=\$(pgrep -f "\$INSTALL_DIR/${BIN_NAME}" 2>/dev/null || true)
     if [ -n "\$pids" ]; then
@@ -562,9 +585,6 @@ EOF
     ok "停止脚本: $STOPPER"
 }
 
-# ============================================================
-# 启动
-# ============================================================
 launch_client() {
     if [ "$NO_LAUNCH" = "1" ]; then
         echo ""
@@ -590,7 +610,6 @@ launch_client() {
 
     if [ -z "$SIGNALING_URL" ]; then
         err "未设置 SIGNALING_URL，无法启动"
-        info "手动: SIGNALING_URL=wss://... $LAUNCHER"
         return 1
     fi
 
@@ -606,9 +625,6 @@ launch_client() {
     fi
 }
 
-# ============================================================
-# 主流程
-# ============================================================
 main() {
     echo ""
     echo "========================================================"
@@ -619,8 +635,19 @@ main() {
     log "安装目录: $INSTALL_DIR"
     echo ""
 
+    if [ "$RESET" = "1" ] && [ -f "$CONFIG_FILE" ]; then
+        warn "RESET=1：将删除 $CONFIG_FILE 和 client_id"
+        local confirm=""
+        read_tty confirm "确认重置？[y/N] "
+        case "$confirm" in
+            y|Y|yes|Yes|YES) ;;
+            *) err "已取消"; exit 1 ;;
+        esac
+    fi
+
     detect_env
     ensure_ca_certs
+    fix_termux_dns
     migrate_legacy_binary
 
     local installed latest need_update
