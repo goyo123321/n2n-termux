@@ -35,6 +35,7 @@ type RelayManager struct {
 	turnClient *TURNClient
 	edge       *Edge
 	states     map[string]ConnType
+	failCounts map[string]int // ★ 新增：UDP 连续发送失败计数
 }
 
 func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *RelayManager {
@@ -43,6 +44,7 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 		turnClient: turnClient,
 		edge:       edge,
 		states:     make(map[string]ConnType),
+		failCounts: make(map[string]int), // ★ 初始化
 	}
 }
 
@@ -72,6 +74,7 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	}
 	prev := rm.states[peerId]
 	rm.states[peerId] = ConnP2P
+	delete(rm.failCounts, peerId) // ★ 重置失败计数
 	rm.mu.Unlock()
 
 	log.Printf("[连接] %s → P2P 直连（prev=%s，数据面已验证）", peerId, prev)
@@ -82,6 +85,9 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	}
 }
 
+// MarkFallback 常规降级路径。保护 P2PAvailable 状态。
+//
+// ★ 修复：3s → 10s（TCP 空闲连接更宽容）
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -109,7 +115,8 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 
 		if lastRecv > 0 {
 			idleMs := time.Now().UnixMilli() - lastRecv
-			if idleMs < 3000 {
+			// ★ 3s → 10s（TCP 空闲连接更宽容）
+			if idleMs < 10000 {
 				log.Printf("[连接] %s 最近 %dms 收到过 UDP 包，跳过降级", peerId, idleMs)
 				return
 			}
@@ -172,12 +179,14 @@ func (rm *RelayManager) ClearPeer(peerID string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	delete(rm.states, peerID)
+	delete(rm.failCounts, peerID)
 }
 
 func (rm *RelayManager) ClearAll() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	rm.states = make(map[string]ConnType)
+	rm.failCounts = make(map[string]int)
 }
 
 func (rm *RelayManager) cancelFallbackTimer(peerID string) {
@@ -272,22 +281,10 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 
 // SendToPeer 按当前状态发送数据。
 //
-// ★ 适配 N2NW：所有 WS 中继路径都发 N2NW 帧（而非裸 IPv4），
-//   让服务端精确按 clientId 路由，多 peer 房间下不广播。
+// ★ 修复：ConnP2P 分支加连续失败计数，连续 5 次失败才降级。
 //
-// ★★ 补丁（本次修复）：ConnP2P 分支加入 LAN 优先。
-//
-//	问题：Termux 端此前只发 UDPAddr。同 WiFi 场景下，如果 UDPAddr
-//	已被切到公网（如 30 秒 lastLANRecvAt 窗口过期），回包会走
-//	CGNAT hairpin（50-100ms），而非 LAN（5ms）。
-//
-//	Android → Termux ping 场景实测：
-//	  - 去程 5ms（Android 端 LAN 优先，正常）
-//	  - 回程 50-100ms（Termux 端只发 UDPAddr，走了公网）
-//	  - 总 RTT 平均 50-70ms，大量样本落在 30-70ms 区间
-//
-//	修复后：与 PC / Android 端 SendToPeer 完全对齐，回程优先走 LAN，
-//	预期 RTT 降到 10-15ms。
+//	单次 WriteToUDP 失败通常是临时网络问题（ENOBUFS、瞬时路由），
+//	不应该立即降级到 TURN/WS。5 次失败才认为通道真的坏了。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -302,11 +299,9 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			return false
 		}
 
-		// ★★ 补丁：LAN 优先
-		//
-		// 条件：UDPAddr 存在且是公网（非 RFC1918），且 peer 有 LAN 端点。
-		// 动作：先尝试所有 LAN 端点；成功一个即返回 true。
-		//       全失败才回退 UDPAddr。
+		sent := false
+
+		// LAN 优先
 		if target.UDPAddr != nil &&
 			!isPrivateIPv4(target.UDPAddr.IP) &&
 			len(target.LanEndpoints) > 0 {
@@ -316,22 +311,46 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 					continue
 				}
 				if _, err := rm.edge.udpConn.WriteToUDP(data, ra); err == nil {
-					return true
+					sent = true
+					break
 				}
 			}
-			// 所有 LAN 端点都发送失败，继续走 UDPAddr
 		}
 
-		// 常规路径：发 UDPAddr（可能是 LAN，也可能是公网）
-		if target.UDPAddr != nil {
-			_, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr)
-			if err == nil {
-				return true
+		// UDPAddr
+		if !sent && target.UDPAddr != nil {
+			if _, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr); err == nil {
+				sent = true
+			} else {
+				log.Printf("[P2P] UDP 发送到 %s 失败: %v", peerId, err)
 			}
-			log.Printf("[P2P] UDP 发送到 %s 失败: %v，降级到 WS", peerId, err)
 		}
+
+		if sent {
+			// ★ 成功：重置失败计数
+			rm.mu.Lock()
+			delete(rm.failCounts, peerId)
+			rm.mu.Unlock()
+			return true
+		}
+
+		// ★ 失败：累积计数，连续 5 次才降级
+		rm.mu.Lock()
+		rm.failCounts[peerId]++
+		fc := rm.failCounts[peerId]
+		rm.mu.Unlock()
+
+		if fc < 5 {
+			// 5 次以内：静默失败，下个包再试
+			return false
+		}
+
+		// 5 次以上：真降级
+		rm.mu.Lock()
+		delete(rm.failCounts, peerId)
+		rm.mu.Unlock()
+		log.Printf("[P2P] UDP 发送到 %s 连续失败 %d 次，降级", peerId, fc)
 		rm.MarkFallback(peerId)
-		// ★ 用 N2NW 帧
 		return rm.ws.SendBinary(buildN2NWFrame(peerId, data)) == nil
 
 	case ConnTURN:
@@ -343,7 +362,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 				} else {
 					log.Printf("[TURN] 发送到 %s 失败（临时）: %v", peerId, sendErr)
 					if rm.ws != nil {
-						// ★ 用 N2NW 帧
 						_ = rm.ws.SendBinary(buildN2NWFrame(peerId, data))
 					}
 					return false
@@ -353,13 +371,11 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			}
 		}
 		if rm.ws != nil {
-			// ★ 用 N2NW 帧
 			return rm.ws.SendBinary(buildN2NWFrame(peerId, data)) == nil
 		}
 		return false
 
 	case ConnRelay:
-		// ★ 用 N2NW 帧
 		err := rm.ws.SendBinary(buildN2NWFrame(peerId, data))
 		return err == nil
 	}
