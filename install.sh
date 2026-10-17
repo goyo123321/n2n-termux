@@ -52,7 +52,7 @@ LOG_FILE="$INSTALL_DIR/n2n.log"
 
 GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
-FALLBACK_VERSION="v1.1.21"
+FALLBACK_VERSION="v1.1.22"
 
 # 非交互式（curl | bash）时把 stdin 重定向到 tty
 if [ ! -t 0 ] && [ -r /dev/tty ]; then
