@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"          // ← 加回这一行
 	"strconv"
 	"strings"
 	"sync"
