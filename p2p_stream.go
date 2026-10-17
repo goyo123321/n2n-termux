@@ -1,5 +1,8 @@
 package main
 
+// N2NS 可靠 UDP 流协议（PC / Termux 通用）。
+// 底层使用 *net.UDPConn，发送时使用 WriteToUDP。
+
 import (
 	"encoding/binary"
 	"errors"
@@ -133,7 +136,11 @@ type P2PStreamManager struct {
 }
 
 func NewP2PStreamManager(edge *Edge) *P2PStreamManager {
-	m := &P2PStreamManager{byID: make(map[uint32]*P2PStream), next: 2, edge: edge}
+	m := &P2PStreamManager{
+		byID: make(map[uint32]*P2PStream),
+		next: 2,
+		edge: edge,
+	}
 	safeGo("p2p-reaper", m.reaper)
 	return m
 }
@@ -201,9 +208,6 @@ func (m *P2PStreamManager) dropPeer(peerID string) {
 	}
 }
 
-// reaper 定期清理超时的 stream。
-//
-// ★★ 适配（本次修复）：加 doneCh 检查，避免 Edge 停止后 goroutine 永不退出。
 func (m *P2PStreamManager) reaper() {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
@@ -305,11 +309,11 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
 //
-// ★★ 适配（本次修复）：
-//   1. TURN 未就绪时也走直连试探（防死锁）
-//   2. lanPreferred 窗口 300000（5 分钟）→ 30000（30 秒）
+// ★ 修复 1：LAN 优先（窗口 30s）。
+// ★ 修复 2：控制帧全发（保 CGNAT 映射 + 探测 LAN 恢复）。
+// ★ 修复 3：TURN 模式下控制帧也尝试直连。
 //
-// ★ Termux 特有：e.udpConn 是 *net.UDPConn，用 WriteToUDP。
+// ★ PC / Termux 特有：e.udpConn 是 *net.UDPConn，用 WriteToUDP。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -322,10 +326,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 
 	if viaTURN {
 		if e.turnClient == nil || !e.turnClient.IsReady() {
-			// ★★ 适配：TURN 未就绪也走直连试探（防死锁）。
-			//   旧版直接 return errors.New("turn down")，会导致
-			//   TURN 挂掉时 N2NS 控制帧（PING/SYN）永远发不出去，
-			//   P2P 也无法重建。
 			if forceDual && e.udpConn != nil {
 				targets := e.collectN2NSTargets(s)
 				sent := 0
@@ -359,7 +359,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 			return e.turnClient.Send(buf, ra)
 		}
 
-		// 控制帧在 TURN 模式：TURN + 直连试探
 		var lastErr error
 
 		if e.udpConn != nil {
@@ -398,7 +397,6 @@ func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	e.peersMu.RLock()
 	var lanPreferred bool
 	if p := e.peers[peerID]; p != nil {
-		// ★★ 适配：5 分钟 → 30 秒
 		if p.lastLANRecvAt > 0 &&
 			time.Now().UnixMilli()-p.lastLANRecvAt < 30000 {
 			lanPreferred = true
