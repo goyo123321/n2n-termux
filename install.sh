@@ -14,7 +14,7 @@
 #   SOCKS5_LISTEN     SOCKS5 监听，默认 127.0.0.1:1080
 #   UDP_PORT          P2P UDP 端口，默认 0（内核分配）
 #   STUN_SERVERS      自定义 STUN（可选）
-#   VERSION           指定版本（如 v1.2.0）；留空自动获取最新
+#   VERSION           指定版本（如 v1.2.1）；留空自动获取最新
 #   INSTALL_DIR       安装目录，默认 ~/.n2n-termux
 #   FORCE_UPDATE      =1 强制重装
 #   NO_LAUNCH         =1 只安装不启动
@@ -25,7 +25,10 @@
 set -euo pipefail
 
 REPO="goyo123321/n2n-termux"
-BIN_NAME="n2n-client"
+
+# ★ 二进制名从 n2n-client 改为 n2n-termux
+#   与 n2n-go-client 区分（后者叫 n2n-go-client-linux-*）
+BIN_NAME="n2n-termux"
 
 SIGNALING_URL="${SIGNALING_URL:-}"
 CONNECT_TOKEN="${CONNECT_TOKEN:-}"
@@ -52,7 +55,11 @@ LOG_FILE="$INSTALL_DIR/n2n.log"
 
 GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
-FALLBACK_VERSION="v1.1.22"
+
+# ★ 从 v1.2.1 起 Release 二进制名带 n2n-termux 前缀。
+#   FALLBACK 必须指向一个有 n2n-termux-linux-* 文件的版本。
+#   发新版时记得同步更新这里。
+FALLBACK_VERSION="v1.2.1"
 
 # 非交互式（curl | bash）时把 stdin 重定向到 tty
 if [ ! -t 0 ] && [ -r /dev/tty ]; then
@@ -101,10 +108,12 @@ detect_env() {
         *) err "不支持的架构: $uname_m"; exit 1 ;;
     esac
 
+    # ★ 二进制文件名：n2n-termux-linux-arm64
     BIN_FILE="${BIN_NAME}-${ARCH}"
 
     log "环境: $(if [ "$IS_TERMUX" = "1" ]; then echo "Termux"; elif [ "$IS_PROOT" = "1" ]; then echo "proot Linux"; else echo "Linux"; fi)"
     log "架构: $uname_m → $ARCH"
+    log "二进制名: $BIN_FILE"
 }
 
 # ============================================================
@@ -145,6 +154,39 @@ ensure_ca_certs() {
 
     warn "CA 证书安装失败，WSS 可能报 x509 错误"
     warn "手动修复: pkg install ca-certificates"
+}
+
+# ============================================================
+# 兼容旧版二进制名（v1.2.0 及之前叫 n2n-client）
+# ============================================================
+
+migrate_legacy_binary() {
+    # 老版本二进制叫 n2n-client，新版本叫 n2n-termux
+    local old_bin="$INSTALL_DIR/n2n-client"
+
+    if [ -f "$old_bin" ]; then
+        warn "检测到旧版二进制: $old_bin"
+        warn "从 v1.2.1 起二进制名改为 $BIN_NAME，旧的将被清理"
+        rm -f "$old_bin"
+        ok "已清理旧版二进制"
+    fi
+
+    # 旧的 pgrep 匹配可能还指向 n2n-client，这里顺手清理残留进程
+    if command -v pgrep >/dev/null 2>&1; then
+        local pids
+        pids=$(pgrep -f "${INSTALL_DIR}/n2n-client" 2>/dev/null || true)
+        if [ -n "$pids" ]; then
+            warn "停止旧版残留进程 (PID: $pids)"
+            # shellcheck disable=SC2086
+            kill $pids 2>/dev/null || true
+            sleep 1
+            pids=$(pgrep -f "${INSTALL_DIR}/n2n-client" 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+                # shellcheck disable=SC2086
+                kill -9 $pids 2>/dev/null || true
+            fi
+        fi
+    fi
 }
 
 # ============================================================
@@ -215,6 +257,7 @@ stop_running_client() {
     fi
 
     # 方法 2：pgrep（兜底，处理 PID 文件丢失的情况）
+    # ★ 用新二进制名 n2n-termux
     if command -v pgrep >/dev/null 2>&1; then
         local pids
         pids=$(pgrep -f "${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null || true)
@@ -255,7 +298,14 @@ install_binary() {
         if ! curl -fL --connect-timeout 10 --max-time 300 \
             -o "$tmp" "$url" 2>&1; then
             err "下载失败: $url"
-            err "请确认版本 $version 是否包含 $ARCH 二进制"
+            err ""
+            err "可能的原因："
+            err "  1. 版本 ${version} 未发布对应 ${ARCH} 的二进制"
+            err "  2. 版本过旧（v1.2.0 及之前的二进制名是 n2n-client-linux-*，无 n2n-termux 前缀）"
+            err ""
+            err "请确认："
+            err "  - 手动打开 https://github.com/${REPO}/releases 检查"
+            err "  - 或指定存在的版本: VERSION=v1.2.1 bash install.sh"
             exit 1
         fi
     elif command -v wget >/dev/null 2>&1; then
@@ -377,124 +427,127 @@ EOF
 # ============================================================
 
 write_launcher() {
-    cat > "$LAUNCHER" <<'EOF'
+    # ★ 用新的二进制名
+    cat > "$LAUNCHER" <<EOF
 #!/usr/bin/env bash
 # n2n-termux 前台启动脚本（Ctrl+C 停止）
 set -euo pipefail
 
-INSTALL_DIR="${INSTALL_DIR:-$HOME/.n2n-termux}"
-CONFIG_FILE="$INSTALL_DIR/config.env"
-BIN="$INSTALL_DIR/n2n-client"
+INSTALL_DIR="\${INSTALL_DIR:-\$HOME/.n2n-termux}"
+CONFIG_FILE="\$INSTALL_DIR/config.env"
+BIN="\$INSTALL_DIR/${BIN_NAME}"
 
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "配置文件不存在: $CONFIG_FILE"
+if [ ! -f "\$CONFIG_FILE" ]; then
+    echo "配置文件不存在: \$CONFIG_FILE"
     exit 1
 fi
-if [ ! -x "$BIN" ]; then
-    echo "二进制不存在: $BIN"
+if [ ! -x "\$BIN" ]; then
+    echo "二进制不存在: \$BIN"
     exit 1
 fi
 
 set -a
 # shellcheck disable=SC1090
-source "$CONFIG_FILE"
+source "\$CONFIG_FILE"
 set +a
 
-exec "$BIN" "$@"
+exec "\$BIN" "\$@"
 EOF
     chmod +x "$LAUNCHER"
     ok "前台启动脚本: $LAUNCHER"
 }
 
 write_background_launcher() {
-    cat > "$INSTALL_DIR/background.sh" <<'EOF'
+    # ★ 用新的二进制名
+    cat > "$INSTALL_DIR/background.sh" <<EOF
 #!/usr/bin/env bash
 # n2n-termux 后台启动脚本（nohup）
 set -euo pipefail
 
-INSTALL_DIR="${INSTALL_DIR:-$HOME/.n2n-termux}"
-CONFIG_FILE="$INSTALL_DIR/config.env"
-BIN="$INSTALL_DIR/n2n-client"
-PID_FILE="$INSTALL_DIR/n2n.pid"
-LOG_FILE="$INSTALL_DIR/n2n.log"
+INSTALL_DIR="\${INSTALL_DIR:-\$HOME/.n2n-termux}"
+CONFIG_FILE="\$INSTALL_DIR/config.env"
+BIN="\$INSTALL_DIR/${BIN_NAME}"
+PID_FILE="\$INSTALL_DIR/n2n.pid"
+LOG_FILE="\$INSTALL_DIR/n2n.log"
 
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "配置文件不存在: $CONFIG_FILE"
+if [ ! -f "\$CONFIG_FILE" ]; then
+    echo "配置文件不存在: \$CONFIG_FILE"
     exit 1
 fi
-if [ ! -x "$BIN" ]; then
-    echo "二进制不存在: $BIN"
+if [ ! -x "\$BIN" ]; then
+    echo "二进制不存在: \$BIN"
     exit 1
 fi
 
 # 已在运行？
-if [ -f "$PID_FILE" ]; then
-    oldpid=$(cat "$PID_FILE" 2>/dev/null | tr -d '[:space:]')
-    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-        echo "已在运行 (PID: $oldpid)"
+if [ -f "\$PID_FILE" ]; then
+    oldpid=\$(cat "\$PID_FILE" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "\$oldpid" ] && kill -0 "\$oldpid" 2>/dev/null; then
+        echo "已在运行 (PID: \$oldpid)"
         exit 0
     fi
-    rm -f "$PID_FILE"
+    rm -f "\$PID_FILE"
 fi
 
 set -a
 # shellcheck disable=SC1090
-source "$CONFIG_FILE"
+source "\$CONFIG_FILE"
 set +a
 
 # 日志轮转：超过 5MB 时备份
-if [ -f "$LOG_FILE" ] && [ "$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 5242880 ]; then
-    mv "$LOG_FILE" "$LOG_FILE.old"
+if [ -f "\$LOG_FILE" ] && [ "\$(stat -c%s "\$LOG_FILE" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+    mv "\$LOG_FILE" "\$LOG_FILE.old"
 fi
 
-nohup "$BIN" >> "$LOG_FILE" 2>&1 &
-NEW_PID=$!
-echo "$NEW_PID" > "$PID_FILE"
-echo "已后台启动 (PID: $NEW_PID)"
-echo "日志: tail -f $LOG_FILE"
+nohup "\$BIN" >> "\$LOG_FILE" 2>&1 &
+NEW_PID=\$!
+echo "\$NEW_PID" > "\$PID_FILE"
+echo "已后台启动 (PID: \$NEW_PID)"
+echo "日志: tail -f \$LOG_FILE"
 EOF
     chmod +x "$INSTALL_DIR/background.sh"
     ok "后台启动脚本: $INSTALL_DIR/background.sh"
 }
 
 write_stopper() {
-    cat > "$STOPPER" <<'EOF'
+    # ★ 用新的二进制名
+    cat > "$STOPPER" <<EOF
 #!/usr/bin/env bash
 # n2n-termux 停止脚本
 set -euo pipefail
 
-INSTALL_DIR="${INSTALL_DIR:-$HOME/.n2n-termux}"
-PID_FILE="$INSTALL_DIR/n2n.pid"
+INSTALL_DIR="\${INSTALL_DIR:-\$HOME/.n2n-termux}"
+PID_FILE="\$INSTALL_DIR/n2n.pid"
 
 stopped=0
 
-if [ -f "$PID_FILE" ]; then
-    pid=$(cat "$PID_FILE" 2>/dev/null | tr -d '[:space:]')
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        echo "停止中 (PID: $pid)..."
-        kill "$pid" 2>/dev/null || true
+if [ -f "\$PID_FILE" ]; then
+    pid=\$(cat "\$PID_FILE" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "\$pid" ] && kill -0 "\$pid" 2>/dev/null; then
+        echo "停止中 (PID: \$pid)..."
+        kill "\$pid" 2>/dev/null || true
         sleep 1
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -9 "$pid" 2>/dev/null || true
+        if kill -0 "\$pid" 2>/dev/null; then
+            kill -9 "\$pid" 2>/dev/null || true
         fi
         stopped=1
     fi
-    rm -f "$PID_FILE"
+    rm -f "\$PID_FILE"
 fi
 
 # 兜底 pgrep
 if command -v pgrep >/dev/null 2>&1; then
-    pids=$(pgrep -f "$INSTALL_DIR/n2n-client" 2>/dev/null || true)
-    if [ -n "$pids" ]; then
-        kill $pids 2>/dev/null || true
+    pids=\$(pgrep -f "\$INSTALL_DIR/${BIN_NAME}" 2>/dev/null || true)
+    if [ -n "\$pids" ]; then
+        kill \$pids 2>/dev/null || true
         sleep 1
-        pids=$(pgrep -f "$INSTALL_DIR/n2n-client" 2>/dev/null || true)
-        [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
+        pids=\$(pgrep -f "\$INSTALL_DIR/${BIN_NAME}" 2>/dev/null || true)
+        [ -n "\$pids" ] && kill -9 \$pids 2>/dev/null || true
         stopped=1
     fi
 fi
 
-if [ "$stopped" = "1" ]; then
+if [ "\$stopped" = "1" ]; then
     echo "已停止"
 else
     echo "未在运行"
@@ -566,6 +619,7 @@ main() {
 
     detect_env
     ensure_ca_certs
+    migrate_legacy_binary
 
     local installed latest need_update
     installed="$(read_installed_version)"
@@ -618,7 +672,7 @@ main() {
         save_config
     fi
 
-    # 持久化 client_id（Go 层首次启动会自己写，这里先写一份也行）
+    # 持久化 client_id
     if [ -n "$CLIENT_ID" ] && [ "$CLIENT_ID" != "" ]; then
         mkdir -p "$INSTALL_DIR"
         echo "$CLIENT_ID" > "$INSTALL_DIR/client_id"
