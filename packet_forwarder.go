@@ -620,10 +620,12 @@ func (f *PacketForwarder) sendTCPInternal(
 	f.sendToPeer(clientIP4, pkt)
 }
 
-// sendToPeer 把包发给目标 peer。
+// ============================================================
+// ★ 核心修改：统一发包逻辑
+// ============================================================
 //
-// ★ 修复：SendToPeer 返回 false 时（例如 relayMgr 状态是 Unknown），
-//   必须显式走 WS 中继，否则响应包会丢失。
+// 优先走 relayMgr（LAN / P2P / TURN）。如果返回 false（不可用/失败），
+// 则降级到 ws.SendBinary（Worker 兜底）。
 func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 	if f.edge == nil || f.edge.relayMgr == nil {
 		return
@@ -644,8 +646,10 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 		return
 	}
 
-	// ★ SendToPeer 返回 false 表示需要走 WS 中继
+	// 1. 尝试 P2P / LAN / TURN 发送
 	sent := f.edge.relayMgr.SendToPeer(target.ClientID, pkt, target)
+	
+	// 2. 如果发送失败（状态为 Unknown 或 Relay，或底层报错），走 WS 中继
 	if !sent && f.edge.ws != nil {
 		_ = f.edge.ws.SendBinary(pkt)
 	}
