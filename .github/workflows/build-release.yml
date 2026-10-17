@@ -125,7 +125,9 @@ jobs:
         run: |
           set +e
           mkdir -p /tmp/logs
-          OUT="n2n-client-linux-$NAME"
+
+          # ★ 二进制名改为 n2n-termux-linux-*，与 n2n-go-client 区分
+          OUT="n2n-termux-linux-$NAME"
           LOG="/tmp/logs/build-$NAME.log"
 
           {
@@ -177,10 +179,11 @@ jobs:
             echo ""
             if [ "$EXIT" = "0" ]; then
               echo "✅ **构建成功**"
-              if [ -f "n2n-client-linux-$NAME" ]; then
-                SIZE=$(du -h "n2n-client-linux-$NAME" | cut -f1)
+              # ★ 用新名字检查文件
+              if [ -f "n2n-termux-linux-$NAME" ]; then
+                SIZE=$(du -h "n2n-termux-linux-$NAME" | cut -f1)
                 echo ""
-                echo "- 文件: \`n2n-client-linux-$NAME\`"
+                echo "- 文件: \`n2n-termux-linux-$NAME\`"
                 echo "- 大小: \`$SIZE\`"
               fi
             else
@@ -210,10 +213,11 @@ jobs:
         if: steps.build.outputs.exit_code == '0'
         uses: actions/upload-artifact@v4
         with:
-          name: n2n-client-linux-${{ matrix.name }}
+          # ★ artifact 名和路径都用新名字
+          name: n2n-termux-linux-${{ matrix.name }}
           path: |
-            n2n-client-linux-${{ matrix.name }}
-            n2n-client-linux-${{ matrix.name }}.sha256
+            n2n-termux-linux-${{ matrix.name }}
+            n2n-termux-linux-${{ matrix.name }}.sha256
 
   release:
     name: Release
@@ -241,13 +245,14 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+          # ★ Release 里挂的文件名全部改掉
           files: |
-            dist/n2n-client-linux-arm64
-            dist/n2n-client-linux-arm64.sha256
-            dist/n2n-client-linux-armv7
-            dist/n2n-client-linux-armv7.sha256
-            dist/n2n-client-linux-amd64
-            dist/n2n-client-linux-amd64.sha256
+            dist/n2n-termux-linux-arm64
+            dist/n2n-termux-linux-arm64.sha256
+            dist/n2n-termux-linux-armv7
+            dist/n2n-termux-linux-armv7.sha256
+            dist/n2n-termux-linux-amd64
+            dist/n2n-termux-linux-amd64.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
