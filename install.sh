@@ -59,7 +59,7 @@ GITHUB_DL="https://github.com/${REPO}/releases/download"
 # ★ 从 v1.2.1 起 Release 二进制名带 n2n-termux 前缀。
 #   FALLBACK 必须指向一个有 n2n-termux-linux-* 文件的版本。
 #   发新版时记得同步更新这里。
-FALLBACK_VERSION="v1.2.1"
+FALLBACK_VERSION="v1.1.22"
 
 # 非交互式（curl | bash）时把 stdin 重定向到 tty
 if [ ! -t 0 ] && [ -r /dev/tty ]; then
