@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -623,11 +622,10 @@ func main() {
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
 	edge.relayMgr.Report(10 * time.Second)
 
-	// ★ ws.SetHandlers：接入 N2NW 二进制帧分发
 	ws.SetHandlers(
 		edge.handleSignaling,
 		func(data []byte) {
-			// 拦截 N2NW 二进制帧（WS 中继数据面）
+			// ★ 拦截 N2NW 二进制帧（WS 中继数据面）
 			if len(data) >= 4 && string(data[:4]) == "N2NW" {
 				edge.handleAppStreamBinary(data)
 				return
@@ -1254,6 +1252,14 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
+// registerPeer 注册/更新一个 peer。
+//
+// ★★ 补丁 3（本次修复）：新建 peer 时，若对端有 LAN 端点，初始 UDPAddr 用 LAN。
+//
+//	旧版新建 peer 时 UDPAddr 直接用服务端下发的公网地址（pubIP:pubPort），
+//	导致连接刚建立时前几个包走 CGNAT hairpin（50-100ms + DUP），
+//	直到收到第一个 LAN 帧才切回 LAN。
+//	新版优先用 sortedLAN[0] 初始化，LAN 不可达时回退公网地址。
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
 		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
@@ -1283,6 +1289,7 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.PubPort = pubPort
 		}
 
+		// ★ LAN 优先保护
 		if udpAddr != nil {
 			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
 			if !oldIsLAN {
@@ -1300,6 +1307,7 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
+		// ★★ 补丁 3：新建 peer 时优先用 LAN 初始化 UDPAddr
 		var initialUDP *net.UDPAddr
 		if len(sortedLAN) > 0 {
 			for _, lan := range sortedLAN {
@@ -1332,6 +1340,9 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 	}
 }
 
+// ensureTargetPeer 记录指令里的目标 peer 信息。
+//
+// ★★ 补丁 3（本次修复）：新建时优先用 LAN 端点初始化 UDPAddr。
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1343,6 +1354,7 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	e.peersMu.Lock()
 	defer e.peersMu.Unlock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
+		// ★ LAN 优先保护
 		if udpAddr != nil {
 			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
 			if !oldIsLAN {
@@ -1353,6 +1365,7 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 			p.VirtualIP = instr.TargetVirtualIp
 		}
 	} else {
+		// ★★ 补丁 3：优先使用 LAN 端点
 		var initialUDP *net.UDPAddr
 		if len(instr.TargetLanEndpoints) > 0 {
 			for _, lan := range instr.TargetLanEndpoints {
