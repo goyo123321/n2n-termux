@@ -43,6 +43,7 @@
 - **双向互通** — 内置 `Packet Forwarder`，支持被其他设备主动访问（TCP/UDP/ICMP）
 - **LAN 优先** — 同 WiFi 场景下优先走 LAN，RTT 稳定 5-15ms
 - **自动 TLS 证书** — 内置 Termux CA 证书探测，彻底解决 `x509: unknown authority` 报错
+- **自动 URL 补全** — `install.sh` 检测漏写 `wss://` 会自动补全
 - **四级降级** — `LAN → P2P → TURN → WS`，连接永远可用
 - **N2NW 二进制** — WS 中继数据面用二进制帧，比 base64 省 33% 带宽
 - **轻量无依赖** — 纯 Go 标准库，无需 gVisor，编译仅需 2 秒，二进制 ~10MB
@@ -50,6 +51,40 @@
 - **P2P 通道保活** — 每 15 秒往对端发 N2NS PING 多目标探针
 - **零配置网段** — 服务端通过 `VIRTUAL_NETWORK` 下发，客户端自动适配
 - **一键部署** — `install.sh` 自动下载 + 配置 + 启动
+
+---
+
+## 📂 二进制路径速查（⚠️ 最容易踩的坑）
+
+**两种安装方式，二进制路径完全不同**，先看清楚再启动：
+
+| 安装方式 | 二进制位置 | 启动命令 |
+|:---|:---|:---|
+| **方式 A：`install.sh` 自动安装** | `~/.n2n-termux/n2n-termux`<br>（**带点的隐藏目录**） | `~/.n2n-termux/start.sh` |
+| **方式 B：手动下载** | `~/n2n-termux`<br>（`curl -o ~/n2n-termux` 下载到的位置） | `~/n2n-termux` |
+
+**常见错误对照**：
+
+```bash
+# ❌ 错误：install.sh 装的，却用 ~/n2n-termux 启动
+~/n2n-termux
+# bash: /data/data/com.termux/files/home/n2n-termux: No such file or directory
+
+# ✅ 正确：install.sh 装的用带点目录
+~/.n2n-termux/n2n-termux
+# 或直接
+~/.n2n-termux/start.sh
+
+# ✅ 正确：手动下载到 ~/ 的用这个
+~/n2n-termux
+```
+
+**验证二进制在哪**：
+
+```bash
+ls -lh ~/.n2n-termux/n2n-termux    # install.sh 装的（存在 → 用这个）
+ls -lh ~/n2n-termux                # 手动下载的（存在 → 用这个）
+```
 
 ---
 
@@ -145,21 +180,38 @@ curl --socks5 127.0.0.1:1080 http://10.64.0.3:8080/
 
 ## 🚀 快速开始
 
-### 方式 1：一键安装脚本（推荐）
+> ⚠️ **两个前置注意**：
+>
+> 1. **`SIGNALING_URL` 必须带 `wss://` 前缀**（或 `ws://` 用于本地调试）。漏写会报 `malformed ws or wss URL`。**v1.1.23+ 的 `install.sh` 会自动补全**。
+>
+> 2. **二进制路径**：`install.sh` 装的是 `~/.n2n-termux/n2n-termux`（带点的隐藏目录）；手动下载的是 `~/n2n-termux`。详见 [📂 二进制路径速查](#-二进制路径速查-最容易踩的坑)。
+
+### 方式 A：一键安装脚本（推荐）
 
 ```bash
 # 交互式安装（会提示填写配置）
-SIGNALING_URL="wss://url.jyece.kdns.fr" \
+SIGNALING_URL="wss://<你的-worker-域名>" \
 ROOM_ID="default-room" \
 CLIENT_ID="termux-a" \
 NODE_NAME="My-Termux" \
 bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh)
 ```
 
-### 方式 2：静默后台安装
+**安装位置**：`~/.n2n-termux/n2n-termux`
+
+**日常操作**：
 
 ```bash
-SIGNALING_URL="wss://url.jyece.kdns.fr" \
+~/.n2n-termux/start.sh          # 前台启动
+~/.n2n-termux/background.sh     # 后台启动
+~/.n2n-termux/stop.sh           # 停止
+tail -f ~/.n2n-termux/n2n.log   # 看日志
+```
+
+### 方式 B：静默后台安装
+
+```bash
+SIGNALING_URL="wss://<你的-worker-域名>" \
 ROOM_ID="default-room" \
 CLIENT_ID="termux-a" \
 NODE_NAME="My-Termux" \
@@ -167,21 +219,23 @@ AUTO_START=1 \
 bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh)
 ```
 
-### 方式 3：手动下载运行（最稳定）
+**安装位置**：同方式 A
 
-Termux 的网络环境经常导致一键脚本卡住，推荐直接手动下载：
+### 方式 C：手动下载运行（最稳定）
+
+Termux 网络经常导致一键脚本卡住，推荐直接手动下载：
 
 ```bash
-# 1. 下载最新二进制（以 ARM64 为例）
+# 1. 下载到 HOME 目录（注意这里是 ~/n2n-termux，不是 ~/.n2n-termux/）
 curl -L -o ~/n2n-termux \
   https://github.com/goyo123321/n2n-termux/releases/latest/download/n2n-termux-linux-arm64
 
 # 2. 给执行权限
 chmod +x ~/n2n-termux
 
-# 3. 运行
+# 3. 运行（SIGNALING_URL 必须有 wss://）
 STUN_SERVERS="stun.chat.bilibili.com:3478,stun.hitv.com:3478" \
-SIGNALING_URL="wss://url.jyece.kdns.fr" \
+SIGNALING_URL="wss://<你的-worker-域名>" \
 ROOM_ID="default-room" \
 CLIENT_ID="termux-a" \
 NODE_NAME="My-Termux" \
@@ -189,43 +243,23 @@ SOCKS5_LISTEN="127.0.0.1:1080" \
 ~/n2n-termux
 ```
 
-### 后台运行（推荐）
+**安装位置**：`~/n2n-termux`（**没有点，直接在 home 下**）
+
+> ⚠️ **注意**：这种方式下载的二进制是 `~/n2n-termux`，和 install.sh 的 `~/.n2n-termux/n2n-termux` **不是同一个位置**。不要混用。
+>
+> ⚠️ `SIGNALING_URL` 必须带 `wss://`，否则报 `malformed ws or wss URL`。
+
+### 方式 D：手动下载 + 后台运行
 
 ```bash
 nohup env \
-  SIGNALING_URL="wss://url.jyece.kdns.fr" \
+  SIGNALING_URL="wss://<你的-worker-域名>" \
   ROOM_ID="default-room" \
   CLIENT_ID="termux-a" \
   NODE_NAME="My-Termux" \
   ~/n2n-termux > ~/n2n.log 2>&1 &
 
-# 查看日志
 tail -f ~/n2n.log
-```
-
-### 用 install.sh 装好后的日常操作
-
-```bash
-# 前台运行（能看到日志，Ctrl+C 停）
-~/.n2n-termux/start.sh
-
-# 后台运行（nohup）
-~/.n2n-termux/background.sh
-
-# 停止
-~/.n2n-termux/stop.sh
-
-# 看日志
-tail -f ~/.n2n-termux/n2n.log
-
-# 查看版本
-cat ~/.n2n-termux/.version
-
-# 检查更新（不下载）
-CHECK_ONLY=1 bash ~/install.sh
-
-# 强制重装当前版本
-FORCE_UPDATE=1 bash ~/install.sh
 ```
 
 ---
@@ -254,7 +288,7 @@ chmod +x n2n-termux
 
 | 变量 | 必填 | 默认值 | 说明 |
 |:---|:---|:---|:---|
-| `SIGNALING_URL` | ✅ | — | edge-signal 的 WSS 地址 |
+| `SIGNALING_URL` | ✅ | — | edge-signal 的 WSS 地址，**必须带 `wss://` 前缀**（或 `ws://`） |
 | `ROOM_ID` | ❌ | `default-room` | 房间名 |
 | `CLIENT_ID` | ❌ | 自动生成并持久化 | 客户端唯一 ID，保存在 `~/.n2n-termux/client_id` |
 | `NODE_NAME` | ❌ | hostname | 显示名 |
@@ -262,7 +296,7 @@ chmod +x n2n-termux
 | `CONNECT_TOKEN` | ❌ | `""` | 连接密码（Worker 配了才需要）|
 | `STUN_SERVERS` | ❌ | 内置 | 自定义 STUN 服务器（逗号分隔）|
 | `UDP_PORT` | ❌ | `0` | P2P UDP 端口，0=内核自动分配 |
-| `INSTALL_DIR` | ❌ | `~/.n2n-termux` | 安装目录 |
+| `INSTALL_DIR` | ❌ | `~/.n2n-termux` | install.sh 的安装目录 |
 
 ---
 
@@ -325,9 +359,9 @@ n2n-termux dev 启动
 [配置] 未设置 CONNECT_TOKEN
 [P2P] UDP 监听端口 54321
 [NAT] 启动预收集 LAN: [192.168.10.10:54321]
-[NAT] STUN 74.125.250.129:19302 → 120.239.134.73:19190
-[NAT] HardNAT（对称），ports_diff=0 pub=120.239.134.73:19190
-[WS] 连接 wss://url.jyece.kdns.fr/ws/default-room?cid=termux-a
+[NAT] STUN 74.125.250.129:19302 → x.x.x.x:19190
+[NAT] HardNAT（对称），ports_diff=0 pub=x.x.x.x:19190
+[WS] 连接 wss://<你的-worker-域名>/ws/default-room?cid=termux-a
 已连接信令，Client ID: termux-a，节点名: My-Termux
 分配虚拟 IP: 10.64.0.2（网段 10.64.0.0/24）
 [信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="..." multiExit=true assisted=2 lan=1
@@ -355,6 +389,7 @@ n2n-termux dev 启动
 | `[SOCKS5] 监听 127.0.0.1:1080` | Termux 独有（不是 PC 版） |
 | `[FWD] 已启动` | Packet Forwarder 启动 |
 | `[P2P] xxx 新建 peer，初始 UDPAddr 用 LAN: ...` | LAN 优先修复生效 |
+| `[WS] 连接 wss://...` | **URL 带了 wss://**（不是 `malformed`） |
 
 ---
 
@@ -364,7 +399,7 @@ n2n-termux dev 启动
 
 ```
 ~/.n2n-termux/
-├── n2n-termux           # 二进制（PC 客户端叫 n2n-client，这里是 n2n-termux）
+├── n2n-termux           # 二进制（手动下载的则在 ~/n2n-termux）
 ├── .version             # 当前版本号
 ├── config.env           # 配置（权限 600）
 ├── client_id            # 持久化的 Client ID
@@ -378,6 +413,83 @@ n2n-termux dev 启动
 ---
 
 ## ❓ 常见问题
+
+### Q: 启动报错 `No such file or directory`，找不到二进制？
+
+**原因**：**路径写错了**。`install.sh` 装的和手动下载的路径完全不同。
+
+**快速判断**：
+
+```bash
+# 用 install.sh 装的 → 二进制在 ~/.n2n-termux/n2n-termux
+ls -lh ~/.n2n-termux/n2n-termux
+
+# 手动下载的 → 二进制在 ~/n2n-termux
+ls -lh ~/n2n-termux
+```
+
+**哪个存在就用哪个**：
+
+```bash
+# install.sh 装的
+~/.n2n-termux/n2n-termux
+# 或直接
+~/.n2n-termux/start.sh
+
+# 手动下载的
+~/n2n-termux
+```
+
+**详细对照**：
+
+| 场景 | 错误命令 | 正确命令 |
+|:---|:---|:---|
+| install.sh 装完，手动跑 | `~/n2n-termux` | `~/.n2n-termux/n2n-termux` |
+| install.sh 装完，正常启动 | — | `~/.n2n-termux/start.sh` |
+| 手动下载到 home | `~/.n2n-termux/n2n-termux` | `~/n2n-termux` |
+
+### Q: 启动报错 `连接信令失败: malformed ws or wss URL`？
+
+**原因**：`SIGNALING_URL` 漏了 `wss://`（或 `ws://`）协议前缀。
+
+**日志特征**：
+
+```
+[WS] 连接 <你的-worker-域名>/ws/default-room?cid=...
+连接信令失败: malformed ws or wss URL
+```
+
+注意日志里是 `<域名>/ws/...`（没有 `wss://` 前缀）。
+
+**修复方式 1：手动改 config.env**
+
+```bash
+# 把 SIGNALING_URL 改成带 wss:// 的
+sed -i 's|^SIGNALING_URL=.*|SIGNALING_URL="wss://<你的-worker-域名>"|' \
+  ~/.n2n-termux/config.env
+
+# 确认
+grep SIGNALING_URL ~/.n2n-termux/config.env
+```
+
+**修复方式 2：用 v1.1.23+ 的 install.sh**（自动补全）
+
+```bash
+# 输入不带 wss:// 的地址会自动补全
+SIGNALING_URL="<你的-worker-域名>" bash <(curl -fsSL .../install.sh)
+# 输出: 自动补全协议头: wss://
+#       SIGNALING_URL = wss://<你的-worker-域名>
+```
+
+**正确的 SIGNALING_URL 格式**：
+
+| 输入 | 结果 |
+|:---|:---|
+| `wss://your-worker.example.com` | ✅ 正确 |
+| `ws://localhost:8080` | ✅ 正确（本地调试） |
+| `https://your-worker.example.com` | ⚠️ 会被自动转成 `wss://` |
+| `your-worker.example.com` | ❌ 缺前缀（新版 install.sh 自动补全） |
+| `wss://your-worker.example.com/ws/default-room` | ❌ 不要带路径，只填域名 |
 
 ### Q: 启动报错 `tls: failed to verify certificate: x509: certificate signed by unknown authority`？
 
@@ -435,14 +547,14 @@ ping -i 0.2 -c 100 10.64.0.2
 
 **原因**：Termux 的网络环境（尤其是国内）经常导致 `curl | bash` 超时。
 
-**解决**：直接手动下载二进制：
+**解决**：直接手动下载二进制（注意路径是 `~/n2n-termux`，不是 `~/.n2n-termux/n2n-termux`）：
 
 ```bash
 curl -L -o ~/n2n-termux \
   https://github.com/goyo123321/n2n-termux/releases/latest/download/n2n-termux-linux-arm64
 chmod +x ~/n2n-termux
 
-SIGNALING_URL="wss://..." \
+SIGNALING_URL="wss://<你的-worker-域名>" \
 ROOM_ID="default-room" \
 CLIENT_ID="termux-a" \
 ~/n2n-termux
@@ -460,14 +572,15 @@ CLIENT_ID="termux-a" \
 **方法 2：看文件名**
 
 ```bash
-ls -lh ~/n2n-termux      # ✅ Termux 版
-ls -lh ~/n2n-go-client   # PC 版
+ls -lh ~/.n2n-termux/n2n-termux    # ✅ Termux 版（install.sh 装的）
+ls -lh ~/n2n-termux                # ✅ Termux 版（手动下载的）
+ls -lh ~/n2n-go-client             # PC 版
 ```
 
 **方法 3：strings 检查**
 
 ```bash
-strings ~/n2n-termux | grep -i "termux\|packet-forwarder" | head -3
+strings ~/.n2n-termux/n2n-termux | grep -i "termux\|packet-forwarder" | head -3
 ```
 
 ### Q: 息屏后 ping 有 200-500ms 尖峰？
@@ -486,26 +599,24 @@ strings ~/n2n-termux | grep -i "termux\|packet-forwarder" | head -3
 
 ### Q: 日志在哪？
 
-**方式 1：install.sh 装的**
+**install.sh 装的**：
 
 ```bash
 tail -f ~/.n2n-termux/n2n.log
 ```
 
-**方式 2：手动运行的**
+**手动下载的**：
 
 ```bash
 tail -f ~/n2n.log
 ```
 
-**方式 3：前台运行的**
-
-直接看终端输出。
+**前台运行的**：直接看终端输出。
 
 ### Q: 如何更新？
 
 ```bash
-# 自动查最新版并更新
+# 自动查最新版并更新（install.sh 装的）
 bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh)
 
 # 只检查不下载
@@ -518,17 +629,23 @@ FORCE_UPDATE=1 bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2
 VERSION=v1.2.1 bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh)
 ```
 
+**手动下载的**：重新下载覆盖 `~/n2n-termux` 即可。
+
 ### Q: 如何卸载？
 
+**install.sh 装的**：
+
 ```bash
-# 停止进程
 ~/.n2n-termux/stop.sh 2>/dev/null
-
-# 删除目录
 rm -rf ~/.n2n-termux
+```
 
-# 或者只删二进制
-rm ~/.n2n-termux/n2n-termux
+**手动下载的**：
+
+```bash
+pkill -f "n2n-termux"
+rm ~/n2n-termux
+rm ~/n2n.log
 ```
 
 ---
