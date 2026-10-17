@@ -3,32 +3,40 @@
 # n2n-termux 一键部署 + 自动升级
 #
 # 用法：
-#   bash <(curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh)
+#   curl -fsSL https://raw.githubusercontent.com/goyo123321/n2n-termux/main/install.sh -o ~/install_n2n_termux.sh
+#   bash ~/install_n2n_termux.sh
 #
 # 环境变量：
-#   SIGNALING_URL     WSS 地址（必填）
+#   SIGNALING_URL     WSS 地址（必填，支持省略 wss:// 自动补全）
 #   CONNECT_TOKEN     连接密码（可选）
 #   ROOM_ID           房间名，默认 default-room
-#   CLIENT_ID         客户端 ID，留空自动生成并持久化
+#   CLIENT_ID         客户端 ID，留空自动生成
 #   NODE_NAME         显示名，默认 hostname
 #   SOCKS5_LISTEN     SOCKS5 监听，默认 127.0.0.1:1080
 #   UDP_PORT          P2P UDP 端口，默认 0（内核分配）
 #   STUN_SERVERS      自定义 STUN（可选）
-#   VERSION           指定版本（如 v1.2.1）；留空自动获取最新
-#   INSTALL_DIR       安装目录，默认 ~/.n2n-termux
+#   VERSION           指定版本；留空自动获取最新
+#   INSTALL_DIR       安装目录，默认当前工作目录下的 .n2n-termux
 #   FORCE_UPDATE      =1 强制重装
 #   NO_LAUNCH         =1 只安装不启动
-#   AUTO_START        =1 静默自动启动（后台）
-#   CHECK_ONLY        =1 只检查版本不下载
+#   AUTO_START        =1 静默后台启动
+#   CHECK_ONLY        =1 只检查版本
 #
 
-set -euo pipefail
+set -eu
 
 REPO="goyo123321/n2n-termux"
-
-# ★ 二进制名从 n2n-client 改为 n2n-termux
-#   与 n2n-go-client 区分（后者叫 n2n-go-client-linux-*）
 BIN_NAME="n2n-termux"
+
+# ★ 安装目录：默认在当前工作目录下创建 .n2n-termux
+if [ -z "${INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="$(pwd)/.n2n-termux"
+fi
+# 相对路径转绝对（防止后续 cd 影响）
+case "$INSTALL_DIR" in
+    /*) ;;
+    *)  INSTALL_DIR="$(pwd)/$INSTALL_DIR" ;;
+esac
 
 SIGNALING_URL="${SIGNALING_URL:-}"
 CONNECT_TOKEN="${CONNECT_TOKEN:-}"
@@ -43,33 +51,33 @@ FORCE_UPDATE="${FORCE_UPDATE:-0}"
 NO_LAUNCH="${NO_LAUNCH:-0}"
 AUTO_START="${AUTO_START:-0}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
-INSTALL_DIR="${INSTALL_DIR:-$HOME/.n2n-termux}"
 
 BIN_PATH="$INSTALL_DIR/$BIN_NAME"
 VERSION_FILE="$INSTALL_DIR/.version"
 CONFIG_FILE="$INSTALL_DIR/config.env"
 LAUNCHER="$INSTALL_DIR/start.sh"
 STOPPER="$INSTALL_DIR/stop.sh"
+BACKGROUND="$INSTALL_DIR/background.sh"
 PID_FILE="$INSTALL_DIR/n2n.pid"
 LOG_FILE="$INSTALL_DIR/n2n.log"
 
 GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
-
-# ★ 从 v1.2.1 起 Release 二进制名带 n2n-termux 前缀。
-#   FALLBACK 必须指向一个有 n2n-termux-linux-* 文件的版本。
-#   发新版时记得同步更新这里。
-FALLBACK_VERSION="v1.1.22"
+FALLBACK_VERSION="v1.2.1"
 
 # 非交互式（curl | bash）时把 stdin 重定向到 tty
 if [ ! -t 0 ] && [ -r /dev/tty ]; then
     exec < /dev/tty || true
 fi
 
-# 颜色
+IS_TERMUX=0
+IS_PROOT=0
+ARCH=""
+BIN_FILE=""
+
 if [ -t 1 ] && [ "${TERM:-}" != "dumb" ]; then
-    RED='\033[0;31m'; GREEN='\033[0;32m'
-    YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 else
     RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; NC=''
 fi
@@ -80,56 +88,51 @@ err()  { printf "${RED}[✗]${NC} %s\n" "$*" >&2; }
 info() { printf "${CYAN}  %s${NC}\n" "$*"; }
 
 # ============================================================
-# Termux 环境检测
+# 环境检测
 # ============================================================
-
-IS_TERMUX=0
-IS_PROOT=0
-ARCH=""
-BIN_FILE=""
-
 detect_env() {
-    # 检测 Termux：PREFIX 含 com.termux
     if [ -n "${PREFIX:-}" ] && [[ "$PREFIX" == *"com.termux"* ]]; then
         IS_TERMUX=1
     fi
 
-    # 检测 proot（Termux 里跑 Linux 容器）
     if [ -f "/.proot" ] || grep -q "proot" /proc/version 2>/dev/null; then
         IS_PROOT=1
     fi
 
-    uname_m="$(uname -m)"
+    local uname_m="$(uname -m)"
     case "$uname_m" in
-        aarch64|arm64)  ARCH="linux-arm64" ;;
+        aarch64|arm64)      ARCH="linux-arm64" ;;
         armv7l|armv8l|arm)  ARCH="linux-armv7" ;;
-        x86_64|amd64)   ARCH="linux-amd64" ;;
-        i686|i386)      ARCH="linux-386" ;;
+        x86_64|amd64)       ARCH="linux-amd64" ;;
+        i686|i386)          ARCH="linux-386" ;;
         *) err "不支持的架构: $uname_m"; exit 1 ;;
     esac
 
-    # ★ 二进制文件名：n2n-termux-linux-arm64
     BIN_FILE="${BIN_NAME}-${ARCH}"
 
-    log "环境: $(if [ "$IS_TERMUX" = "1" ]; then echo "Termux"; elif [ "$IS_PROOT" = "1" ]; then echo "proot Linux"; else echo "Linux"; fi)"
+    if [ "$IS_TERMUX" = "1" ]; then
+        log "环境: Termux"
+    elif [ "$IS_PROOT" = "1" ]; then
+        log "环境: proot Linux"
+    else
+        log "环境: Linux"
+    fi
     log "架构: $uname_m → $ARCH"
     log "二进制名: $BIN_FILE"
 }
 
 # ============================================================
-# 依赖检查（ca-certificates 对 WSS 至关重要）
+# CA 证书检查（Termux 特有，WSS 必备）
 # ============================================================
-
 ensure_ca_certs() {
     if [ "$IS_TERMUX" != "1" ]; then
         return 0
     fi
 
-    # 检测 CA 证书是否存在
     local ca_paths=(
-        "$PREFIX/etc/tls/cert.pem"
-        "$PREFIX/etc/ca-certificates/ca-bundle.crt"
-        "$PREFIX/etc/ssl/certs/ca-certificates.crt"
+        "${PREFIX:-/data/data/com.termux/files/usr}/etc/tls/cert.pem"
+        "${PREFIX:-/data/data/com.termux/files/usr}/etc/ca-certificates/ca-bundle.crt"
+        "${PREFIX:-/data/data/com.termux/files/usr}/etc/ssl/certs/ca-certificates.crt"
     )
 
     for p in "${ca_paths[@]}"; do
@@ -144,7 +147,6 @@ ensure_ca_certs() {
         pkg install -y ca-certificates 2>&1 | tail -3 || true
     fi
 
-    # 再次检查
     for p in "${ca_paths[@]}"; do
         if [ -f "$p" ] && [ -s "$p" ]; then
             ok "CA 证书安装成功: $p"
@@ -157,11 +159,9 @@ ensure_ca_certs() {
 }
 
 # ============================================================
-# 兼容旧版二进制名（v1.2.0 及之前叫 n2n-client）
+# 迁移旧版二进制（v1.2.0 及之前叫 n2n-client）
 # ============================================================
-
 migrate_legacy_binary() {
-    # 老版本二进制叫 n2n-client，新版本叫 n2n-termux
     local old_bin="$INSTALL_DIR/n2n-client"
 
     if [ -f "$old_bin" ]; then
@@ -171,7 +171,6 @@ migrate_legacy_binary() {
         ok "已清理旧版二进制"
     fi
 
-    # 旧的 pgrep 匹配可能还指向 n2n-client，这里顺手清理残留进程
     if command -v pgrep >/dev/null 2>&1; then
         local pids
         pids=$(pgrep -f "${INSTALL_DIR}/n2n-client" 2>/dev/null || true)
@@ -192,13 +191,8 @@ migrate_legacy_binary() {
 # ============================================================
 # 版本管理
 # ============================================================
-
 read_installed_version() {
-    if [ -f "$VERSION_FILE" ]; then
-        cat "$VERSION_FILE" 2>/dev/null | tr -d '[:space:]'
-    else
-        echo ""
-    fi
+    [ -f "$VERSION_FILE" ] && cat "$VERSION_FILE" 2>/dev/null | tr -d '[:space:]' || echo ""
 }
 
 write_installed_version() {
@@ -227,6 +221,7 @@ resolve_latest_version() {
     if [ -n "$latest" ]; then
         echo "$latest"
     else
+        warn "GitHub API 请求失败，回退到 $FALLBACK_VERSION" >&2
         echo "$FALLBACK_VERSION"
     fi
 }
@@ -234,11 +229,9 @@ resolve_latest_version() {
 # ============================================================
 # 停止运行中的客户端
 # ============================================================
-
 stop_running_client() {
     local stopped=0
 
-    # 方法 1：PID 文件
     if [ -f "$PID_FILE" ]; then
         local pid
         pid=$(cat "$PID_FILE" 2>/dev/null | tr -d '[:space:]')
@@ -256,8 +249,6 @@ stop_running_client() {
         rm -f "$PID_FILE"
     fi
 
-    # 方法 2：pgrep（兜底，处理 PID 文件丢失的情况）
-    # ★ 用新二进制名 n2n-termux
     if command -v pgrep >/dev/null 2>&1; then
         local pids
         pids=$(pgrep -f "${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null || true)
@@ -283,7 +274,6 @@ stop_running_client() {
 # ============================================================
 # 下载二进制
 # ============================================================
-
 install_binary() {
     local version="$1"
     mkdir -p "$INSTALL_DIR"
@@ -301,11 +291,9 @@ install_binary() {
             err ""
             err "可能的原因："
             err "  1. 版本 ${version} 未发布对应 ${ARCH} 的二进制"
-            err "  2. 版本过旧（v1.2.0 及之前的二进制名是 n2n-client-linux-*，无 n2n-termux 前缀）"
+            err "  2. 版本过旧（v1.2.0 及之前的二进制名是 n2n-client-linux-*）"
             err ""
-            err "请确认："
-            err "  - 手动打开 https://github.com/${REPO}/releases 检查"
-            err "  - 或指定存在的版本: VERSION=v1.2.1 bash install.sh"
+            err "请检查: https://github.com/${REPO}/releases"
             exit 1
         fi
     elif command -v wget >/dev/null 2>&1; then
@@ -323,25 +311,59 @@ install_binary() {
     mv "$tmp" "$BIN_PATH"
     trap - EXIT
 
-    ok "已安装: $BIN_PATH ($(du -h "$BIN_PATH" | cut -f1))"
+    ok "已安装: $BIN_PATH ($(du -h "$BIN_PATH" 2>/dev/null | cut -f1 || echo '?'))"
 }
 
 # ============================================================
 # 交互式配置
 # ============================================================
+read_tty() {
+    local var="$1"
+    local prompt="${2:-}"
+    local silent="${3:-0}"
+    [ -n "$prompt" ] && printf "%s" "$prompt"
+    local val=""
+    if [ -r /dev/tty ]; then
+        if [ "$silent" = "1" ]; then read -rs val < /dev/tty || true
+        else read -r val < /dev/tty || true; fi
+    else
+        if [ "$silent" = "1" ]; then read -rs val || true
+        else read -r val || true; fi
+    fi
+    [ "$silent" = "1" ] && [ -n "$prompt" ] && echo
+    eval "$var=\"\$val\""
+}
+
+normalize_signaling_url() {
+    local url="$SIGNALING_URL"
+    url="$(echo "$url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    case "$url" in
+        wss://*|ws://*) SIGNALING_URL="$url" ;;
+        https://*)      SIGNALING_URL="wss://${url#https://}"; log "自动转换 https:// → wss://" ;;
+        http://*)       SIGNALING_URL="ws://${url#http://}";   log "自动转换 http:// → ws://" ;;
+        "")             SIGNALING_URL="" ;;
+        *)              SIGNALING_URL="wss://${url}";          log "自动补全协议头 wss://" ;;
+    esac
+    if [ -n "$SIGNALING_URL" ]; then
+        case "$SIGNALING_URL" in
+            wss://?*|ws://?*) ok "SIGNALING_URL = $SIGNALING_URL" ;;
+            *) err "SIGNALING_URL 格式非法: $SIGNALING_URL"; exit 1 ;;
+        esac
+    fi
+}
 
 prompt_config() {
     if [ "$NO_LAUNCH" = "1" ]; then
         return 0
     fi
 
-    # 已有 config.env 且没传 SIGNALING_URL → 用现成的
     if [ -f "$CONFIG_FILE" ] && [ -z "$SIGNALING_URL" ]; then
         log "使用已有配置: $CONFIG_FILE"
         set -a
         # shellcheck disable=SC1090
         source "$CONFIG_FILE"
         set +a
+        normalize_signaling_url
         return 0
     fi
 
@@ -349,10 +371,9 @@ prompt_config() {
     log "配置客户端（直接回车用默认值）"
 
     if [ -z "$SIGNALING_URL" ]; then
-        printf "SIGNALING_URL (wss://xxx.workers.dev): "
-        read -r SIGNALING_URL || true
+        read_tty SIGNALING_URL "SIGNALING_URL (wss://xxx.workers.dev): "
+        normalize_signaling_url
     fi
-
     if [ -z "$SIGNALING_URL" ]; then
         warn "未填写 SIGNALING_URL，跳过启动"
         NO_LAUNCH=1
@@ -360,47 +381,37 @@ prompt_config() {
     fi
 
     if [ -z "$ROOM_ID" ]; then
-        printf "ROOM_ID [default-room]: "
-        read -r input || true
+        read_tty input "ROOM_ID [default-room]: "
         ROOM_ID="${input:-default-room}"
     fi
 
     if [ -z "$CLIENT_ID" ]; then
-        # 已有持久化的 client_id 就复用
         if [ -f "$INSTALL_DIR/client_id" ]; then
-            CLIENT_ID=$(cat "$INSTALL_DIR/client_id" 2>/dev/null | tr -d '[:space:]')
-            if [ -n "$CLIENT_ID" ]; then
-                log "复用已有 CLIENT_ID: $CLIENT_ID"
-            fi
+            CLIENT_ID=$(tr -d '[:space:]' < "$INSTALL_DIR/client_id" 2>/dev/null || echo "")
+            [ -n "$CLIENT_ID" ] && log "复用已有 CLIENT_ID: $CLIENT_ID"
         fi
         if [ -z "$CLIENT_ID" ]; then
-            printf "CLIENT_ID [自动生成]: "
-            read -r input || true
+            read_tty input "CLIENT_ID [自动生成]: "
             CLIENT_ID="$input"
         fi
     fi
 
     if [ -z "$NODE_NAME" ]; then
-        hostname_default=$(hostname 2>/dev/null || echo "termux")
-        printf "NODE_NAME [$hostname_default]: "
-        read -r input || true
+        local hostname_default
+        hostname_default="$(hostname 2>/dev/null || echo 'termux')"
+        read_tty input "NODE_NAME [$hostname_default]: "
         NODE_NAME="${input:-$hostname_default}"
     fi
 
     if [ -z "$CONNECT_TOKEN" ]; then
-        printf "CONNECT_TOKEN [留空]: "
-        read -rs input || true
-        echo
+        read_tty input "CONNECT_TOKEN [留空]: " 1
         CONNECT_TOKEN="$input"
     fi
 
     if [ -z "$SOCKS5_LISTEN" ]; then
-        printf "SOCKS5_LISTEN [127.0.0.1:1080]: "
-        read -r input || true
+        read_tty input "SOCKS5_LISTEN [127.0.0.1:1080]: "
         SOCKS5_LISTEN="${input:-127.0.0.1:1080}"
     fi
-
-    return 0
 }
 
 save_config() {
@@ -423,34 +434,30 @@ EOF
 }
 
 # ============================================================
-# 生成启动 / 停止脚本
+# ★ 三个启动脚本：INSTALL_DIR 用自身所在目录推导
+#   - 从任意目录调用都能工作
+#   - 用户显式设置 INSTALL_DIR 环境变量时优先
 # ============================================================
-
 write_launcher() {
-    # ★ 用新的二进制名
     cat > "$LAUNCHER" <<EOF
 #!/usr/bin/env bash
-# n2n-termux 前台启动脚本（Ctrl+C 停止）
-set -euo pipefail
+# n2n-termux 前台启动（Ctrl+C 停止）
+set -eu
 
-INSTALL_DIR="\${INSTALL_DIR:-\$HOME/.n2n-termux}"
+if [ -z "\${INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+fi
+
 CONFIG_FILE="\$INSTALL_DIR/config.env"
 BIN="\$INSTALL_DIR/${BIN_NAME}"
 
-if [ ! -f "\$CONFIG_FILE" ]; then
-    echo "配置文件不存在: \$CONFIG_FILE"
-    exit 1
-fi
-if [ ! -x "\$BIN" ]; then
-    echo "二进制不存在: \$BIN"
-    exit 1
-fi
+if [ ! -f "\$CONFIG_FILE" ]; then echo "配置文件不存在: \$CONFIG_FILE"; exit 1; fi
+if [ ! -x "\$BIN" ]; then echo "二进制不存在: \$BIN"; exit 1; fi
 
 set -a
 # shellcheck disable=SC1090
 source "\$CONFIG_FILE"
 set +a
-
 exec "\$BIN" "\$@"
 EOF
     chmod +x "$LAUNCHER"
@@ -458,26 +465,22 @@ EOF
 }
 
 write_background_launcher() {
-    # ★ 用新的二进制名
-    cat > "$INSTALL_DIR/background.sh" <<EOF
+    cat > "$BACKGROUND" <<EOF
 #!/usr/bin/env bash
-# n2n-termux 后台启动脚本（nohup）
-set -euo pipefail
+# n2n-termux 后台启动（nohup）
+set -eu
 
-INSTALL_DIR="\${INSTALL_DIR:-\$HOME/.n2n-termux}"
+if [ -z "\${INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+fi
+
 CONFIG_FILE="\$INSTALL_DIR/config.env"
 BIN="\$INSTALL_DIR/${BIN_NAME}"
 PID_FILE="\$INSTALL_DIR/n2n.pid"
 LOG_FILE="\$INSTALL_DIR/n2n.log"
 
-if [ ! -f "\$CONFIG_FILE" ]; then
-    echo "配置文件不存在: \$CONFIG_FILE"
-    exit 1
-fi
-if [ ! -x "\$BIN" ]; then
-    echo "二进制不存在: \$BIN"
-    exit 1
-fi
+if [ ! -f "\$CONFIG_FILE" ]; then echo "配置文件不存在: \$CONFIG_FILE"; exit 1; fi
+if [ ! -x "\$BIN" ]; then echo "二进制不存在: \$BIN"; exit 1; fi
 
 # 已在运行？
 if [ -f "\$PID_FILE" ]; then
@@ -505,18 +508,20 @@ echo "\$NEW_PID" > "\$PID_FILE"
 echo "已后台启动 (PID: \$NEW_PID)"
 echo "日志: tail -f \$LOG_FILE"
 EOF
-    chmod +x "$INSTALL_DIR/background.sh"
-    ok "后台启动脚本: $INSTALL_DIR/background.sh"
+    chmod +x "$BACKGROUND"
+    ok "后台启动脚本: $BACKGROUND"
 }
 
 write_stopper() {
-    # ★ 用新的二进制名
     cat > "$STOPPER" <<EOF
 #!/usr/bin/env bash
-# n2n-termux 停止脚本
-set -euo pipefail
+# n2n-termux 停止
+set -eu
 
-INSTALL_DIR="\${INSTALL_DIR:-\$HOME/.n2n-termux}"
+if [ -z "\${INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+fi
+
 PID_FILE="\$INSTALL_DIR/n2n.pid"
 
 stopped=0
@@ -558,28 +563,26 @@ EOF
 }
 
 # ============================================================
-# 启动客户端
+# 启动
 # ============================================================
-
 launch_client() {
     if [ "$NO_LAUNCH" = "1" ]; then
         echo ""
-        ok "安装完成"
+        ok "安装完成（未启动）"
         info "前台启动: $LAUNCHER"
-        info "后台启动: $INSTALL_DIR/background.sh"
+        info "后台启动: $BACKGROUND"
         info "停止:     $STOPPER"
         return 0
     fi
 
     if [ "$AUTO_START" != "1" ]; then
-        echo ""
-        printf "是否立即启动客户端？[Y/n] "
-        read -r answer || true
+        local answer=""
+        read_tty answer "是否立即启动客户端？[Y/n] "
         case "$answer" in
             n|N|no|No|NO)
                 ok "安装完成（未启动）"
                 info "前台启动: $LAUNCHER"
-                info "后台启动: $INSTALL_DIR/background.sh"
+                info "后台启动: $BACKGROUND"
                 return 0
                 ;;
         esac
@@ -593,13 +596,11 @@ launch_client() {
 
     echo ""
     if [ "$AUTO_START" = "1" ]; then
-        # AUTO_START=1 时静默后台启动
         log "后台启动..."
-        INSTALL_DIR="$INSTALL_DIR" "$INSTALL_DIR/background.sh"
+        INSTALL_DIR="$INSTALL_DIR" "$BACKGROUND"
         sleep 2
         info "日志: tail -f $LOG_FILE"
     else
-        # 交互模式前台启动（能看到日志）
         ok "启动中（Ctrl+C 停止）..."
         exec "$LAUNCHER"
     fi
@@ -608,13 +609,14 @@ launch_client() {
 # ============================================================
 # 主流程
 # ============================================================
-
 main() {
     echo ""
     echo "========================================================"
     echo "  n2n-termux 一键部署"
     echo "  https://github.com/${REPO}"
     echo "========================================================"
+    echo ""
+    log "安装目录: $INSTALL_DIR"
     echo ""
 
     detect_env
@@ -627,11 +629,7 @@ main() {
     log "查询最新版本..."
     latest="$(resolve_latest_version)"
 
-    if [ -n "$installed" ]; then
-        log "本地已装: $installed"
-    else
-        log "本地未装（或旧版无版本记录）"
-    fi
+    [ -n "$installed" ] && log "本地已装: $installed" || log "本地未装"
     log "远端最新: $latest"
 
     need_update=1
@@ -644,7 +642,6 @@ main() {
         echo ""
         if [ "$need_update" = "1" ]; then
             ok "有新版本可更新: ${installed:-无} → $latest"
-            info "运行不带 CHECK_ONLY=1 即可升级"
         else
             ok "已是最新版本: $latest"
         fi
@@ -654,26 +651,17 @@ main() {
     if [ "$need_update" = "0" ]; then
         ok "已是最新版本: $latest（跳过下载，FORCE_UPDATE=1 可强制重装）"
     else
-        if [ -n "$installed" ]; then
-            log "升级中: $installed → $latest"
-        else
-            log "首次安装: $latest"
-        fi
-
+        [ -n "$installed" ] && log "升级: $installed → $latest" || log "首次安装: $latest"
         stop_running_client
         install_binary "$latest"
         write_installed_version "$latest"
         ok "版本已更新: $latest"
     fi
 
-    # 配置
     prompt_config
-    if [ -n "$SIGNALING_URL" ]; then
-        save_config
-    fi
+    [ -n "$SIGNALING_URL" ] && save_config
 
-    # 持久化 client_id
-    if [ -n "$CLIENT_ID" ] && [ "$CLIENT_ID" != "" ]; then
+    if [ -n "${CLIENT_ID:-}" ]; then
         mkdir -p "$INSTALL_DIR"
         echo "$CLIENT_ID" > "$INSTALL_DIR/client_id"
         chmod 600 "$INSTALL_DIR/client_id"
@@ -686,12 +674,13 @@ main() {
     echo ""
     ok "部署完成！"
     echo ""
+    info "安装目录: $INSTALL_DIR"
     info "二进制:   $BIN_PATH"
     info "版本:     $latest"
     info "配置:     $CONFIG_FILE"
     info "日志:     $LOG_FILE"
     info "前台启动: $LAUNCHER"
-    info "后台启动: $INSTALL_DIR/background.sh"
+    info "后台启动: $BACKGROUND"
     info "停止:     $STOPPER"
     echo ""
 
