@@ -623,9 +623,16 @@ func main() {
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
 	edge.relayMgr.Report(10 * time.Second)
 
+	// ★ ws.SetHandlers：接入 N2NW 二进制帧分发
 	ws.SetHandlers(
 		edge.handleSignaling,
 		func(data []byte) {
+			// 拦截 N2NW 二进制帧（WS 中继数据面）
+			if len(data) >= 4 && string(data[:4]) == "N2NW" {
+				edge.handleAppStreamBinary(data)
+				return
+			}
+			// 裸 IPv4 包（兼容旧服务端 / 无目标 ID 的广播）
 			if edge.pktFwd != nil {
 				edge.pktFwd.HandlePacket(data)
 			}
