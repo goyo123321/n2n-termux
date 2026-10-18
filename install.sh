@@ -57,7 +57,7 @@ LOG_FILE="$INSTALL_DIR/n2n.log"
 
 GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
-FALLBACK_VERSION="v1.2.1"
+FALLBACK_VERSION="v1.1.23"
 
 if [ ! -t 0 ] && [ -r /dev/tty ]; then
     exec < /dev/tty || true
