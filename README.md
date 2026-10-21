@@ -274,7 +274,7 @@ tail -f ./n2n.log
 
 ## 📦 二进制命名说明
 
-从 **v1.2.1** 起，Release 二进制名带 `n2n-termux-` 前缀，与 `n2n-go-client` 区分：
+从 **v1.1.21** 起，Release 二进制名带 `n2n-termux-` 前缀，与 `n2n-go-client` 区分：
 
 | 项目 | 二进制名 |
 |:---|:---|
@@ -283,7 +283,7 @@ tail -f ./n2n.log
 
 **好处**：下载后一眼看出是哪个，两个项目放同一目录也不冲突，`install.sh` 的 pgrep 也不会误杀。
 
-**历史版本**（v1.2.0 及之前）的二进制名是 `n2n-client-linux-*`，与 n2n-go-client 同名——如果还在用旧版，下载后手动改个名：
+**历史版本**（v1.1.20 及之前）的二进制名是 `n2n-client-linux-*`，与 n2n-go-client 同名——如果还在用旧版，下载后手动改个名：
 
 ```bash
 mv n2n-client-linux-arm64 n2n-termux
@@ -310,7 +310,7 @@ chmod +x n2n-termux
 
 ## 🔧 LAN 优先机制
 
-Termux 从 v1.2.1 起与 PC/Android 完全对齐，`Edge` 的 8 个 `UDPAddr` 写入点全部优先用 LAN：
+Termux 从 v1.1.21 起与 PC/Android 完全对齐，`Edge` 的 8 个 `UDPAddr` 写入点全部优先用 LAN：
 
 | 写入点 | 触发时机 |
 |:---|:---|
