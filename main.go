@@ -112,6 +112,7 @@ type PeerInfo struct {
 	probeReplied      bool
 	AssistedEndpoints []string
 	LanEndpoints      []string
+	Features          []string   // ★ 新增：["n2na", "n2nw", ...]
 }
 
 type Edge struct {
@@ -634,13 +635,16 @@ func main() {
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
 	edge.relayMgr.Report(10 * time.Second)
 
-	// ★ N2NW 二进制拦截
+	// ★ 二进制拦截：N2NW（IPv4 数据面）+ N2NA（app_stream 二进制数据面）
 	ws.SetHandlers(
 		edge.handleSignaling,
 		func(data []byte) {
-			if len(data) >= 4 && string(data[:4]) == "N2NW" {
-				edge.handleAppStreamBinary(data)
-				return
+			if len(data) >= 4 {
+				magic := string(data[:4])
+				if magic == "N2NW" || magic == "N2NA" {
+					edge.handleAppStreamBinary(data)
+					return
+				}
 			}
 			if edge.pktFwd != nil {
 				edge.pktFwd.HandlePacket(data)
@@ -772,6 +776,11 @@ func (e *Edge) Stop() {
 	}
 }
 
+// reportMetadata 上报 p2p_metadata。
+//
+// ★ 新增：上报 features = ["n2na", "n2nw"]，让服务端在 WS 中继时
+//   知道本端支持 N2NA（app_stream 二进制）和 N2NW（IPv4 二进制）。
+//   服务端按目标端 features 决定发二进制还是降级文本。
 func (e *Edge) reportMetadata() {
 	if e.ws == nil || e.natMeta == nil {
 		return
@@ -799,6 +808,7 @@ func (e *Edge) reportMetadata() {
 		"behavior":           nm.Behavior,
 		"p2pEndpoint":        nm.P2PEndpoint,
 		"multiExit":          nm.MultiExit,
+		"features":           []string{"n2na", "n2nw"},   // ★ 新增
 	}
 	if nm.PublicEndpoint != "" {
 		metaPayload["publicEndpoint"] = nm.PublicEndpoint
@@ -822,7 +832,7 @@ func (e *Edge) reportMetadata() {
 		log.Printf("[NAT] 上报 LAN 地址: %v", lanEndpoints)
 	}
 
-	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d lan=%d",
+	log.Printf("[信令] 上报 p2p_metadata: natType=%s publicEndpoint=%q multiExit=%v assisted=%d lan=%d features=[n2na,n2nw]",
 		nm.NATType, nm.PublicEndpoint, nm.MultiExit, len(nm.AllEndpoints), len(lanEndpoints))
 
 	_ = e.ws.Send(map[string]interface{}{
@@ -883,6 +893,7 @@ func (e *Edge) logPeerReady(peerID string) {
 	clientID := p.ClientID
 	lans := p.LanEndpoints
 	assisted := p.AssistedEndpoints
+	features := append([]string(nil), p.Features...) // ★ 新增
 	e.peersMu.Unlock()
 
 	log.Println("")
@@ -896,6 +907,9 @@ func (e *Edge) logPeerReady(peerID string) {
 	}
 	if len(assisted) > 0 {
 		log.Printf("  STUN 端点 : %v", assisted)
+	}
+	if len(features) > 0 {
+		log.Printf("  features  : %v", features) // ★ 新增
 	}
 	log.Println("==========================================")
 	log.Println("")
@@ -1009,6 +1023,16 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 					}
 				}
 
+				// ★ 新增：解析 features
+				var features []string
+				if raw, ok := pm["features"].([]interface{}); ok {
+					for _, v := range raw {
+						if s, ok := v.(string); ok && s != "" {
+							features = append(features, s)
+						}
+					}
+				}
+
 				if pid == "" || pip == "" {
 					continue
 				}
@@ -1016,13 +1040,16 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				e.maybeResetFailCountForPeer(pid, pubIP, pubPort)
 
 				e.registerPeer(pid, pip, pubIP, pubPort, natType, assisted, lanEndpoints)
-				if relayAddr != "" {
-					e.peersMu.Lock()
-					if pi, ok := e.peers[pid]; ok {
+				e.peersMu.Lock()
+				if pi, ok := e.peers[pid]; ok {
+					if relayAddr != "" {
 						pi.TurnRelayAddr = relayAddr
 					}
-					e.peersMu.Unlock()
+					if len(features) > 0 {
+						pi.Features = features   // ★ 新增
+					}
 				}
+				e.peersMu.Unlock()
 				e.logPeerReady(pid)
 			}
 		}
@@ -1061,6 +1088,16 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			}
 		}
 
+		// ★ 新增：解析 features
+		var features []string
+		if raw, ok := payload["features"].([]interface{}); ok {
+			for _, v := range raw {
+				if s, ok := v.(string); ok && s != "" {
+					features = append(features, s)
+				}
+			}
+		}
+
 		if from != "" && pip != "" {
 			e.peersMu.RLock()
 			p, exists := e.peers[from]
@@ -1070,16 +1107,19 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			e.maybeResetFailCountForPeer(from, pubIP, pubPort)
 
 			e.registerPeer(from, pip, pubIP, pubPort, natType, assisted, lanEndpoints)
-			if relayAddr != "" {
-				e.peersMu.Lock()
-				if pi, ok := e.peers[from]; ok {
+			e.peersMu.Lock()
+			if pi, ok := e.peers[from]; ok {
+				if relayAddr != "" {
 					pi.TurnRelayAddr = relayAddr
 				}
-				e.peersMu.Unlock()
+				if len(features) > 0 {
+					pi.Features = features   // ★ 新增
+				}
 			}
+			e.peersMu.Unlock()
 
 			if !alreadyReady {
-				log.Printf("[信令] 节点上线: %s (vip=%s)", from, pip)
+				log.Printf("[信令] 节点上线: %s (vip=%s) features=%v", from, pip, features)
 			}
 			e.logPeerReady(from)
 
@@ -1357,6 +1397,7 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			NATType:           natType,
 			AssistedEndpoints: assisted,
 			LanEndpoints:      sortedLAN,
+			// Features 由调用方在 registerPeer 之后直接设置
 		}
 	}
 	e.peersMu.Unlock()
