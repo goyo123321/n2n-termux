@@ -1318,6 +1318,22 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
+// ★ P0 修复（本次）：registerPeer 检测出口 IP 变化时无条件更新 UDPAddr
+//
+// 旧版问题：
+//   - peer 的 UDPAddr 初始是 LAN 地址（同 WiFi 场景）
+//   - 对端从 WiFi 切到移动数据，出口 IP 从 58.253.240.119 变成 120.230.253.3
+//   - registerPeer 收到新的 pubIP 更新了 PubIP，但 UDPAddr 没更新（因为 oldIsLAN=true）
+//   - UDPAddr 永远是旧 LAN → 写包到旧 LAN 是黑洞
+//   - 结果：sendToPeer / ICMP 都走黑洞 → 永远收不到对端 UDP
+//   - 面板显示 TURN-A，但对端显示 p2p-B（单向 P2P）
+//
+// 修复：检测出口 IP 变化（oldPubIP != newPubIP），此时无条件把 UDPAddr 切到新公网地址。
+//
+// 效果：
+//   - B 从 WiFi 切到移动数据 → A 的 UDPAddr 自动切到 120.230.253.3:xxx
+//   - A 能通过 UDP 直连到 B → 收到 PONG via UDP 直连 → MarkP2P
+//   - 双向都显示 p2p，面板一致，延迟更低
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
 		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
@@ -1337,6 +1353,11 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 	_, existed := e.peers[peerID]
 	if existed {
 		p := e.peers[peerID]
+
+		// ★ P0 修复：出口 IP 变化检测必须在更新 PubIP 之前
+		oldPubIP := p.PubIP
+		pubIpChanged := oldPubIP != "" && pubIP != "" && oldPubIP != pubIP
+
 		if virtualIP != "" {
 			p.VirtualIP = virtualIP
 		}
@@ -1349,8 +1370,13 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 
 		if udpAddr != nil {
 			oldIsLAN := p.UDPAddr != nil && isPrivateIPv4(p.UDPAddr.IP)
-			if !oldIsLAN {
+			// ★ 出口 IP 变化时，无条件切到新公网地址（即使旧地址是 LAN）
+			if !oldIsLAN || pubIpChanged {
 				p.UDPAddr = udpAddr
+				if pubIpChanged {
+					log.Printf("[P2P] %s 出口 IP 变化 %s → %s，UDPAddr 切到新公网: %s",
+						peerID, oldPubIP, pubIP, udpAddr)
+				}
 			}
 		}
 
