@@ -151,6 +151,9 @@ type Edge struct {
 
 	lastMetadataReportAt int64
 
+	// ★ P0-3：最近一次真实数据帧发送时间（用于自适应保活）
+	lastDataFrameAt int64
+
 	streamMgr  *AppStreamManager
 	p2pStreams *P2PStreamManager
 	socks5Srv  *Socks5Server
@@ -193,6 +196,7 @@ func buildSTUNBindingRequest() []byte {
 	return buf
 }
 
+// ★ P0-3 自适应保活：最近 10s 有真实数据帧 → 跳过 STUN
 func (e *Edge) startKeepalive() {
 	if e.udpConn == nil {
 		return
@@ -209,11 +213,16 @@ func (e *Edge) startKeepalive() {
 		return
 	}
 
-	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器（无条件，保 CGNAT 映射）",
+	log.Printf("[Keepalive] 启动，每 %v 刷新 %d 个 STUN 服务器（自适应：有数据时跳过）",
 		keepaliveInterval, len(addrs))
 
 	safeGo("keepalive", func() {
 		sendOnce := func() {
+			// ★ 自适应：10s 内有数据帧 → 跳过（真实数据天然刷新映射）
+			last := atomic.LoadInt64(&e.lastDataFrameAt)
+			if last > 0 && time.Now().UnixMilli()-last < 10000 {
+				return
+			}
 			for _, addr := range addrs {
 				probe := buildSTUNBindingRequest()
 				_, _ = e.udpConn.WriteToUDP(probe, addr)
@@ -238,7 +247,6 @@ func (e *Edge) startKeepalive() {
 
 // ============ P2P 通道保活 + 活性检测 ============
 
-// ★ 修复：15s → 10s，60s → 30s
 const p2pKeepaliveInterval = 10 * time.Second
 const p2pIdleDeadMs = 30000
 
@@ -278,7 +286,6 @@ func (e *Edge) sendP2PKeepalive() {
 
 		if st == ConnP2P || st == ConnP2PAvailable {
 			idleMs := now - p.lastRecvAt
-			// ★ 60s → 30s
 			if p.lastRecvAt > 0 && idleMs > p2pIdleDeadMs {
 				deadPeers = append(deadPeers, id)
 				continue
@@ -290,7 +297,6 @@ func (e *Edge) sendP2PKeepalive() {
 	e.peersMu.RUnlock()
 
 	for _, id := range deadPeers {
-		// ★ 日志用常量，文案自动匹配（30s）
 		log.Printf("[P2P] %s %ds 无任何流量，判定 P2P 失效，强制降级",
 			id, p2pIdleDeadMs/1000)
 		e.relayMgr.ForceFallback(id, "no-traffic-30s")
@@ -1059,6 +1065,18 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 				log.Printf("[信令] 节点上线: %s (vip=%s)", from, pip)
 			}
 			e.logPeerReady(from)
+
+			// ★ P0-2 预连接：立即发一次 PING 试探（不等打洞指令）
+			if e.p2pStreams != nil && e.relayMgr != nil {
+				if e.relayMgr.GetState(from) != ConnP2P {
+					targetID := from
+					safeGo("p2p-preconnect", func() {
+						time.Sleep(200 * time.Millisecond)
+						e.p2pStreams.sendP2PProbe(targetID)
+						log.Printf("[P2P] 预连接试探 → %s", targetID)
+					})
+				}
+			}
 		}
 
 	case "nat_hole_instruction":
@@ -1248,9 +1266,6 @@ func (e *Edge) peerExists(peerID string) bool {
 	return ok
 }
 
-// registerPeer 注册/更新一个 peer。
-//
-// ★ 新建 peer 时优先用 LAN 初始化 UDPAddr（补丁 3）
 func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natType string, assisted, lanEndpoints []string) {
 	log.Printf("[registerPeer] %s: 收到 assisted=%d 个 %v lanEndpoints=%d 个 %v",
 		peerID, len(assisted), assisted, len(lanEndpoints), lanEndpoints)
@@ -1297,7 +1312,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 			p.LanEndpoints = sortedLAN
 		}
 	} else {
-		// ★ 补丁 3：新建 peer 时优先用 LAN 初始化 UDPAddr
 		var initialUDP *net.UDPAddr
 		if len(sortedLAN) > 0 {
 			for _, lan := range sortedLAN {
@@ -1330,9 +1344,6 @@ func (e *Edge) registerPeer(peerID, virtualIP, pubIP string, pubPort int, natTyp
 	}
 }
 
-// ensureTargetPeer 记录指令里的目标 peer 信息。
-//
-// ★ 新建 peer 时优先用 LAN 端点初始化 UDPAddr（补丁 3）
 func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 	if instr.TargetMac == "" {
 		return
@@ -1354,7 +1365,6 @@ func (e *Edge) ensureTargetPeer(instr *NatHoleInstruction) {
 			p.VirtualIP = instr.TargetVirtualIp
 		}
 	} else {
-		// ★ 补丁 3：优先使用 LAN 端点
 		var initialUDP *net.UDPAddr
 		if len(instr.TargetLanEndpoints) > 0 {
 			for _, lan := range instr.TargetLanEndpoints {
