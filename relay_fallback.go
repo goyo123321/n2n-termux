@@ -35,7 +35,7 @@ type RelayManager struct {
 	turnClient *TURNClient
 	edge       *Edge
 	states     map[string]ConnType
-	failCounts map[string]int // ★ 新增：UDP 连续发送失败计数
+	failCounts map[string]int
 }
 
 func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *RelayManager {
@@ -44,7 +44,7 @@ func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *Relay
 		turnClient: turnClient,
 		edge:       edge,
 		states:     make(map[string]ConnType),
-		failCounts: make(map[string]int), // ★ 初始化
+		failCounts: make(map[string]int),
 	}
 }
 
@@ -74,7 +74,7 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	}
 	prev := rm.states[peerId]
 	rm.states[peerId] = ConnP2P
-	delete(rm.failCounts, peerId) // ★ 重置失败计数
+	delete(rm.failCounts, peerId)
 	rm.mu.Unlock()
 
 	log.Printf("[连接] %s → P2P 直连（prev=%s，数据面已验证）", peerId, prev)
@@ -85,9 +85,6 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	}
 }
 
-// MarkFallback 常规降级路径。保护 P2PAvailable 状态。
-//
-// ★ 修复：3s → 10s（TCP 空闲连接更宽容）
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -115,7 +112,6 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 
 		if lastRecv > 0 {
 			idleMs := time.Now().UnixMilli() - lastRecv
-			// ★ 3s → 10s（TCP 空闲连接更宽容）
 			if idleMs < 10000 {
 				log.Printf("[连接] %s 最近 %dms 收到过 UDP 包，跳过降级", peerId, idleMs)
 				return
@@ -281,10 +277,7 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 
 // SendToPeer 按当前状态发送数据。
 //
-// ★ 修复：ConnP2P 分支加连续失败计数，连续 5 次失败才降级。
-//
-//	单次 WriteToUDP 失败通常是临时网络问题（ENOBUFS、瞬时路由），
-//	不应该立即降级到 TURN/WS。5 次失败才认为通道真的坏了。
+// ★ P0 修复：ConnP2P 分支加 selfIsOnTargetLAN 判断
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -301,8 +294,9 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 
 		sent := false
 
-		// LAN 优先
-		if target.UDPAddr != nil &&
+		selfOnLAN := rm.edge.selfIsOnTargetLAN(target)
+
+		if selfOnLAN && target.UDPAddr != nil &&
 			!isPrivateIPv4(target.UDPAddr.IP) &&
 			len(target.LanEndpoints) > 0 {
 			for _, lan := range target.LanEndpoints {
@@ -317,35 +311,38 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 			}
 		}
 
-		// UDPAddr
 		if !sent && target.UDPAddr != nil {
-			if _, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr); err == nil {
-				sent = true
-			} else {
-				log.Printf("[P2P] UDP 发送到 %s 失败: %v", peerId, err)
+			skip := false
+			if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
+				skip = true
+				log.Printf("[P2P] %s UDPAddr=%s 是私网且本机不在该 LAN，跳过（避免黑洞）",
+					peerId, target.UDPAddr)
+			}
+			if !skip {
+				if _, err := rm.edge.udpConn.WriteToUDP(data, target.UDPAddr); err == nil {
+					sent = true
+				} else {
+					log.Printf("[P2P] UDP 发送到 %s 失败: %v", peerId, err)
+				}
 			}
 		}
 
 		if sent {
-			// ★ 成功：重置失败计数
 			rm.mu.Lock()
 			delete(rm.failCounts, peerId)
 			rm.mu.Unlock()
 			return true
 		}
 
-		// ★ 失败：累积计数，连续 5 次才降级
 		rm.mu.Lock()
 		rm.failCounts[peerId]++
 		fc := rm.failCounts[peerId]
 		rm.mu.Unlock()
 
 		if fc < 5 {
-			// 5 次以内：静默失败，下个包再试
 			return false
 		}
 
-		// 5 次以上：真降级
 		rm.mu.Lock()
 		delete(rm.failCounts, peerId)
 		rm.mu.Unlock()
