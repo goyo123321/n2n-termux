@@ -45,7 +45,9 @@
 - **自动 TLS 证书** — 内置 Termux CA 证书探测，彻底解决 `x509: unknown authority` 报错
 - **自动 URL 补全** — `install.sh` 检测漏写 `wss://` 会自动补全
 - **四级降级** — `LAN → P2P → TURN → WS`，连接永远可用
-- **N2NW 二进制** — WS 中继数据面用二进制帧，比 base64 省 33% 带宽
+- **N2NW / N2NA 二进制** — WS 中继数据面用二进制帧，比 base64 省 ~27% 带宽
+- **协议能力协商** — 上报 `features=["n2na","n2nw"]`，服务端自动协商帧格式，**混合房间零丢包**
+- **单向 P2P 自动降级** — 与 PC/Android 一致，只收到 PING 而收不到 PONG 时 60 秒后自动降级到 TURN/WS
 - **轻量无依赖** — 纯 Go 标准库，无需 gVisor，编译仅需 2 秒，二进制 ~10MB
 - **UDP 保活** — 每 5 秒刷新 STUN 映射，防止 CGNAT 端口漂移
 - **P2P 通道保活** — 每 15 秒往对端发 N2NS PING 多目标探针
@@ -56,7 +58,7 @@
 
 ## 📂 安装路径（默认当前目录）
 
-**从 v1.2.1 起，安装目录默认是「当前工作目录下的 `.n2n-termux`」**，不再是 `~/.n2n-termux`。
+**从 v1.1.21 起，安装目录默认是「当前工作目录下的 `.n2n-termux`」**，不再是 `~/.n2n-termux`。
 
 | 用户在哪个目录运行 `install.sh` | 实际安装到 |
 |:---|:---|
@@ -328,9 +330,9 @@ Termux 从 v1.2.1 起与 PC/Android 完全对齐，`Edge` 的 8 个 `UDPAddr` �
 
 ---
 
-## 🔌 N2NW 二进制传输
+## 🔌 N2NW / N2NA 二进制传输
 
-WS 中继数据面使用 **N2NW 二进制帧**（6 字节头 + peerId + 裸 IPv4 包），而非 base64 编码：
+WS 中继数据面使用两套二进制帧：
 
 | 通道 | 帧格式 | 说明 |
 |:---|:---|:---|
@@ -338,10 +340,13 @@ WS 中继数据面使用 **N2NW 二进制帧**（6 字节头 + peerId + 裸 IPv4
 | UDP TURN | 裸 IPv4 | TURN relay 封装 |
 | UDP N2NS | N2NS（21B 头）| P2P TCP stream + PING/PONG |
 | UDP N2NP/N2NA | 4B magic | 打洞握手 |
-| **WS 二进制 N2NW** | **6B 头 + peerId + IPv4** | WS 中继数据面 |
-| WS 文本 app_stream_* | base64 JSON | SOCKS5 TCP 隧道（保持不变） |
+| **WS 二进制 N2NW** | **6B 头 + peerId + IPv4** | WS 中继 IPv4 数据面 |
+| **WS 二进制 N2NA** | **7B 头 + peerId + streamId + TCP 字节** | WS 中继 app_stream 数据面（新增） |
+| WS 文本 app_stream_* | base64 JSON | 旧协议（自动降级时使用） |
 
-**帧格式**：
+**服务端按目标端 `features` 自动协商**：目标支持 `n2na` 走二进制，否则降级到文本。旧客户端完全兼容。
+
+### N2NW 帧格式
 
 ```
   0    1    2    3    4     5      6..6+N        6+N..
@@ -352,7 +357,95 @@ WS 中继数据面使用 **N2NW 二进制帧**（6 字节头 + peerId + 裸 IPv4
    服务端→客户端: peerId = 发送方 clientId（服务端重写）
 ```
 
-**⚠️ 兼容性**：三端客户端和 edge-signal 服务端**必须同步升级**。旧服务端遇到 N2NW magic 会静默丢弃，WS 中继数据面不通。
+### N2NA 帧格式
+
+```
+  0    1    2    3    4     5      6..6+N      6+N      7+N..7+N+M      7+N+M..
+┌────┬────┬────┬────┬─────┬──────┬─────────────┬───────┬──────────────┬────────────┐
+│ 'N'│ '2'│ 'N'│ 'A'│flags│len(N)│ peerId(NB)  │len(M) │ streamId(MB) │ TCP 字节   │
+└────┴────┴────┴────┴─────┴──────┴─────────────┴───────┴──────────────┴────────────┘
+   客户端→服务端: peerId = 目标 clientId
+   服务端→客户端: peerId = 发送方 clientId（服务端重写）
+```
+
+---
+
+## 🔌 协议能力协商（features）
+
+Termux 在 `p2p_metadata` 中上报 `features=["n2na","n2nw"]`，服务端据此决定 WS 中继的帧格式。
+
+### 混合房间行为
+
+服务端按**目标端**是否支持 `n2na` 决定：
+
+| 发送方 | 接收方 | 服务端行为 |
+|:---|:---|:---|
+| 新 | 新 | 二进制转发（N2NA，节省 ~27% 带宽） |
+| 新 | 旧 | 解码转 `app_stream_data` 文本 |
+| 旧 | 新 | 文本（新客户端兼容） |
+| 旧 | 旧 | 文本 |
+
+**零丢包**——新旧客户端可在同一房间通信，服务端自动协商。
+
+### 向后兼容保证
+
+- 旧客户端不上报 `features` → 服务端视为 `[]` → 全走文本降级，**行为与升级前完全一致**
+- 服务端**不需要等待任何客户端先升级**——部署后即生效
+- 新旧客户端可以在同一房间共存，互不影响
+
+### 验证 features 上报
+
+```bash
+curl -s "https://<worker>/api/admin/status/<room>?token=<ADMIN_TOKEN>" | jq '.peers[] | {code, features}'
+```
+
+新客户端返回 `["n2na","n2nw"]`，旧客户端返回 `[]`。
+
+---
+
+## 🆕 版本行为变化说明
+
+### 端口漂移保留 P2P 状态（P0 修复）
+
+**行为变化**：从最新版本起，**只有出口 IP 变化时才清空连接状态**，端口漂移（HardNAT 常见）时保留 P2P 状态。
+
+**为什么改**：
+
+旧版 Termux（与 PC 一致）在收到 `joined`/`ready` 时，只要 `pubSocket` 变化就无条件 `ClearPeer`。HardNAT 下端口漂移频繁，导致每次 `joined`/`ready` 都清空 P2P 状态，P2P 通道反复断开重连。
+
+**新行为**（与服务端 `room.ts`、Android 端对齐）：
+
+- **IP 变化** → 清空连接状态，重新打洞
+- **仅端口漂移** → 保留 P2P 状态，P2P 通道通常仍可用
+
+**日志表现**：
+
+```
+[NAT-HOLE] xxx 出口 IP 变化 1.2.3.4 → 5.6.7.8，清空连接状态 (was=1)
+[NAT-HOLE] xxx 端口漂移 1.2.3.4:5000 → 1.2.3.4:5001，保留 P2P 状态 (was=0)
+```
+
+### 重连清理更彻底（P1 修复）
+
+**行为变化**：WS 重连成功后，除了清理 `failCounts`，还会清理 `natHoleActive` 中的 in-flight 标记。
+
+**为什么改**：旧版重连后，残留的 `targetMac@rung` 标记会导致后续打洞指令被误判为“已在处理中”而跳过，直到该标记因超时被清除。
+
+**新行为**：重连时同时清空 `failCounts` 和 `natHoleActive`，重连后打洞指令立即正常执行。
+
+**日志表现**：
+
+```
+[NAT-HOLE] WS 重连，清空 2 个失败计数 / 1 个 in-flight 标记
+```
+
+### `_reconnected` 消息真正触发（P1 修复）
+
+**行为变化**：WS 重连成功后，客户端会显式发送 `_reconnected` 消息，触发 `handleSignaling` 里的完整清理逻辑。
+
+**为什么改**：旧版 `ws_transport.go` 重连成功后只调用 `onReconnect` 回调，**不发送 `_reconnected` 消息**，导致 `handleSignaling` 里的 `if t == "_reconnected"` 分支永远是死代码。
+
+**新行为**：重连成功后调用 `ws.routeText({type:"_reconnected"})`，触发完整的清理流程（与 `onReconnect` 幂等）。
 
 ---
 
@@ -371,6 +464,7 @@ n2n-termux dev 启动
 已连接信令，Client ID: termux-a，节点名: My-Termux
 分配虚拟 IP: 10.64.0.2（网段 10.64.0.0/24）
 [NAT] 上报 LAN 地址: [192.168.10.10:54321]
+[信令] 上报 p2p_metadata: natType=HardNAT publicEndpoint="x.x.x.x:19190" multiExit=true assisted=2 lan=1 features=[n2na,n2nw]
 [Keepalive] 启动，每 5s 刷新 3 个 STUN 服务器
 [P2P-Keepalive] 启动，每 15s 刷新 P2P 通道
 [SOCKS5] 监听 127.0.0.1:1080（用 curl --socks5 或 ALL_PROXY 访问虚拟 IP）
@@ -394,6 +488,7 @@ n2n-termux dev 启动
 | `[SOCKS5] 监听 127.0.0.1:1080` | **Termux 独有**（不是 PC 版） |
 | `[FWD] 已启动` | Packet Forwarder 启动 |
 | `[WS] 连接 wss://...` | URL 带了 wss://（不是 `malformed`） |
+| `[信令] 上报 p2p_metadata: ... features=[n2na,n2nw]` | 能力上报成功 |
 | `[P2P] xxx 新建 peer，初始 UDPAddr 用 LAN: ...` | LAN 优先生效 |
 
 ---
@@ -629,6 +724,40 @@ fi
 ```
 
 所以从任意目录调用都能正确找到 `config.env` 和 `n2n-termux`。
+
+### Q: 混合房间（新旧客户端共存）会丢数据吗？
+
+**不会**。
+
+服务端按目标端 `features` 自动协商：
+
+| 发送方 | 接收方 | 数据面 |
+|:---|:---|:---|
+| 新 Termux | 新 PC / 新 Android | N2NA 二进制 |
+| 新 Termux | 旧客户端 | 文本 `app_stream_data` |
+| 旧客户端 | 新 Termux | 文本（新 Termux 兼容） |
+
+**旧客户端完全无感知**，新 Termux 自动获得二进制优化。
+
+### Q: 管理面板为什么显示 `无能力上报`？
+
+**旧客户端**（升级 features 之前的版本）不上报 `features` 字段。
+
+- **不影响功能**：服务端自动降级到文本 `app_stream_data`，连接正常
+- **升级后消失**：升级到最新版本后，管理面板会显示 `n2na` / `n2nw` chips
+
+### Q: 单向 P2P 场景（A→B 通，B→A 断）会怎样？
+
+**Termux 与 PC 一致：保持 P2PAvailable，60 秒后自动降级到 TURN/WS，不会卡在 P2P 丢包。**
+
+**原因**：Termux 收到 PING 只更新活跃时间，**只有收到 PONG 或数据帧才升级 P2P**。单向 P2P 场景下保持 `ConnP2PAvailable`，60 秒后 `scheduleP2PAvailTimeout` 触发 `ForceFallback`。
+
+**日志表现**：
+
+```
+[P2P] 收到 PONG → P2P 直连（双向通道已验证）    ← 正常
+[P2P] xxx P2PAvailable 超时 60s 未验证数据面，强制降级   ← 单向 P2P
+```
 
 ---
 
