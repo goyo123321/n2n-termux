@@ -581,7 +581,6 @@ func main() {
 		edge.p2pAvailTimers = make(map[string]*time.Timer)
 		edge.p2pAvailTimersMu.Unlock()
 
-		// ★ P1 修复：同时清空 failCounts 和 natHoleActive
 		natHoleActiveMu.Lock()
 		failCount := len(failCounts)
 		if failCount > 0 {
@@ -631,7 +630,6 @@ func main() {
 	edge.relayMgr = NewRelayManager(ws, edge.turnClient, edge)
 	edge.relayMgr.Report(10 * time.Second)
 
-	// ★ 二进制拦截：N2NW（IPv4 数据面）+ N2NA（app_stream 二进制数据面）
 	ws.SetHandlers(
 		edge.handleSignaling,
 		func(data []byte) {
@@ -916,7 +914,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	if t == "_reconnected" {
 		log.Printf("[信令] WebSocket 重连成功，重新上报元数据")
 
-		// ★ P1 修复：同时清空 failCounts 和 natHoleActive
 		natHoleActiveMu.Lock()
 		count := len(failCounts)
 		if count > 0 {
@@ -1235,11 +1232,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	}
 }
 
-// ★ P0 修复：maybeResetFailCountForPeer 只在 IP 变化时清空连接状态
-//
-// 与 n2n-go-client / Android / 服务端 room.ts 的行为对齐：
-//   - IP 变化（可能换了网络环境）→ 清空连接状态，重新打洞
-//   - 仅端口漂移（CGNAT 常见）→ 保留 P2P 状态，P2P 通道通常仍可用
 func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort int) {
 	if peerID == "" || newPubIP == "" || newPubPort <= 0 {
 		return
@@ -1520,6 +1512,29 @@ func (e *Edge) reportP2PStatus(peerID string, status int) {
 			},
 		},
 	})
+}
+
+// ★ P0 修复：selfIsOnTargetLAN 判断本机是否在 target 的 LAN 上
+func (e *Edge) selfIsOnTargetLAN(target *PeerInfo) bool {
+	if target == nil || len(target.LanEndpoints) == 0 {
+		return false
+	}
+	myPrefixes := localPrefixes(e.getVirtualIPLocked())
+	if len(myPrefixes) == 0 {
+		return false
+	}
+	for _, lan := range target.LanEndpoints {
+		ra, err := net.ResolveUDPAddr("udp", lan)
+		if err != nil || ra == nil || ra.IP == nil {
+			continue
+		}
+		for _, p := range myPrefixes {
+			if p.Contains(ra.IP) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ============ peer 探测处理 ============
