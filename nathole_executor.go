@@ -170,11 +170,16 @@ func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 
 	e.peersMu.RLock()
 	var pLan, pAssisted []string
+	var pUDPAddr *net.UDPAddr
+	var pLastRecv int64
 	if p := e.peers[instr.TargetMac]; p != nil {
 		pLan = p.LanEndpoints
 		pAssisted = p.AssistedEndpoints
+		pUDPAddr = p.UDPAddr
+		pLastRecv = p.lastRecvAt
 	}
 	e.peersMu.RUnlock()
+
 	log.Printf("[collectScanTargets] target=%s p.Lan=%v p.Assisted=%v instr.TargetLan=%v instr.TargetAssisted=%v TargetPubSocket=%q",
 		instr.TargetMac, pLan, pAssisted, instr.TargetLanEndpoints, instr.TargetAssistedEndpoints, instr.TargetPubSocket)
 
@@ -184,11 +189,9 @@ func (e *Edge) collectScanTargets(instr *NatHoleInstruction) []*net.UDPAddr {
 		}
 	}
 
-	e.peersMu.RLock()
-	if p := e.peers[instr.TargetMac]; p != nil && p.UDPAddr != nil && p.lastRecvAt > 0 {
-		raw = append(raw, &net.UDPAddr{IP: p.UDPAddr.IP, Port: p.UDPAddr.Port})
+	if pUDPAddr != nil && pLastRecv > 0 {
+		raw = append(raw, &net.UDPAddr{IP: pUDPAddr.IP, Port: pUDPAddr.Port})
 	}
-	e.peersMu.RUnlock()
 
 	for _, ep := range instr.TargetAssistedEndpoints {
 		if addr := parseSockAddr(ep); addr != nil {
@@ -229,16 +232,20 @@ func (e *Edge) executeNatHole(instr *NatHoleInstruction) *PunchResult {
 		log.Printf("[NAT-HOLE] 跳过指令 target=%s（已连续失败 %d 次）", instr.TargetMac, fc)
 		return nil
 	}
-	if natHoleActive[instr.TargetMac] {
+
+	// ★ P0-1 打洞并行化：去重 key 用 target@rung
+	activeKey := fmt.Sprintf("%s@%d", instr.TargetMac, instr.BehaviorIndex)
+	if natHoleActive[activeKey] {
 		natHoleActiveMu.Unlock()
-		log.Printf("[NAT-HOLE] 跳过重复指令 target=%s（已在处理中）", instr.TargetMac)
+		log.Printf("[NAT-HOLE] 跳过重复指令 target=%s rung=%d（已在处理中）",
+			instr.TargetMac, instr.BehaviorIndex)
 		return nil
 	}
-	natHoleActive[instr.TargetMac] = true
+	natHoleActive[activeKey] = true
 	natHoleActiveMu.Unlock()
 	defer func() {
 		natHoleActiveMu.Lock()
-		delete(natHoleActive, instr.TargetMac)
+		delete(natHoleActive, activeKey)
 		natHoleActiveMu.Unlock()
 	}()
 
@@ -449,11 +456,6 @@ func (e *Edge) resetFailCount(peerID string) {
 	natHoleActiveMu.Unlock()
 }
 
-// recordP2PSuccess 打洞成功时更新 peer 地址。
-//
-// ★ LAN 优先保护
-//
-// ★★ 适配（本次修复）：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
 func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAddr) {
 	e.peersMu.Lock()
 	if p, ok := e.peers[instr.TargetMac]; ok {
@@ -467,7 +469,6 @@ func (e *Edge) recordP2PSuccess(instr *NatHoleInstruction, targetAddr *net.UDPAd
 		} else if !oldIsLAN && newIsLAN {
 			shouldUpdate = true
 		} else if oldIsLAN && !newIsLAN {
-			// ★★ 适配：5 分钟 → 30 秒
 			if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 30000 {
 				shouldUpdate = true
 			}
