@@ -894,23 +894,12 @@ func (s *P2PStream) close(reason string) {
 }
 
 // ============ N2NW / N2NA 二进制帧（WS 中继数据面） ============
-//
-// 两套二进制协议：
-//   - N2NW（flags=0）：IPv4 数据面，服务端按目标 peer 直接转发裸 IPv4 包
-//   - N2NA：app_stream 数据面，服务端按 streamId 转发 TCP 字节流
-//
-// handleAppStreamBinary 是 WS 二进制的统一入口：
-//   1. 先判 N2NA（app_stream 二进制）→ 交给 handleN2NAFrame
-//   2. 再判 N2NW（IPv4 数据面）→ 提取 senderID 后送 packet_forwarder
-//   3. 其他 → 丢弃
 
 const (
 	n2nwHdrMin  = 6
 	n2nwPeerMax = 255
 )
 
-// buildN2NWFrame 构造 N2NW 帧。targetID 是目标 peer 的 clientId，
-// 服务端会把它重写为发送方 ID 后再转发给对端。
 func buildN2NWFrame(targetID string, payload []byte) []byte {
 	idBytes := []byte(targetID)
 	if len(idBytes) > n2nwPeerMax {
@@ -921,7 +910,7 @@ func buildN2NWFrame(targetID string, payload []byte) []byte {
 	frame[1] = '2'
 	frame[2] = 'N'
 	frame[3] = 'W'
-	frame[4] = 0 // flags
+	frame[4] = 0
 	frame[5] = byte(len(idBytes))
 	copy(frame[n2nwHdrMin:], idBytes)
 	copy(frame[n2nwHdrMin+len(idBytes):], payload)
@@ -930,15 +919,16 @@ func buildN2NWFrame(targetID string, payload []byte) []byte {
 
 // handleAppStreamBinary 处理服务端转发来的 WS 二进制帧。
 //
-// ★ 先判 N2NA（app_stream 二进制），再判 N2NW（IPv4 数据面）。
+// ★ Termux 特有：N2NW 的 IPv4 payload 交给 packet_forwarder.HandlePacket，
+//   由 packet_forwarder 在用户态解析 IP/TCP/UDP/ICMP 头，转发到 127.0.0.1。
 func (e *Edge) handleAppStreamBinary(data []byte) {
-	// ★ N2NA 分支（app_stream 二进制数据面）
+	// ★ N2NA 分支
 	if isN2NAFrame(data) {
 		e.handleN2NAFrame(data)
 		return
 	}
 
-	// N2NW 分支（IPv4 数据面，原有逻辑）
+	// N2NW 分支
 	if len(data) < n2nwHdrMin {
 		return
 	}
@@ -958,17 +948,15 @@ func (e *Edge) handleAppStreamBinary(data []byte) {
 	senderID := string(data[n2nwHdrMin : n2nwHdrMin+peerLen])
 	payload := data[n2nwHdrMin+peerLen:]
 	if len(payload) < 20 || payload[0]>>4 != 4 {
-		// 当前 flags=0 只承诺 IPv4 payload；未来扩展走 flags
 		log.Printf("[WS-BIN] %s → 非 IPv4 payload (len=%d flags=%d)",
 			senderID, len(payload), flags)
 		return
 	}
 
 	// 更新发送方 peer 的活跃时间
-	//
 	// 用途：
-	//   - P2P 空闲检测（sendP2PKeepalive 里的 30s p2pIdleDeadMs）   ← P3 修复：60s → 30s
-	//   - MarkFallback 的 10 秒保护（relay_fallback.go）              ← P3 修复：3 秒 → 10 秒
+	//   - P2P 空闲检测（sendP2PKeepalive 里的 30s p2pIdleDeadMs）
+	//   - MarkFallback 的 10 秒保护（relay_fallback.go）
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
 	if p, ok := e.peers[senderID]; ok {
@@ -976,8 +964,7 @@ func (e *Edge) handleAppStreamBinary(data []byte) {
 	}
 	e.peersMu.Unlock()
 
-	// Termux 无 TUN，走 packet_forwarder 转发到 127.0.0.1
-	// HandlePacket 内部会校验 dstIP == 本机 VIP，安全
+	// ★ Termux 特有：走 packet_forwarder 而非 TUN
 	if e.pktFwd != nil {
 		e.pktFwd.HandlePacket(payload)
 	}
