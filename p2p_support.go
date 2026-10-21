@@ -67,9 +67,18 @@ func (e *Edge) peerAddrAndMode(peerID string) (*net.UDPAddr, bool) {
 
 // handleP2PFrame 收到 N2NS 帧时的入口。
 //
-// ★ LAN 优先 + 30 秒窗口 + lastLANRecvAt > 0 检查
+// ★ P0 修复：PING/PONG 状态机（与 PC / Android 对齐）
 //
-// ★★ 适配（本次修复）：LAN→公网切换窗口 300000（5 分钟）→ 30000（30 秒）。
+// 新行为：
+//   - 收到 PING → 只更新 lastRecvAt（由调用方已完成），不升级、不回 PONG
+//   - 收到 PONG → 升级 P2P（证明双向可达）
+//   - 收到数据帧 → 升级 P2P（数据面已验证）
+//
+// ★ P1 修复：区分 PONG / 数据帧的 viaTURN 来源
+//
+//   - viaTURN=false 的 PONG → MarkP2P（真 P2P）
+//   - viaTURN=true  的 PONG → 保持 P2PAvailable（不标记 P2P），
+//                        让 60s 超时自然降级到 TURN
 func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) {
 	if e.p2pStreams == nil {
 		return
@@ -100,7 +109,6 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 				shouldUpdate = true
 				p.lastLANRecvAt = now
 			} else if oldIsLAN && !newIsLAN {
-				// ★★ 适配：5 分钟 → 30 秒
 				if p.lastLANRecvAt > 0 && now-p.lastLANRecvAt > 30000 {
 					shouldUpdate = true
 					log.Printf("[P2P] %s LAN 地址超过 30s 无流量，改用公网地址", peerID)
@@ -124,19 +132,33 @@ func (e *Edge) handleP2PFrame(peerAddr *net.UDPAddr, viaTURN bool, data []byte) 
 		e.peersMu.Unlock()
 	}
 
+	// ★ P0 + P1 修复：区分 viaTURN 来源
 	if e.relayMgr != nil {
 		switch f.Type {
 		case p2pTypePING:
+			// 静默：只更新 lastRecvAt（上方已完成）
+			// PONG 由 p2pStreams.handleFrame 统一回复
+
 		case p2pTypePONG:
 			if e.relayMgr.GetState(peerID) != ConnP2P {
-				log.Printf("[P2P] 收到 PONG → P2P 直连（双向通道已验证）")
-				e.relayMgr.MarkP2P(peerID)
+				if !viaTURN {
+					log.Printf("[P2P] 收到 PONG（UDP 直连）→ P2P 直连（双向通道已验证）")
+					e.relayMgr.MarkP2P(peerID)
+				} else {
+					log.Printf("[TURN] 通过 TURN 收到 PONG → 保持 P2PAvailable（不标记 P2P，等待直连 PONG）")
+				}
 			}
+
 		default:
 			if e.relayMgr.GetState(peerID) != ConnP2P {
-				log.Printf("[P2P] 收到数据帧（stream=%d type=%d）→ P2P 直连",
-					f.StreamID, f.Type)
-				e.relayMgr.MarkP2P(peerID)
+				if !viaTURN {
+					log.Printf("[P2P] 收到数据帧（stream=%d type=%d）→ P2P 直连",
+						f.StreamID, f.Type)
+					e.relayMgr.MarkP2P(peerID)
+				} else {
+					log.Printf("[TURN] 通过 TURN 收到数据帧（stream=%d type=%d）→ 保持当前状态",
+						f.StreamID, f.Type)
+				}
 			}
 		}
 	}
