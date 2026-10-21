@@ -154,6 +154,10 @@ type Edge struct {
 	// ★ P0-3：最近一次真实数据帧发送时间（用于自适应保活）
 	lastDataFrameAt int64
 
+	// ★ Bug 2 修复：已上报 P2P 状态的目标（避免并行指令重复上报 p2p_status=3）
+	p2pStatusReported   map[string]bool
+	p2pStatusReportedMu sync.Mutex
+
 	streamMgr  *AppStreamManager
 	p2pStreams *P2PStreamManager
 	socks5Srv  *Socks5Server
@@ -393,7 +397,6 @@ func (e *Edge) cancelFallbackTimer(peerID string) {
 	}
 }
 
-// ★ 修复：30s → 60s（给 TCP 更多验证时间）
 func (e *Edge) scheduleP2PAvailTimeout(peerID string) {
 	if e.relayMgr == nil || peerID == "" {
 		return
@@ -497,17 +500,18 @@ func main() {
 	}
 
 	edge := &Edge{
-		clientId:       clientId,
-		nodeName:       nodeName,
-		roomId:         roomId,
-		virtualCIDR:    DefaultVirtualCIDR,
-		peers:          make(map[string]*PeerInfo),
-		udpPort:        udpPort,
-		fallbackTimers: make(map[string]*time.Timer),
-		p2pAvailTimers: make(map[string]*time.Timer),
-		lastNoPeerLog:  make(map[string]int64),
-		tunStateLog:    make(map[string]ConnType),
-		doneCh:         make(chan struct{}),
+		clientId:          clientId,
+		nodeName:          nodeName,
+		roomId:            roomId,
+		virtualCIDR:       DefaultVirtualCIDR,
+		peers:             make(map[string]*PeerInfo),
+		udpPort:           udpPort,
+		fallbackTimers:    make(map[string]*time.Timer),
+		p2pAvailTimers:    make(map[string]*time.Timer),
+		lastNoPeerLog:     make(map[string]int64),
+		tunStateLog:       make(map[string]ConnType),
+		p2pStatusReported: make(map[string]bool), // ★ Bug 2 修复
+		doneCh:            make(chan struct{}),
 	}
 	edge.punchAckLimiter = newPunchAckLimiter()
 	edge.streamMgr = NewAppStreamManager()
@@ -568,6 +572,11 @@ func main() {
 		if edge.streamMgr != nil {
 			edge.streamMgr.closeAll()
 		}
+
+		// ★ Bug 2 修复：清空去重标记
+		edge.p2pStatusReportedMu.Lock()
+		edge.p2pStatusReported = make(map[string]bool)
+		edge.p2pStatusReportedMu.Unlock()
 
 		edge.p2pAvailTimersMu.Lock()
 		for _, t := range edge.p2pAvailTimers {
@@ -692,6 +701,9 @@ func main() {
 	edge.socks5Srv = NewSocks5Server(edge, socks5Listen)
 	safeGo("socks5-server", func() { edge.socks5Srv.Serve() })
 
+	// ============================================================
+	// ★ nat-probe：STUN 探测完成后合并端点（Bug 1 修复）
+	// ============================================================
 	safeGo("turn-init", func() {
 		time.Sleep(2 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -924,6 +936,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		if e.streamMgr != nil {
 			e.streamMgr.closeAll()
 		}
+
+		// ★ Bug 2 修复：清空去重标记
+		e.p2pStatusReportedMu.Lock()
+		e.p2pStatusReported = make(map[string]bool)
+		e.p2pStatusReportedMu.Unlock()
 
 		e.reportMetadata()
 		return
@@ -1163,6 +1180,11 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 		e.cancelP2PAvailTimeout(from)
+
+		// ★ Bug 2 修复：清理去重标记
+		e.p2pStatusReportedMu.Lock()
+		delete(e.p2pStatusReported, from)
+		e.p2pStatusReportedMu.Unlock()
 
 		natHoleActiveMu.Lock()
 		delete(failCounts, from)
@@ -1430,10 +1452,25 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
+// reportP2PStatus 上报 P2P 状态。
+//
+// ★ Bug 2 修复：同一 peer 只上报一次（避免并行打洞导致重复）。
+//   - 首次调用：发消息 + 标记 reported
+//   - 后续调用：跳过（除非 left 后重新清理）
 func (e *Edge) reportP2PStatus(peerID string, status int) {
 	if e.ws == nil || peerID == "" {
 		return
 	}
+
+	// ★ 去重：同一 peer 只上报一次
+	e.p2pStatusReportedMu.Lock()
+	if e.p2pStatusReported[peerID] {
+		e.p2pStatusReportedMu.Unlock()
+		return
+	}
+	e.p2pStatusReported[peerID] = true
+	e.p2pStatusReportedMu.Unlock()
+
 	_ = e.ws.Send(map[string]interface{}{
 		"type": "p2p_state_info",
 		"payload": map[string]interface{}{
