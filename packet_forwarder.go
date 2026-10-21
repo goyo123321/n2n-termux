@@ -593,11 +593,17 @@ func (f *PacketForwarder) sendTCPInternal(
 	f.sendToPeer(clientIP4, pkt)
 }
 
-// ============================================================
-// ★ P0-3：sendToPeer 更新 lastDataFrameAt
-//   - ICMP / TCP / UDP 的所有成功发送路径都更新
-//   - startKeepalive 会检查该字段，10s 内有数据就跳过 STUN
-// ============================================================
+// ★ P0 修复：sendToPeer 的 ICMP 分支加 selfIsOnTargetLAN 判断
+//
+// 旧版问题：WriteToUDP 返回 nil 只表示"写到本地 socket"，不表示"对方收到"。
+// 跨网络场景下，target.LanEndpoints 是旧 LAN 地址（对端已切走），
+// 写进去就是黑洞，ping 100% 丢包。
+//
+// 新版逻辑：
+//   1. LAN 优先：只有本机也在 target 的 LAN 上才走
+//   2. UDPAddr：只有不是"本机不可达的私网"时才写
+//   3. TURN 兜底（必做）
+//   4. WS 兜底（必做）
 func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 	if f.edge == nil {
 		return
@@ -620,10 +626,11 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 
 	isICMP := len(pkt) >= 10 && pkt[9] == protoICMP
 
-	// ICMP：绕过状态机，LAN → UDPAddr → TURN → WS
 	if isICMP {
-		// 1. LAN 优先
-		if len(target.LanEndpoints) > 0 && f.edge.udpConn != nil {
+		selfOnLAN := f.edge.selfIsOnTargetLAN(target)
+
+		// 1. LAN 优先：只有本机也在该 LAN 上
+		if selfOnLAN && len(target.LanEndpoints) > 0 && f.edge.udpConn != nil {
 			for _, lan := range target.LanEndpoints {
 				ra, err := net.ResolveUDPAddr("udp", lan)
 				if err != nil || ra == nil || ra.IP == nil {
@@ -636,11 +643,19 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 			}
 		}
 
-		// 2. UDPAddr
+		// 2. UDPAddr：只有不是"本机不可达的私网"时，才写
 		if target.UDPAddr != nil && f.edge.udpConn != nil {
-			if _, err := f.edge.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
-				atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
-				return
+			skip := false
+			if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
+				skip = true
+				log.Printf("[FWD-ICMP] %s UDPAddr=%s 是私网且本机不在该 LAN，跳过（避免黑洞）",
+					target.ClientID, target.UDPAddr)
+			}
+			if !skip {
+				if _, err := f.edge.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
+					atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+					return
+				}
 			}
 		}
 
@@ -655,7 +670,7 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 			}
 		}
 
-		// 4. WS 中继
+		// 4. WS 兜底（ICMP 走 WS 中继，牺牲延迟换可靠）
 		if f.edge.ws != nil {
 			frame := buildN2NWFrame(target.ClientID, pkt)
 			_ = f.edge.ws.SendBinary(frame)
