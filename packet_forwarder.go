@@ -1,21 +1,12 @@
 package main
 
-// 轻量 IP 包转发器：TCP 中继 + UDP 转发 + ICMP 响应。
-//
-// 能力：
-//   ✅ PC/Android → Termux 的 TCP（中继到 127.0.0.1:port）
-//   ✅ PC/Android → Termux 的 UDP（转发到 127.0.0.1:port）
-//   ✅ PC/Android → Termux 的 ICMP Echo Request（响应 ping）
-//   ❌ Termux 主动发起 UDP/ICMP（无 root）
-//
-// 依赖：无（纯 Go 标准库）
-
 import (
 	"encoding/binary"
 	"log"
 	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,20 +18,16 @@ const (
 	tcpDialTimeout   = 5 * time.Second
 	tcpRcvWindow     = 65535
 
-	// TCP flags
 	tcpFlagFIN = 0x01
 	tcpFlagSYN = 0x02
 	tcpFlagRST = 0x04
 	tcpFlagPSH = 0x08
 	tcpFlagACK = 0x10
 
-	// IP 协议号
 	protoICMP = 1
 	protoTCP  = 6
 	protoUDP  = 17
 )
-
-// ============ UDP NAT ============
 
 type udpNATKey struct {
 	srcIP   [4]byte
@@ -55,8 +42,6 @@ type udpNATEntry struct {
 	remotePort uint16
 	localPort  uint16
 }
-
-// ============ TCP 连接 ============
 
 type tcpConnKey struct {
 	clientIP   [4]byte
@@ -80,8 +65,6 @@ type tcpConn struct {
 	mu sync.Mutex
 }
 
-// ============ PacketForwarder ============
-
 type PacketForwarder struct {
 	edge    *Edge
 	mu      sync.Mutex
@@ -103,7 +86,6 @@ func NewPacketForwarder(edge *Edge) *PacketForwarder {
 	return f
 }
 
-// HandlePacket 是入口。
 func (f *PacketForwarder) HandlePacket(pkt []byte) {
 	if len(pkt) < 20 || pkt[0]>>4 != 4 {
 		return
@@ -132,9 +114,7 @@ func (f *PacketForwarder) HandlePacket(pkt []byte) {
 	}
 }
 
-// ============================================================
-// UDP
-// ============================================================
+// ============ UDP ============
 
 func (f *PacketForwarder) handleUDP(pkt []byte) {
 	ihl := int(pkt[0]&0x0F) * 4
@@ -244,9 +224,7 @@ func (f *PacketForwarder) removeUDP(key udpNATKey) {
 	}
 }
 
-// ============================================================
-// ICMP Echo Reply
-// ============================================================
+// ============ ICMP Echo Reply ============
 
 func (f *PacketForwarder) handleICMP(pkt []byte) {
 	ihl := int(pkt[0]&0x0F) * 4
@@ -311,9 +289,7 @@ func buildICMPEchoReply(reqPkt []byte, selfIP net.IP, remoteIP net.IP, ihl, icmp
 	return pkt
 }
 
-// ============================================================
-// TCP 中继
-// ============================================================
+// ============ TCP 中继 ============
 
 func (f *PacketForwarder) handleTCP(pkt []byte) {
 	ihl := int(pkt[0]&0x0F) * 4
@@ -528,9 +504,7 @@ func (f *PacketForwarder) removeTCP(key tcpConnKey, reason string) {
 		net.IP(key.clientIP[:]), key.clientPort, reason)
 }
 
-// ============================================================
-// TCP 包发送
-// ============================================================
+// ============ TCP 包发送 ============
 
 func (f *PacketForwarder) sendTCP(
 	clientIP net.IP, srcPort, dstPort uint16,
@@ -620,7 +594,9 @@ func (f *PacketForwarder) sendTCPInternal(
 }
 
 // ============================================================
-// ★★ ICMP 绕过状态机：LAN → UDPAddr → TURN → WS
+// ★ P0-3：sendToPeer 更新 lastDataFrameAt
+//   - ICMP / TCP / UDP 的所有成功发送路径都更新
+//   - startKeepalive 会检查该字段，10s 内有数据就跳过 STUN
 // ============================================================
 func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 	if f.edge == nil {
@@ -642,12 +618,9 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 		return
 	}
 
-	// ★ 判断是否是 ICMP
 	isICMP := len(pkt) >= 10 && pkt[9] == protoICMP
 
-	// ============================================================
-	// ICMP：绕过状态机，直接按 LAN → UDPAddr → TURN → WS 顺序发送
-	// ============================================================
+	// ICMP：绕过状态机，LAN → UDPAddr → TURN → WS
 	if isICMP {
 		// 1. LAN 优先
 		if len(target.LanEndpoints) > 0 && f.edge.udpConn != nil {
@@ -657,6 +630,7 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 					continue
 				}
 				if _, err := f.edge.udpConn.WriteToUDP(pkt, ra); err == nil {
+					atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
 					return
 				}
 			}
@@ -665,6 +639,7 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 		// 2. UDPAddr
 		if target.UDPAddr != nil && f.edge.udpConn != nil {
 			if _, err := f.edge.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
+				atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
 				return
 			}
 		}
@@ -674,37 +649,39 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 			if err == nil {
 				if sendErr := f.edge.turnClient.Send(pkt, relayAddr); sendErr == nil {
+					atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
 					return
 				}
 			}
 		}
 
-		// 4. WS 中继（最后兜底）
+		// 4. WS 中继
 		if f.edge.ws != nil {
 			frame := buildN2NWFrame(target.ClientID, pkt)
 			_ = f.edge.ws.SendBinary(frame)
+			atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
 		}
 		return
 	}
 
-	// ============================================================
-	// 非 ICMP：走 relayMgr 状态机（TCP/UDP 数据面）
-	// ============================================================
+	// 非 ICMP：走 relayMgr 状态机
 	if f.edge.relayMgr == nil {
 		return
 	}
 
 	sent := f.edge.relayMgr.SendToPeer(target.ClientID, pkt, target)
+	if sent {
+		atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+	}
 
 	if !sent && f.edge.ws != nil {
 		frame := buildN2NWFrame(target.ClientID, pkt)
 		_ = f.edge.ws.SendBinary(frame)
+		atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
 	}
 }
 
-// ============================================================
-// 清理
-// ============================================================
+// ============ 清理 ============
 
 func (f *PacketForwarder) reaper() {
 	t := time.NewTicker(fwdReaperInterval)
@@ -771,9 +748,7 @@ func (f *PacketForwarder) Stop() {
 	log.Printf("[FWD] 已停止")
 }
 
-// ============================================================
-// IP 包构造 & 校验和
-// ============================================================
+// ============ IP 包构造 & 校验和 ============
 
 func buildUDPResponsePacket(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16, payload []byte) []byte {
 	srcIP4 := srcIP.To4()
