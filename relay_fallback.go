@@ -143,15 +143,32 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.cancelFallbackTimer(peerId)
 }
 
+// ForceFallback 强制降级。
+//
+// ★ P1 修复（本次，与 n2n-android 同步）：允许 ConnP2P 在 no-traffic 场景降级
+//
+// 旧版：ConnP2P 时直接 return，但日志已打，下一次 keepalive 又触发，
+// 造成 30 秒刷屏。更重要的是 30s 无流量场景下 P2P 实际已死，如果不能
+// 降级，后续数据全走黑洞 UDP。
+//
+// 新版：如果 reason 是 "no-traffic-30s" 或 "p2p-avail-timeout"，
+// 允许从 ConnP2P 降级到 TURN/WS。其他 reason（如 server-forced）
+// 在 P2P 状态下仍然不降级，避免误伤健康连接。
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	if rm.states[peerId] == ConnP2P {
-		return
-	}
+	// 已经是 TURN/WS → 不需要再降级
 	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
 		return
+	}
+
+	// ★ P1 修复：ConnP2P 允许在 no-traffic 场景降级
+	if rm.states[peerId] == ConnP2P {
+		if reason != "no-traffic-30s" && reason != "p2p-avail-timeout" {
+			return
+		}
+		log.Printf("[连接] %s 从 P2P 降级 (force: %s)", peerId, reason)
 	}
 
 	if rm.turnClient != nil && rm.turnClient.IsReady() {
