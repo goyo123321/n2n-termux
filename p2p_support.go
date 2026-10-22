@@ -8,6 +8,16 @@ import (
 	"time"
 )
 
+// findPeerIDByAddr 按对端地址查 peerID。
+//
+// ★ P0 修复（本次，与 n2n-android 同步）：加 IP 匹配 AssistedEndpoints
+//
+// 旧版问题：HardNAT 端口漂移时，B 的 PONG 从 112.96.52.208:任意端口 来，
+// 但 AssistedEndpoints 里只有 112.96.52.208:32519/52911/...（固定几个端口）。
+// 精确匹配全部失败 → 找不到 peer → lastRecvAt 不更新 → 30 秒后 ForceFallback。
+//
+// 新版：精确匹配全部失败后，用 IP 匹配 AssistedEndpoints（忽略端口）。
+// 只要 IP 匹配，就认定是该 peer 的包。
 func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	if addr == nil {
 		return ""
@@ -15,11 +25,14 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 	e.peersMu.RLock()
 	defer e.peersMu.RUnlock()
 
+	// 1. 精确匹配 UDPAddr
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) && p.UDPAddr.Port == addr.Port {
 			return id
 		}
 	}
+
+	// 2. 精确匹配 LanEndpoints
 	for id, p := range e.peers {
 		for _, lan := range p.LanEndpoints {
 			la, err := net.ResolveUDPAddr("udp", lan)
@@ -31,6 +44,8 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 			}
 		}
 	}
+
+	// 3. 精确匹配 AssistedEndpoints
 	for id, p := range e.peers {
 		for _, ass := range p.AssistedEndpoints {
 			aa, err := net.ResolveUDPAddr("udp", ass)
@@ -42,11 +57,28 @@ func (e *Edge) findPeerIDByAddr(addr *net.UDPAddr) string {
 			}
 		}
 	}
+
+	// ★ 新增 4：IP 匹配 AssistedEndpoints（HardNAT 端口漂移兜底）
+	// B 的 PONG 从 112.96.52.208:任意端口 来，只要 IP 匹配 AssistedEndpoints 就认
+	for id, p := range e.peers {
+		for _, ass := range p.AssistedEndpoints {
+			aa, err := net.ResolveUDPAddr("udp", ass)
+			if err != nil {
+				continue
+			}
+			if aa.IP.Equal(addr.IP) {
+				return id
+			}
+		}
+	}
+
+	// ★ 新增 5：IP 匹配 UDPAddr（原有兜底，移到后面避免干扰）
 	for id, p := range e.peers {
 		if p.UDPAddr != nil && p.UDPAddr.IP.Equal(addr.IP) {
 			return id
 		}
 	}
+
 	return ""
 }
 
