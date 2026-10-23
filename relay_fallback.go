@@ -36,15 +36,22 @@ type RelayManager struct {
 	edge       *Edge
 	states     map[string]ConnType
 	failCounts map[string]int
+
+	// peer-via-ws 震荡保护：5 秒内累计 ≥5 个 WS 帧才降级
+	// 且要求 5 秒内没有 P2P 真实数据（lastRecvAt 保护）
+	wsFrameCounts map[string]int
+	wsFirstAt     map[string]int64
 }
 
 func NewRelayManager(ws *WSTransport, turnClient *TURNClient, edge *Edge) *RelayManager {
 	return &RelayManager{
-		ws:         ws,
-		turnClient: turnClient,
-		edge:       edge,
-		states:     make(map[string]ConnType),
-		failCounts: make(map[string]int),
+		ws:            ws,
+		turnClient:    turnClient,
+		edge:          edge,
+		states:        make(map[string]ConnType),
+		failCounts:    make(map[string]int),
+		wsFrameCounts: make(map[string]int),
+		wsFirstAt:     make(map[string]int64),
 	}
 }
 
@@ -144,28 +151,20 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 }
 
 // ForceFallback 强制降级。
-//
-// ★ P1 修复（本次，与 n2n-android 同步）：允许 ConnP2P 在 no-traffic 场景降级
-//
-// 旧版：ConnP2P 时直接 return，但日志已打，下一次 keepalive 又触发，
-// 造成 30 秒刷屏。更重要的是 30s 无流量场景下 P2P 实际已死，如果不能
-// 降级，后续数据全走黑洞 UDP。
-//
-// 新版：如果 reason 是 "no-traffic-30s" 或 "p2p-avail-timeout"，
-// 允许从 ConnP2P 降级到 TURN/WS。其他 reason（如 server-forced）
-// 在 P2P 状态下仍然不降级，避免误伤健康连接。
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	// 已经是 TURN/WS → 不需要再降级
 	if rm.states[peerId] == ConnTURN || rm.states[peerId] == ConnRelay {
 		return
 	}
 
-	// ★ P1 修复：ConnP2P 允许在 no-traffic 场景降级
 	if rm.states[peerId] == ConnP2P {
-		if reason != "no-traffic-30s" && reason != "p2p-avail-timeout" {
+		// 允许 no-traffic / p2p-avail-timeout / peer-via-ws / peer-via-turn 场景降级
+		if reason != "no-traffic-30s" &&
+			reason != "p2p-avail-timeout" &&
+			reason != "peer-via-ws" &&
+			reason != "peer-via-turn" {
 			return
 		}
 		log.Printf("[连接] %s 从 P2P 降级 (force: %s)", peerId, reason)
@@ -185,6 +184,87 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	}
 }
 
+// RecordWSFrame WS 帧降级保护。
+//
+// 1. 5 秒内累计 ≥5 个 WS 帧才降级
+// 2. 5 秒内有 P2P 真实数据（lastRecvAt）→ 忽略 WS 帧，不降级
+// 3. 降级目标直接 TURN/Relay（不是 P2PAvailable）
+func (rm *RelayManager) RecordWSFrame(peerID string) {
+	if peerID == "" {
+		return
+	}
+
+	// P2P 数据保护（进锁前做，避免长持锁）
+	if rm.edge != nil {
+		rm.edge.peersMu.RLock()
+		var lastRecv int64
+		if p := rm.edge.peers[peerID]; p != nil {
+			lastRecv = p.lastRecvAt
+		}
+		rm.edge.peersMu.RUnlock()
+
+		if lastRecv > 0 && time.Now().UnixMilli()-lastRecv < 5000 {
+			return
+		}
+	}
+
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	now := time.Now().UnixMilli()
+	if first, ok := rm.wsFirstAt[peerID]; !ok || now-first > 5000 {
+		rm.wsFirstAt[peerID] = now
+		rm.wsFrameCounts[peerID] = 0
+	}
+	rm.wsFrameCounts[peerID]++
+
+	if rm.wsFrameCounts[peerID] < 5 {
+		log.Printf("[连接] %s WS 帧计数 %d/5（5s 窗口）",
+			peerID, rm.wsFrameCounts[peerID])
+		return
+	}
+
+	rm.wsFrameCounts[peerID] = 0
+	rm.wsFirstAt[peerID] = 0
+
+	cur := rm.states[peerID]
+	if cur != ConnP2P && cur != ConnP2PAvailable {
+		return
+	}
+
+	if rm.turnClient != nil && rm.turnClient.IsReady() {
+		rm.states[peerID] = ConnTURN
+		log.Printf("[连接] %s %s → TURN（peer-via-ws ×5）", peerID, cur)
+	} else {
+		rm.states[peerID] = ConnRelay
+		log.Printf("[连接] %s %s → WS 中继（peer-via-ws ×5，TURN 未就绪）", peerID, cur)
+	}
+
+	if rm.edge != nil {
+		rm.edge.cancelFallbackTimer(peerID)
+		rm.edge.cancelP2PAvailTimeout(peerID)
+	}
+}
+
+// ForceReportNow 立即上报 connection_status（不等 10s 周期）。
+func (rm *RelayManager) ForceReportNow() {
+	if rm.ws == nil {
+		return
+	}
+	rm.mu.RLock()
+	conns := make(map[string]string, len(rm.states))
+	for id, t := range rm.states {
+		conns[id] = string(t)
+	}
+	rm.mu.RUnlock()
+
+	_ = rm.ws.Send(map[string]interface{}{
+		"type":    "connection_status",
+		"payload": map[string]interface{}{"connections": conns},
+	})
+	log.Printf("[连接] 立即上报 connection_status (%d peers)", len(conns))
+}
+
 func (rm *RelayManager) ClearPeer(peerID string) {
 	if peerID == "" {
 		return
@@ -193,6 +273,8 @@ func (rm *RelayManager) ClearPeer(peerID string) {
 	defer rm.mu.Unlock()
 	delete(rm.states, peerID)
 	delete(rm.failCounts, peerID)
+	delete(rm.wsFrameCounts, peerID)
+	delete(rm.wsFirstAt, peerID)
 }
 
 func (rm *RelayManager) ClearAll() {
@@ -200,6 +282,8 @@ func (rm *RelayManager) ClearAll() {
 	defer rm.mu.Unlock()
 	rm.states = make(map[string]ConnType)
 	rm.failCounts = make(map[string]int)
+	rm.wsFrameCounts = make(map[string]int)
+	rm.wsFirstAt = make(map[string]int64)
 }
 
 func (rm *RelayManager) cancelFallbackTimer(peerID string) {
@@ -292,9 +376,24 @@ func (rm *RelayManager) SendViaRelay(data []byte) error {
 	return rm.ws.SendBinary(data)
 }
 
-// SendToPeer 按当前状态发送数据。
+// ResetP2PStates 重置所有 P2P / TURN 状态，保留 WS。
 //
-// ★ P0 修复：ConnP2P 分支加 selfIsOnTargetLAN 判断
+// ★ 新增：清 failCounts 和 wsFrameCounts，避免网络切换后旧计数误触发降级。
+func (rm *RelayManager) ResetP2PStates(reason string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	for peerID, state := range rm.states {
+		if state == ConnP2P || state == ConnP2PAvailable || state == ConnTURN {
+			rm.states[peerID] = ConnUnknown
+			log.Printf("[连接] %s %s → Unknown（%s）", peerID, state, reason)
+		}
+	}
+	rm.failCounts = make(map[string]int)
+	rm.wsFrameCounts = make(map[string]int)
+	rm.wsFirstAt = make(map[string]int64)
+}
+
+// SendToPeer 按当前状态发送数据。
 func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo) bool {
 	state := rm.GetState(peerId)
 
@@ -310,7 +409,6 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		}
 
 		sent := false
-
 		selfOnLAN := rm.edge.selfIsOnTargetLAN(target)
 
 		if selfOnLAN && target.UDPAddr != nil &&
@@ -368,6 +466,18 @@ func (rm *RelayManager) SendToPeer(peerId string, data []byte, target *PeerInfo)
 		return rm.ws.SendBinary(buildN2NWFrame(peerId, data)) == nil
 
 	case ConnTURN:
+		// ★ 修复：每次发送前检查 TURN 是否真的就绪
+		if rm.turnClient == nil || !rm.turnClient.IsReady() {
+			log.Printf("[TURN] %s TURN 未就绪（可能已断开），直接走 WS 兜底", peerId)
+			rm.mu.Lock()
+			rm.states[peerId] = ConnRelay
+			rm.mu.Unlock()
+			if rm.ws != nil {
+				return rm.ws.SendBinary(buildN2NWFrame(peerId, data)) == nil
+			}
+			return false
+		}
+
 		if target != nil && target.TurnRelayAddr != "" && rm.turnClient != nil {
 			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 			if err == nil {
