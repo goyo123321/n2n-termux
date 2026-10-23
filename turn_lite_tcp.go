@@ -101,6 +101,8 @@ type TURNTCPAllocation struct {
 	tunnelsMu sync.Mutex
 
 	onMessage func(data []byte, addr net.Addr)
+	// ★ 新增：Refresh 连续失败主动关闭时通知 TURNClient 立即重建
+	onClosed func()
 
 	mu        sync.Mutex
 	stopped   bool
@@ -233,8 +235,6 @@ func (t *TURNTCPAllocation) readControlLoop() {
 }
 
 // Allocate 建立 TCP allocation。
-//
-// ★ n2n-termux 改动：去掉 newProtectedDialer。
 func (t *TURNTCPAllocation) Allocate() error {
 	conn, err := net.DialTimeout("tcp", t.serverAddr, 10*time.Second)
 	if err != nil {
@@ -325,8 +325,6 @@ func (t *TURNTCPAllocation) extractAllocation(resp *stunMessage) error {
 }
 
 // Dial 建立到目标 peer 的 TCP 隧道（RFC 6062）。
-//
-// ★ n2n-termux 改动：去掉 newProtectedDialer。
 func (t *TURNTCPAllocation) Dial(targetIP string, targetPort int) (net.Conn, error) {
 	t.mu.Lock()
 	if t.stopped {
@@ -479,6 +477,10 @@ func (t *TURNTCPAllocation) tunnelReadLoop(tun *tcpTunnel, peerAddr *net.UDPAddr
 	}
 }
 
+// refreshLoop RFC 6062 Refresh 循环。
+//
+// ★ 修复：连续失败 3 次时调用 onClosed，让 TURNClient 立即重建，
+// 不等 StartReconnectLoop 的 30s 轮询。
 func (t *TURNTCPAllocation) refreshLoop() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -508,6 +510,9 @@ func (t *TURNTCPAllocation) refreshLoop() {
 				if fc >= 3 {
 					log.Printf("[TURN-TCP] Refresh 连续失败 %d 次，关闭等待重建", fc)
 					t.Close()
+					if t.onClosed != nil {
+						t.onClosed()
+					}
 					return
 				}
 			} else {
