@@ -82,13 +82,6 @@ type turnEndpoint struct {
 }
 
 // parseTURLEndpoint 解析 TURN URL。
-//
-// 输入示例（可能来自服务端 /api/turn-credentials 的 url 字段）：
-//   turn:47.76.28.111:3478
-//   turn:111.171.194.230:3478?transport=udp
-//   turns:secure.example.com:5349
-//   turn://user:pass@host:3478?transport=tcp
-//   turn:1.2.3.4                （无端口，用默认）
 func parseTURLEndpoint(raw string) turnEndpoint {
 	s := strings.TrimSpace(raw)
 	scheme := "turn"
@@ -221,14 +214,7 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) (err error) {
 
 // RebuildAllocation 网络变化后重建 TURN allocation。
 //
-// 场景：客户端换网络，旧 allocation 基于旧 NAT 映射失效。但 UDP socket
-// 没关，SendTo 返回 nil（假成功），数据丢失。旧版靠 Refresh 失败 3 次
-// （最长 3 分钟）才重建。
-//
-// 修复：主动关闭旧 allocation + 立即重建。重建期间 IsReady()=false，
-// SendToPeer 的 ConnTURN 分支会检测到并走 WS 兜底。
-//
-// 注意：保留 tc.server（TURN 凭证 24 小时内有效），避免重复调
+// 保留 tc.server（TURN 凭证 24 小时内有效），避免重复调
 // /api/turn-credentials 消耗 Worker 配额。
 func (tc *TURNClient) RebuildAllocation(ctx context.Context) error {
 	tc.mu.Lock()
@@ -351,8 +337,8 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	tryRFC6062 := func() error {
 		tcpAlloc := NewTURNTCPAllocation(ep.Addr, srv.Username, srv.Password)
 		tcpAlloc.onMessage = tc.wrapOnMessage()
-		// RFC 6062 的 Refresh 失败已通过 refreshLoop 里的 t.Close() 主动关闭，
-		// 不需要额外 onClosed 回调，StartReconnectLoop 会兜底
+		// ★ 新增：注册 onClosed 回调（配合 turn_lite_tcp.go 的 onClosed 字段）
+		tcpAlloc.onClosed = tc.makeOnClosed()
 		if err := tcpAlloc.Allocate(); err != nil {
 			return err
 		}
