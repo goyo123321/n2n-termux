@@ -919,7 +919,7 @@ func buildN2NWFrame(targetID string, payload []byte) []byte {
 // ★ 修复：N2NW 分支收到数据时用 RecordWSFrame（5 秒内 ≥5 帧才降级），
 // 避免单帧就 ForceFallback 导致震荡。
 func (e *Edge) handleAppStreamBinary(data []byte) {
-	// ★ N2NA 分支
+	// ★ N2NA 分支（app_stream.go 里已加 RecordWSFrame）
 	if isN2NAFrame(data) {
 		e.handleN2NAFrame(data)
 		return
