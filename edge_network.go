@@ -2,12 +2,8 @@ package main
 
 // 网络切换（WiFi ↔ Cellular / WiFi1 → WiFi2）时的状态清理。
 //
-// ★ Termux 特有：没有 ConnectivityManager，用 10 秒定时探测检测
-//   本机出口 IP 变化，变了就触发 OnNetworkChanged。
-//
-// ★ 与 n2n-android / n2n-go-client 对齐：
-//   - 1.5 秒合并延迟
-//   - applyNetworkChanged 七步清理 + 立即上报 + TURN 重建
+// Termux 特有：没有 ConnectivityManager，用 10 秒定时探测检测
+// 本机出口 IP 变化，变了就触发 OnNetworkChanged。
 
 import (
 	"context"
@@ -19,9 +15,7 @@ import (
 const networkChangeMergeDelay = 1500 * time.Millisecond
 const networkProbeInterval = 10 * time.Second
 
-// OnNetworkChanged 网络切换入口。
-//
-// 1.5 秒合并：频繁切换时只执行最后一次，避免状态反复重置。
+// OnNetworkChanged 网络切换入口（1.5 秒合并）。
 func (e *Edge) OnNetworkChanged(networkType string) {
 	e.pendingNetChangeMu.Lock()
 	e.pendingNetChange = networkType
@@ -48,7 +42,7 @@ func (e *Edge) OnNetworkChanged(networkType string) {
 	log.Printf("[Network] %s 已排队（1.5s 内合并）", networkType)
 }
 
-// applyNetworkChanged 实际执行七步清理 + 立即上报 + TURN 重建。
+// applyNetworkChanged 实际执行 10 步清理。
 func (e *Edge) applyNetworkChanged(networkType string) {
 	log.Printf("[Network] 执行网络变化处理: %s", networkType)
 
@@ -188,10 +182,7 @@ func (e *Edge) applyNetworkChanged(networkType string) {
 	})
 }
 
-// startNetworkMonitor 定时探测本机出口 IP 变化。
-//
-// Termux 没有 Android ConnectivityManager，用「UDP connect 骗内核」拿出口 IP。
-// 10 秒探测一次，IP 变化就触发 OnNetworkChanged。
+// startNetworkMonitor 定时探测本机出口 IP 变化（10 秒周期）。
 func (e *Edge) startNetworkMonitor() {
 	if e.udpConn == nil {
 		return
