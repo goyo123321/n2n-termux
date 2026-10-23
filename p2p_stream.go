@@ -308,12 +308,6 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 }
 
 // sendP2PFrame 发送一帧到对端的所有候选地址。
-//
-// ★ 修复 1：LAN 优先（窗口 30s）。
-// ★ 修复 2：控制帧全发（保 CGNAT 映射 + 探测 LAN 恢复）。
-// ★ 修复 3：TURN 模式下控制帧也尝试直连。
-//
-// ★ PC / Termux 特有：e.udpConn 是 *net.UDPConn，用 WriteToUDP。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -920,7 +914,10 @@ func buildN2NWFrame(targetID string, payload []byte) []byte {
 // handleAppStreamBinary 处理服务端转发来的 WS 二进制帧。
 //
 // ★ Termux 特有：N2NW 的 IPv4 payload 交给 packet_forwarder.HandlePacket，
-//   由 packet_forwarder 在用户态解析 IP/TCP/UDP/ICMP 头，转发到 127.0.0.1。
+// 由 packet_forwarder 在用户态解析 IP/TCP/UDP/ICMP 头，转发到 127.0.0.1。
+//
+// ★ 修复：N2NW 分支收到数据时用 RecordWSFrame（5 秒内 ≥5 帧才降级），
+// 避免单帧就 ForceFallback 导致震荡。
 func (e *Edge) handleAppStreamBinary(data []byte) {
 	// ★ N2NA 分支
 	if isN2NAFrame(data) {
@@ -954,15 +951,20 @@ func (e *Edge) handleAppStreamBinary(data []byte) {
 	}
 
 	// 更新发送方 peer 的活跃时间
-	// 用途：
-	//   - P2P 空闲检测（sendP2PKeepalive 里的 30s p2pIdleDeadMs）
-	//   - MarkFallback 的 10 秒保护（relay_fallback.go）
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
 	if p, ok := e.peers[senderID]; ok {
 		p.lastRecvAt = now
 	}
 	e.peersMu.Unlock()
+
+	// ★ 新增：WS 帧降级保护（5 秒内 ≥5 帧才降级）
+	if e.relayMgr != nil {
+		st := e.relayMgr.GetState(senderID)
+		if st == ConnP2P || st == ConnP2PAvailable {
+			e.relayMgr.RecordWSFrame(senderID)
+		}
+	}
 
 	// ★ Termux 特有：走 packet_forwarder 而非 TUN
 	if e.pktFwd != nil {
