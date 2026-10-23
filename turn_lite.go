@@ -83,6 +83,8 @@ type TURNLite struct {
 	permMu      sync.Mutex
 
 	onMessage func([]byte, net.Addr)
+	// ★ 新增：Refresh 连续失败主动关闭时通知 TURNClient 立即重建
+	onClosed func()
 
 	pendingMu sync.Mutex
 	pending   map[[12]byte]chan *stunMessage
@@ -383,11 +385,6 @@ func (t *TURNLite) extractAllocateResult(resp *stunMessage) error {
 	return nil
 }
 
-// ★ 修复：ensurePermission 加 port 参数。
-//
-// 旧版传 port=0，coturn 对 XOR-PEER-ADDRESS 的 port 做合法性检查，
-// port=0 会被静默丢弃（不返回 error，直接不响应）→ CreatePermission
-// 请求超时 → TURN 中继实际不可用。
 func (t *TURNLite) ensurePermission(ip net.IP, port int) error {
 	key := ip.String()
 	t.permMu.Lock()
@@ -398,7 +395,6 @@ func (t *TURNLite) ensurePermission(ip net.IP, port int) error {
 		return nil
 	}
 
-	// ★ 用真实端口，coturn 拒绝 port=0
 	peerData := xorEncodePeer(ip, port)
 
 	resp, err := t.sendRequest(msgCreatePermissionReq, []stunAttr{
@@ -443,7 +439,12 @@ func (t *TURNLite) ensurePermission(ip net.IP, port int) error {
 	return nil
 }
 
-// ★ 修复：SendTo 传真实端口给 ensurePermission。
+// SendTo 发送数据到对端。
+//
+// ★ 修复：UDP socket 在换网络后不一定报错（源 IP 变了但 socket 还开着），
+// 但 SendTo 返回 nil 时数据实际丢了。TCP transport 会报错，UDP 不会。
+// 只有 isNetworkUnreachable 才触发 Close + 重建。
+// 真正的「假成功」场景由 edge_network.go 的 RebuildAllocation 兜底。
 func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if t.conn == nil {
 		return fmt.Errorf("TURN 未就绪")
@@ -464,8 +465,17 @@ func (t *TURNLite) SendTo(data []byte, peerAddr *net.UDPAddr) error {
 	if t.stopped {
 		return fmt.Errorf("已关闭")
 	}
+
+	// ★ 修复：socket 失效检测
 	_, err := t.conn.Write(msg)
-	return err
+	if err != nil {
+		if isNetworkUnreachable(err) {
+			log.Printf("[TURN-Lite] SendTo socket 失效（网络变化），关闭等待重建")
+			go t.Close()
+		}
+		return err
+	}
+	return nil
 }
 
 func (t *TURNLite) readLoop() {
@@ -580,6 +590,10 @@ func (t *TURNLite) handleIncoming(data []byte) {
 	}
 }
 
+// refreshLoop TURN Refresh 循环。
+//
+// ★ 修复：Refresh 连续失败 3 次 / 437 (Allocation Mismatch) 时，
+// 主动触发 onClosed 回调，让 TURNClient 立即重建，不等 30s StartReconnectLoop。
 func (t *TURNLite) refreshLoop() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -611,7 +625,12 @@ func (t *TURNLite) refreshLoop() {
 				log.Printf("[TURN-Lite] Refresh 失败 (%d/3): %v", consecutiveFails, err)
 				if consecutiveFails >= 3 {
 					log.Printf("[TURN-Lite] Refresh 连续失败 %d 次，关闭等待重建", consecutiveFails)
-					go t.Close()
+					go func() {
+						t.Close()
+						if t.onClosed != nil {
+							t.onClosed()
+						}
+					}()
 					return
 				}
 				continue
@@ -643,7 +662,12 @@ func (t *TURNLite) refreshLoop() {
 
 			case 437:
 				log.Printf("[TURN-Lite] Refresh 被拒 437 (Allocation Mismatch)，关闭等待重建")
-				go t.Close()
+				go func() {
+					t.Close()
+					if t.onClosed != nil {
+						t.onClosed()
+					}
+				}()
 				return
 
 			default:
