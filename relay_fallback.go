@@ -37,8 +37,9 @@ type RelayManager struct {
 	states     map[string]ConnType
 	failCounts map[string]int
 
-	// peer-via-ws 震荡保护：5 秒内累计 ≥5 个 WS 帧才降级
-	// 且要求 5 秒内没有 P2P 真实数据（lastRecvAt 保护）
+	// ★ 新增：peer-via-ws 震荡保护
+	//   5 秒内累计 ≥5 个 WS 帧才降级
+	//   且要求 5 秒内没有 P2P 真实数据（lastRecvAt 保护）
 	wsFrameCounts map[string]int
 	wsFirstAt     map[string]int64
 }
@@ -151,6 +152,9 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 }
 
 // ForceFallback 强制降级。
+//
+// ★ 修复：允许 ConnP2P 在 no-traffic-30s / p2p-avail-timeout /
+// peer-via-ws / peer-via-turn 场景降级，其他 reason 保持不降。
 func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -160,7 +164,6 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 	}
 
 	if rm.states[peerId] == ConnP2P {
-		// 允许 no-traffic / p2p-avail-timeout / peer-via-ws / peer-via-turn 场景降级
 		if reason != "no-traffic-30s" &&
 			reason != "p2p-avail-timeout" &&
 			reason != "peer-via-ws" &&
@@ -186,9 +189,9 @@ func (rm *RelayManager) ForceFallback(peerId string, reason string) {
 
 // RecordWSFrame WS 帧降级保护。
 //
-// 1. 5 秒内累计 ≥5 个 WS 帧才降级
-// 2. 5 秒内有 P2P 真实数据（lastRecvAt）→ 忽略 WS 帧，不降级
-// 3. 降级目标直接 TURN/Relay（不是 P2PAvailable）
+//   1. 5 秒内累计 ≥5 个 WS 帧才降级
+//   2. 5 秒内有 P2P 流量（lastRecvAt）→ 忽略 WS 帧，不降级
+//   3. 降级目标直接 TURN/Relay（不是 P2PAvailable）
 func (rm *RelayManager) RecordWSFrame(peerID string) {
 	if peerID == "" {
 		return
