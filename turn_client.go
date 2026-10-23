@@ -74,7 +74,6 @@ func (tc *TURNClient) IsReady() bool {
 
 // ============ TURN URL 解析 ============
 
-// turnEndpoint 描述一个解析好的 TURN 服务端地址。
 type turnEndpoint struct {
 	Addr      string // host:port
 	Scheme    string // "turn" 或 "turns"
@@ -220,6 +219,83 @@ func (tc *TURNClient) FetchAndSetup(ctx context.Context) (err error) {
 	return tc.setupAllocation(ctx)
 }
 
+// RebuildAllocation 网络变化后重建 TURN allocation。
+//
+// 场景：客户端换网络，旧 allocation 基于旧 NAT 映射失效。但 UDP socket
+// 没关，SendTo 返回 nil（假成功），数据丢失。旧版靠 Refresh 失败 3 次
+// （最长 3 分钟）才重建。
+//
+// 修复：主动关闭旧 allocation + 立即重建。重建期间 IsReady()=false，
+// SendToPeer 的 ConnTURN 分支会检测到并走 WS 兜底。
+//
+// 注意：保留 tc.server（TURN 凭证 24 小时内有效），避免重复调
+// /api/turn-credentials 消耗 Worker 配额。
+func (tc *TURNClient) RebuildAllocation(ctx context.Context) error {
+	tc.mu.Lock()
+	if tc.lite != nil {
+		tc.lite.Close()
+		tc.lite = nil
+	}
+	if tc.tcpAlloc != nil {
+		tc.tcpAlloc.Close()
+		tc.tcpAlloc = nil
+	}
+	tc.relayAddr = nil
+	tc.alive = false
+	serverCached := tc.server
+	tc.mu.Unlock()
+
+	if serverCached == nil {
+		return tc.FetchAndSetup(ctx)
+	}
+	return tc.setupAllocation(ctx)
+}
+
+// makeOnClosed 构造 TURNLite.onClosed 回调。
+//
+// Refresh 连续失败时，TURNLite 会调 onClosed()。本回调立即触发重建，
+// 不等 StartReconnectLoop 的 30s 轮询。
+func (tc *TURNClient) makeOnClosed() func() {
+	return func() {
+		log.Printf("[TURN] TURNLite 主动关闭（Refresh 失败），立即触发重建")
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[TURN] 立即重建 panic: %v", r)
+				}
+			}()
+
+			time.Sleep(500 * time.Millisecond)
+
+			select {
+			case <-tc.stopCh:
+				return
+			default:
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			if err := tc.FetchAndSetup(ctx); err != nil {
+				log.Printf("[TURN] Refresh 失败后立即重建失败: %v（30 秒后 StartReconnectLoop 重试）", err)
+				return
+			}
+
+			log.Printf("[TURN] ✅ Refresh 失败后立即重建成功: %s", tc.GetRelayAddr())
+
+			if tc.edge != nil && tc.edge.ws != nil {
+				_ = tc.edge.ws.Send(map[string]interface{}{
+					"type":      "turn_relay_info",
+					"relayAddr": tc.GetRelayAddr(),
+				})
+			}
+			if tc.edge != nil && tc.edge.relayMgr != nil {
+				tc.edge.relayMgr.UpgradeRelaysToTURN()
+			}
+		}()
+	}
+}
+
 // ============ 建立 TURN Allocation（TURN-Lite） ============
 
 func (tc *TURNClient) setupAllocation(ctx context.Context) error {
@@ -241,6 +317,8 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	tryUDP := func() error {
 		lite := NewTURNLiteWithTCP(ep.Addr, srv.Username, srv.Password, false)
 		lite.onMessage = tc.wrapOnMessage()
+		// ★ 新增：注册 onClosed 回调，Refresh 失败时立即触发重建
+		lite.onClosed = tc.makeOnClosed()
 		if err := lite.Allocate(); err != nil {
 			return err
 		}
@@ -256,6 +334,8 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	tryTCP := func() error {
 		lite := NewTURNLiteWithTCP(ep.Addr, srv.Username, srv.Password, true)
 		lite.onMessage = tc.wrapOnMessage()
+		// ★ 新增：注册 onClosed 回调
+		lite.onClosed = tc.makeOnClosed()
 		if err := lite.Allocate(); err != nil {
 			return err
 		}
@@ -271,6 +351,8 @@ func (tc *TURNClient) setupAllocation(ctx context.Context) error {
 	tryRFC6062 := func() error {
 		tcpAlloc := NewTURNTCPAllocation(ep.Addr, srv.Username, srv.Password)
 		tcpAlloc.onMessage = tc.wrapOnMessage()
+		// RFC 6062 的 Refresh 失败已通过 refreshLoop 里的 t.Close() 主动关闭，
+		// 不需要额外 onClosed 回调，StartReconnectLoop 会兜底
 		if err := tcpAlloc.Allocate(); err != nil {
 			return err
 		}
