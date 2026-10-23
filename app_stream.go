@@ -1,489 +1,954 @@
 package main
 
-// WS 应用层隧道（app_stream）。
-//
-// 与 n2n-go-client / n2n-android 完全一致。
-//
-// 使用场景：三级降级到 WS 中继时，对端主动向本机上的服务发起连接。
-// 此时数据面无法走 TUN（Termux 没有 TUN，只有 SOCKS5），改用
-// app_stream_* 消息把 TCP 字节流封装成 base64 隧道。
-//
-// 消息：
-//   app_stream_open      → 发起方 → 接收方，携带 targetPort
-//   app_stream_open_ack  ← 接收方 → 发起方，携带 ok
-//   app_stream_data      → 双向，携带 base64 编码的 TCP 数据
-//   app_stream_close     → 双向，携带 reason
-//
-// ★ 新增：N2NA 二进制数据面（与文本 app_stream_data 并存）
-//
-//   app_stream_open / open_ack / close 保持文本（低频，无需优化）
-//   app_stream_data 在双方 features 都含 "n2na" 时走 N2NA 二进制
-//   否则回退文本 base64（完全向后兼容）
+// N2NS 可靠 UDP 流协议（PC / Termux 通用）。
+// 底层使用 *net.UDPConn，发送时使用 WriteToUDP。
 
 import (
-	"encoding/base64"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-type AppStream struct {
-	ID        string
-	PeerID    string
-	LocalConn net.Conn
-	CreatedAt time.Time
+var p2pMagic = [4]byte{'N', '2', 'N', 'S'}
 
-	// ★ 新增：对端是否支持 N2NA 二进制数据面
-	//   - openLocalStream / onRemoteStreamOpen 里根据对端 features 设置
-	//   - pumpLocalToRemote 据此决定发二进制还是文本
-	PeerSupportsN2NA bool
+const (
+	p2pTypeSYN    = 1
+	p2pTypeSYNACK = 2
+	p2pTypeDATA   = 3
+	p2pTypeACK    = 4
+	p2pTypeFIN    = 5
+	p2pTypeRST    = 6
+	p2pTypePING   = 7
+	p2pTypePONG   = 8
+)
 
-	ackCh   chan bool
-	ackOnce sync.Once
-	closed  atomic.Bool
+const (
+	p2pVer         = 1
+	p2pHeaderLen   = 21
+	p2pMaxPayload  = 1200
+	p2pWindow      = 16
+	p2pResendMs    = 200
+	p2pMaxRetries  = 8
+	p2pIdleTimeout = 120 * time.Second
+)
+
+type p2pFrame struct {
+	Type     uint8
+	StreamID uint32
+	Seq      uint32
+	Ack      uint32
+	Flags    uint8
+	Payload  []byte
 }
 
-func (s *AppStream) WaitAck(timeout time.Duration) bool {
-	select {
-	case ok := <-s.ackCh:
-		return ok
-	case <-time.After(timeout):
-		return false
+func encodeP2PFrame(f *p2pFrame) []byte {
+	buf := make([]byte, p2pHeaderLen+len(f.Payload))
+	copy(buf[0:4], p2pMagic[:])
+	buf[4] = p2pVer
+	buf[5] = f.Type
+	binary.BigEndian.PutUint32(buf[6:10], f.StreamID)
+	binary.BigEndian.PutUint32(buf[10:14], f.Seq)
+	binary.BigEndian.PutUint32(buf[14:18], f.Ack)
+	buf[18] = f.Flags
+	binary.BigEndian.PutUint16(buf[19:21], uint16(len(f.Payload)))
+	if len(f.Payload) > 0 {
+		copy(buf[21:], f.Payload)
 	}
+	return buf
 }
 
-func (s *AppStream) signalAck(ok bool) {
-	s.ackOnce.Do(func() {
-		select {
-		case s.ackCh <- ok:
-		default:
-		}
-	})
-}
-
-type AppStreamManager struct {
-	mu      sync.RWMutex
-	streams map[string]*AppStream
-	seq     atomic.Uint64
-}
-
-func NewAppStreamManager() *AppStreamManager {
-	return &AppStreamManager{
-		streams: make(map[string]*AppStream),
+func decodeP2PFrame(data []byte) (*p2pFrame, error) {
+	if len(data) < p2pHeaderLen {
+		return nil, errors.New("short")
 	}
+	if data[0] != 'N' || data[1] != '2' || data[2] != 'N' || data[3] != 'S' {
+		return nil, errors.New("magic")
+	}
+	if data[4] != p2pVer {
+		return nil, errors.New("ver")
+	}
+	plen := int(binary.BigEndian.Uint16(data[19:21]))
+	if len(data) < p2pHeaderLen+plen {
+		return nil, errors.New("trunc")
+	}
+	return &p2pFrame{
+		Type:     data[5],
+		StreamID: binary.BigEndian.Uint32(data[6:10]),
+		Seq:      binary.BigEndian.Uint32(data[10:14]),
+		Ack:      binary.BigEndian.Uint32(data[14:18]),
+		Flags:    data[18],
+		Payload:  data[21 : 21+plen],
+	}, nil
 }
 
-func (m *AppStreamManager) allocID(prefix string) string {
-	n := m.seq.Add(1)
-	return fmt.Sprintf("%s-%d", prefix, n)
+func isP2PFrame(data []byte) bool {
+	return len(data) >= 4 && data[0] == 'N' && data[1] == '2' && data[2] == 'N' && data[3] == 'S'
 }
 
-func (m *AppStreamManager) add(s *AppStream) {
+type p2pSeg struct {
+	seq      uint32
+	data     []byte
+	sentAt   time.Time
+	retries  int
+	isSyn    bool
+	isSynAck bool
+}
+
+type P2PStream struct {
+	ID     uint32
+	PeerID string
+
+	mu       sync.Mutex
+	peerAddr *net.UDPAddr
+	viaTURN  bool
+
+	lastRecvFrom *net.UDPAddr
+
+	sendNext uint32
+	sendBase uint32
+	segments map[uint32]*p2pSeg
+
+	recvNext uint32
+	recvBuf  map[uint32][]byte
+
+	recentlyDelivered map[uint32]time.Time
+
+	localConn net.Conn
+	ownsConn  bool
+
+	closed        bool
+	closeCh       chan struct{}
+	establishedCh chan bool
+	lastAct       time.Time
+}
+
+type P2PStreamManager struct {
+	mu   sync.RWMutex
+	byID map[uint32]*P2PStream
+	next uint32
+	edge *Edge
+}
+
+func NewP2PStreamManager(edge *Edge) *P2PStreamManager {
+	m := &P2PStreamManager{
+		byID: make(map[uint32]*P2PStream),
+		next: 2,
+		edge: edge,
+	}
+	safeGo("p2p-reaper", m.reaper)
+	return m
+}
+
+func (m *P2PStreamManager) allocID() uint32 {
 	m.mu.Lock()
-	m.streams[s.ID] = s
+	defer m.mu.Unlock()
+	for {
+		id := m.next
+		m.next += 2
+		if m.next == 0 {
+			m.next = 2
+		}
+		if _, dup := m.byID[id]; !dup {
+			return id
+		}
+	}
+}
+
+func (m *P2PStreamManager) add(s *P2PStream) {
+	m.mu.Lock()
+	m.byID[s.ID] = s
 	m.mu.Unlock()
 }
 
-func (m *AppStreamManager) get(id string) *AppStream {
+func (m *P2PStreamManager) get(id uint32) *P2PStream {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.streams[id]
+	return m.byID[id]
 }
 
-func (m *AppStreamManager) remove(id string) *AppStream {
+func (m *P2PStreamManager) remove(id uint32) {
 	m.mu.Lock()
-	s := m.streams[id]
-	delete(m.streams, id)
-	m.mu.Unlock()
-	return s
-}
-
-func (m *AppStreamManager) closeAll() {
-	m.mu.Lock()
-	for _, s := range m.streams {
-		s.closed.Store(true)
-		if s.LocalConn != nil {
-			_ = s.LocalConn.Close()
-		}
-	}
-	m.streams = make(map[string]*AppStream)
+	delete(m.byID, id)
 	m.mu.Unlock()
 }
 
-// ============ 对端 features 查询辅助 ============
-
-// peerSupportsN2NA 判断 peer 是否上报了 n2na feature
-func (e *Edge) peerSupportsN2NA(peerID string) bool {
-	if peerID == "" {
-		return false
+func (m *P2PStreamManager) closeAll() {
+	m.mu.Lock()
+	all := make([]*P2PStream, 0, len(m.byID))
+	for _, s := range m.byID {
+		all = append(all, s)
 	}
-	e.peersMu.RLock()
-	defer e.peersMu.RUnlock()
-	p := e.peers[peerID]
-	if p == nil {
-		return false
+	m.byID = make(map[uint32]*P2PStream)
+	m.mu.Unlock()
+	for _, s := range all {
+		s.close("manager-shutdown")
 	}
-	for _, f := range p.Features {
-		if f == "n2na" {
-			return true
-		}
-	}
-	return false
 }
 
-// ============ Edge 端方法 ============
-
-func (e *Edge) findPeerByVIP(vip string) (string, bool) {
-	e.peersMu.RLock()
-	defer e.peersMu.RUnlock()
-	for id, p := range e.peers {
-		if p.VirtualIP == vip {
-			return id, true
+func (m *P2PStreamManager) dropPeer(peerID string) {
+	if m == nil || peerID == "" {
+		return
+	}
+	m.mu.RLock()
+	var toClose []*P2PStream
+	for _, s := range m.byID {
+		if s.PeerID == peerID {
+			toClose = append(toClose, s)
 		}
 	}
-	return "", false
+	m.mu.RUnlock()
+	for _, s := range toClose {
+		s.close("peer-left")
+	}
 }
 
-func (e *Edge) openLocalStream(peerID string, targetPort int, conn net.Conn) (*AppStream, error) {
-	if e.streamMgr == nil {
-		return nil, fmt.Errorf("stream manager not initialized")
+func (m *P2PStreamManager) reaper() {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.edge.doneCh:
+			return
+		case <-t.C:
+		}
+		now := time.Now()
+		m.mu.RLock()
+		var stale []*P2PStream
+		for _, s := range m.byID {
+			s.mu.Lock()
+			idle := now.Sub(s.lastAct)
+			s.mu.Unlock()
+			if idle > p2pIdleTimeout {
+				stale = append(stale, s)
+			}
+		}
+		m.mu.RUnlock()
+		for _, s := range stale {
+			s.close("idle")
+		}
+	}
+}
+
+func (m *P2PStreamManager) sendP2PProbe(peerID string) {
+	if m == nil || m.edge == nil || peerID == "" {
+		return
+	}
+	addr, viaTURN := m.edge.peerAddrAndMode(peerID)
+	if addr == nil {
+		return
+	}
+	frame := &p2pFrame{
+		Type:     p2pTypePING,
+		StreamID: 0,
+	}
+	tmp := &P2PStream{
+		ID:       0,
+		PeerID:   peerID,
+		peerAddr: addr,
+		viaTURN:  viaTURN,
+	}
+	if err := m.edge.sendP2PFrame(tmp, frame); err != nil {
+		log.Printf("[P2P-PROBE] 向 %s 发 P2P PING 失败: %v", peerID, err)
+	}
+}
+
+func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
+	s.mu.Lock()
+	primary := s.peerAddr
+	lastRecv := s.lastRecvFrom
+	peerID := s.PeerID
+	s.mu.Unlock()
+
+	e.peersMu.RLock()
+	var lanEndpoints []string
+	var assisted []string
+	var peerUDPAddr *net.UDPAddr
+	if p := e.peers[peerID]; p != nil {
+		lanEndpoints = p.LanEndpoints
+		assisted = p.AssistedEndpoints
+		peerUDPAddr = p.UDPAddr
+	}
+	e.peersMu.RUnlock()
+
+	var out []*net.UDPAddr
+	seen := make(map[string]bool)
+	add := func(a *net.UDPAddr) {
+		if a == nil || a.IP == nil {
+			return
+		}
+		k := a.String()
+		if seen[k] {
+			return
+		}
+		seen[k] = true
+		out = append(out, a)
 	}
 
-	// ★ 新增：检查对端是否支持 N2NA
-	supportsBinary := e.peerSupportsN2NA(peerID)
-
-	streamID := e.streamMgr.allocID(e.clientId)
-	s := &AppStream{
-		ID:               streamID,
-		PeerID:           peerID,
-		LocalConn:        conn,
-		CreatedAt:        time.Now(),
-		PeerSupportsN2NA: supportsBinary,
-		ackCh:            make(chan bool, 1),
+	for _, lan := range lanEndpoints {
+		if ra, err := net.ResolveUDPAddr("udp", lan); err == nil {
+			add(ra)
+		}
 	}
-	e.streamMgr.add(s)
+	for _, ep := range assisted {
+		if ra, err := net.ResolveUDPAddr("udp", ep); err == nil {
+			add(ra)
+		}
+	}
+	add(lastRecv)
+	add(primary)
+	add(peerUDPAddr)
 
-	err := e.ws.Send(map[string]interface{}{
-		"type":       "app_stream_open",
-		"to":         peerID,
-		"streamId":   streamID,
-		"targetPort": targetPort,
-	})
-	if err != nil {
-		e.streamMgr.remove(streamID)
+	return out
+}
+
+// sendP2PFrame 发送一帧到对端的所有候选地址。
+func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
+	s.mu.Lock()
+	viaTURN := s.viaTURN
+	peerID := s.PeerID
+	s.mu.Unlock()
+
+	buf := encodeP2PFrame(f)
+
+	forceDual := f.Type != p2pTypeDATA && f.Type != p2pTypeACK
+
+	if viaTURN {
+		if e.turnClient == nil || !e.turnClient.IsReady() {
+			if forceDual && e.udpConn != nil {
+				targets := e.collectN2NSTargets(s)
+				sent := 0
+				for _, addr := range targets {
+					if _, err := e.udpConn.WriteToUDP(buf, addr); err == nil {
+						sent++
+					}
+				}
+				if sent > 0 {
+					return nil
+				}
+			}
+			return errors.New("turn down")
+		}
+
+		if !forceDual {
+			e.peersMu.RLock()
+			var relayAddr string
+			if p := e.peers[peerID]; p != nil {
+				relayAddr = p.TurnRelayAddr
+			}
+			e.peersMu.RUnlock()
+
+			if relayAddr == "" {
+				return errors.New("peer turn relay unknown")
+			}
+			ra, err := net.ResolveUDPAddr("udp", relayAddr)
+			if err != nil {
+				return fmt.Errorf("bad relay addr %q: %w", relayAddr, err)
+			}
+			return e.turnClient.Send(buf, ra)
+		}
+
+		var lastErr error
+
+		if e.udpConn != nil {
+			targets := e.collectN2NSTargets(s)
+			for _, addr := range targets {
+				if _, err := e.udpConn.WriteToUDP(buf, addr); err != nil {
+					lastErr = err
+				}
+			}
+		}
+
+		e.peersMu.RLock()
+		var relayAddr string
+		if p := e.peers[peerID]; p != nil {
+			relayAddr = p.TurnRelayAddr
+		}
+		e.peersMu.RUnlock()
+		if relayAddr != "" {
+			ra, err := net.ResolveUDPAddr("udp", relayAddr)
+			if err == nil {
+				_ = e.turnClient.Send(buf, ra)
+			}
+		}
+
+		return lastErr
+	}
+
+	targets := e.collectN2NSTargets(s)
+	if len(targets) == 0 {
+		return errors.New("no targets for N2NS frame")
+	}
+	if e.udpConn == nil {
+		return errors.New("no udp")
+	}
+
+	e.peersMu.RLock()
+	var lanPreferred bool
+	if p := e.peers[peerID]; p != nil {
+		if p.lastLANRecvAt > 0 &&
+			time.Now().UnixMilli()-p.lastLANRecvAt < 30000 {
+			lanPreferred = true
+		}
+	}
+	e.peersMu.RUnlock()
+
+	if lanPreferred && !forceDual {
+		sent := 0
+		for _, addr := range targets {
+			if !isPrivateIPv4(addr.IP) {
+				continue
+			}
+			if _, err := e.udpConn.WriteToUDP(buf, addr); err == nil {
+				sent++
+			}
+		}
+		if sent > 0 {
+			return nil
+		}
+	}
+
+	var lastErr error
+	sent := 0
+	for _, addr := range targets {
+		if _, err := e.udpConn.WriteToUDP(buf, addr); err != nil {
+			lastErr = err
+		} else {
+			sent++
+		}
+	}
+	if sent == 0 {
+		if lastErr == nil {
+			lastErr = errors.New("all sends failed")
+		}
+		return lastErr
+	}
+	return nil
+}
+
+func (m *P2PStreamManager) OpenP2PStream(peerID string, targetPort int, localConn net.Conn, timeout time.Duration) (*P2PStream, error) {
+	addr, viaTURN := m.edge.peerAddrAndMode(peerID)
+	if addr == nil {
+		return nil, errors.New("peer addr unknown")
+	}
+	s := &P2PStream{
+		ID:                m.allocID(),
+		PeerID:            peerID,
+		peerAddr:          addr,
+		viaTURN:           viaTURN,
+		segments:          make(map[uint32]*p2pSeg),
+		recvBuf:           make(map[uint32][]byte),
+		recentlyDelivered: make(map[uint32]time.Time),
+		localConn:         localConn,
+		ownsConn:          false,
+		closeCh:           make(chan struct{}),
+		establishedCh:     make(chan bool, 1),
+		lastAct:           time.Now(),
+	}
+	m.add(s)
+
+	portBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(portBuf, uint32(targetPort))
+	syn := &p2pFrame{Type: p2pTypeSYN, StreamID: s.ID, Seq: 0, Payload: portBuf}
+
+	s.mu.Lock()
+	s.segments[0] = &p2pSeg{seq: 0, sentAt: time.Now(), isSyn: true}
+	s.sendNext = 1
+	s.recvNext = 1
+	s.mu.Unlock()
+
+	if err := m.edge.sendP2PFrame(s, syn); err != nil {
+		m.remove(s.ID)
+		s.abortNoConn()
 		return nil, err
 	}
-	log.Printf("[STREAM] %s → %s:%d 打开 (binary=%v)", streamID, peerID, targetPort, supportsBinary)
-	return s, nil
+
+	safeGo("p2p-rtx", func() { s.retransmitLoop(m.edge) })
+
+	select {
+	case ok := <-s.establishedCh:
+		if !ok {
+			m.remove(s.ID)
+			s.abortNoConn()
+			return nil, errors.New("peer rejected")
+		}
+		s.mu.Lock()
+		s.ownsConn = true
+		s.mu.Unlock()
+		safeGo("p2p-tx", func() { s.readLocalAndSend(m.edge) })
+		return s, nil
+
+	case <-time.After(timeout):
+		m.remove(s.ID)
+		log.Printf("[P2P-STREAM] %d 建流超时（%v），保留 conn 让调用方回落", s.ID, timeout)
+		s.abortNoConn()
+		return nil, errors.New("syn timeout")
+
+	case <-s.closeCh:
+		m.remove(s.ID)
+		s.mu.Lock()
+		s.localConn = nil
+		s.closed = true
+		s.mu.Unlock()
+		return nil, errors.New("closed")
+	}
 }
 
-// pumpLocalToRemote 本地 → 远端的数据泵。
-//
-// ★ 新增：根据 s.PeerSupportsN2NA 决定二进制还是文本。
-//   - 二进制：N2NA 帧（省 ~27% 带宽）
-//   - 文本：app_stream_data JSON + base64（旧协议，完全兼容）
-//   - 二进制发送失败时回退文本
-func (e *Edge) pumpLocalToRemote(s *AppStream) {
+func (s *P2PStream) abortNoConn() {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	s.localConn = nil
+	s.mu.Unlock()
+	close(s.closeCh)
+}
+
+func (m *P2PStreamManager) acceptSYN(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
+	if len(f.Payload) < 4 {
+		return
+	}
+	targetPort := int(binary.BigEndian.Uint32(f.Payload[:4]))
+	if targetPort <= 0 || targetPort > 65535 {
+		return
+	}
+
+	if existing := m.get(f.StreamID); existing != nil {
+		existing.mu.Lock()
+		existing.lastRecvFrom = peerAddr
+		existing.mu.Unlock()
+		synack := &p2pFrame{
+			Type:     p2pTypeSYNACK,
+			StreamID: f.StreamID,
+			Seq:      0,
+			Ack:      1,
+		}
+		_ = m.edge.sendP2PFrame(existing, synack)
+		return
+	}
+
+	localConn, err := net.DialTimeout(
+		"tcp",
+		net.JoinHostPort("127.0.0.1", strconv.Itoa(targetPort)),
+		5*time.Second,
+	)
+	if err != nil {
+		rst := &p2pFrame{Type: p2pTypeRST, StreamID: f.StreamID}
+		tmp := &P2PStream{ID: f.StreamID, peerAddr: peerAddr, viaTURN: viaTURN}
+		_ = m.edge.sendP2PFrame(tmp, rst)
+		log.Printf("[P2P-STREAM] %d dial 127.0.0.1:%d 失败: %v", f.StreamID, targetPort, err)
+		return
+	}
+
+	s := &P2PStream{
+		ID:                f.StreamID,
+		PeerID:            peerID,
+		peerAddr:          peerAddr,
+		viaTURN:           viaTURN,
+		lastRecvFrom:      peerAddr,
+		segments:          make(map[uint32]*p2pSeg),
+		recvBuf:           make(map[uint32][]byte),
+		recentlyDelivered: make(map[uint32]time.Time),
+		localConn:         localConn,
+		ownsConn:          true,
+		closeCh:           make(chan struct{}),
+		establishedCh:     make(chan bool, 1),
+		lastAct:           time.Now(),
+	}
+	s.establishedCh <- true
+
+	m.mu.Lock()
+	if _, dup := m.byID[s.ID]; dup {
+		m.mu.Unlock()
+		_ = localConn.Close()
+		return
+	}
+	m.byID[s.ID] = s
+	m.mu.Unlock()
+
+	s.mu.Lock()
+	s.segments[0] = &p2pSeg{seq: 0, sentAt: time.Now(), isSyn: true, isSynAck: true}
+	s.sendNext = 1
+	s.recvNext = 1
+	s.mu.Unlock()
+
+	synack := &p2pFrame{
+		Type:     p2pTypeSYNACK,
+		StreamID: s.ID,
+		Seq:      0,
+		Ack:      1,
+	}
+	_ = m.edge.sendP2PFrame(s, synack)
+
+	log.Printf("[P2P-STREAM] %d 收到 SYN from %s, 转发到 127.0.0.1:%d",
+		s.ID, peerID, targetPort)
+
+	safeGo("p2p-rtx", func() { s.retransmitLoop(m.edge) })
+	safeGo("p2p-tx", func() { s.readLocalAndSend(m.edge) })
+}
+
+func (m *P2PStreamManager) handleFrame(peerID string, peerAddr *net.UDPAddr, viaTURN bool, f *p2pFrame) {
+	s := m.get(f.StreamID)
+
+	if s == nil {
+		if f.Type == p2pTypePING {
+			safeGo("p2p-pong", func() {
+				resp := &p2pFrame{Type: p2pTypePONG, StreamID: 0}
+				tmp := &P2PStream{
+					ID:       0,
+					PeerID:   peerID,
+					peerAddr: peerAddr,
+					viaTURN:  viaTURN,
+				}
+				_ = m.edge.sendP2PFrame(tmp, resp)
+			})
+			return
+		}
+		if f.Type == p2pTypePONG {
+			return
+		}
+		if f.Type == p2pTypeSYN {
+			safeGo("p2p-accept", func() { m.acceptSYN(peerID, peerAddr, viaTURN, f) })
+			return
+		}
+		return
+	}
+
+	s.mu.Lock()
+	s.peerAddr = peerAddr
+	s.lastRecvFrom = peerAddr
+	s.viaTURN = viaTURN
+	s.lastAct = time.Now()
+
+	if f.Type == p2pTypeACK || f.Type == p2pTypeDATA || f.Type == p2pTypeSYNACK {
+		if f.Ack > s.sendBase {
+			for seq := s.sendBase; seq < f.Ack; seq++ {
+				delete(s.segments, seq)
+			}
+			s.sendBase = f.Ack
+		}
+	}
+	s.mu.Unlock()
+
+	switch f.Type {
+	case p2pTypeSYNACK:
+		_ = m.edge.sendP2PFrame(s, &p2pFrame{
+			Type:     p2pTypeACK,
+			StreamID: s.ID,
+			Ack:      1,
+		})
+		select {
+		case s.establishedCh <- true:
+		default:
+		}
+	case p2pTypeDATA:
+		s.handleData(m.edge, f)
+	case p2pTypeACK:
+	case p2pTypeFIN, p2pTypeRST:
+		s.close("peer-close")
+	}
+}
+
+func (s *P2PStream) handleData(e *Edge, f *p2pFrame) {
+	var toWrite [][]byte
+
+	s.mu.Lock()
+
+	if f.Seq < s.recvNext {
+		ackToSend := s.recvNext
+		s.mu.Unlock()
+		_ = e.sendP2PFrame(s, &p2pFrame{
+			Type:     p2pTypeACK,
+			StreamID: s.ID,
+			Ack:      ackToSend,
+		})
+		return
+	}
+
+	if s.recentlyDelivered == nil {
+		s.recentlyDelivered = make(map[uint32]time.Time)
+	}
+	if ts, seen := s.recentlyDelivered[f.Seq]; seen && time.Since(ts) < 5*time.Second {
+		ackToSend := s.recvNext
+		s.mu.Unlock()
+		_ = e.sendP2PFrame(s, &p2pFrame{
+			Type:     p2pTypeACK,
+			StreamID: s.ID,
+			Ack:      ackToSend,
+		})
+		return
+	}
+
+	if f.Seq == s.recvNext {
+		if len(f.Payload) > 0 {
+			cp := make([]byte, len(f.Payload))
+			copy(cp, f.Payload)
+			toWrite = append(toWrite, cp)
+		}
+		s.recentlyDelivered[f.Seq] = time.Now()
+		s.recvNext++
+
+		for {
+			d, ok := s.recvBuf[s.recvNext]
+			if !ok {
+				break
+			}
+			delete(s.recvBuf, s.recvNext)
+			toWrite = append(toWrite, d)
+			s.recentlyDelivered[s.recvNext] = time.Now()
+			s.recvNext++
+		}
+
+		if len(s.recentlyDelivered) > 100 {
+			for seq, ts := range s.recentlyDelivered {
+				if time.Since(ts) > 5*time.Second {
+					delete(s.recentlyDelivered, seq)
+				}
+			}
+		}
+	} else if f.Seq > s.recvNext {
+		if _, exists := s.recvBuf[f.Seq]; !exists {
+			cp := make([]byte, len(f.Payload))
+			copy(cp, f.Payload)
+			s.recvBuf[f.Seq] = cp
+		}
+	}
+	ackToSend := s.recvNext
+	local := s.localConn
+	s.mu.Unlock()
+
+	for _, d := range toWrite {
+		if local != nil {
+			_, _ = local.Write(d)
+		}
+	}
+
+	_ = e.sendP2PFrame(s, &p2pFrame{
+		Type:     p2pTypeACK,
+		StreamID: s.ID,
+		Ack:      ackToSend,
+	})
+}
+
+func (s *P2PStream) readLocalAndSend(e *Edge) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[STREAM] pumpLocalToRemote panic: %v", r)
+			log.Printf("[P2P-STREAM] %d readLocal panic: %v", s.ID, r)
 		}
 	}()
 
-	buf := make([]byte, 2048)
+	buf := make([]byte, p2pMaxPayload)
 	for {
-		if s.closed.Load() {
+		s.mu.Lock()
+		closed := s.closed
+		local := s.localConn
+		s.mu.Unlock()
+		if closed || local == nil {
 			return
 		}
-		n, err := s.LocalConn.Read(buf)
-		if n > 0 {
-			if s.PeerSupportsN2NA {
-				// ★ 二进制路径
-				frame := buildN2NAFrame(s.PeerID, s.ID, buf[:n])
-				if frame != nil {
-					if sendErr := e.ws.SendBinary(frame); sendErr != nil {
-						// 兜底：回退文本
-						dataB64 := base64.StdEncoding.EncodeToString(buf[:n])
-						_ = e.ws.Send(map[string]interface{}{
-							"type":     "app_stream_data",
-							"to":       s.PeerID,
-							"streamId": s.ID,
-							"data":     dataB64,
-						})
-					}
-				} else {
-					// 编码失败（ID 过长等），回退文本
-					dataB64 := base64.StdEncoding.EncodeToString(buf[:n])
-					_ = e.ws.Send(map[string]interface{}{
-						"type":     "app_stream_data",
-						"to":       s.PeerID,
-						"streamId": s.ID,
-						"data":     dataB64,
-					})
-				}
-			} else {
-				// 文本路径（旧协议，兼容旧对端）
-				dataB64 := base64.StdEncoding.EncodeToString(buf[:n])
-				_ = e.ws.Send(map[string]interface{}{
-					"type":     "app_stream_data",
-					"to":       s.PeerID,
-					"streamId": s.ID,
-					"data":     dataB64,
-				})
+
+		for {
+			s.mu.Lock()
+			inflight := s.sendNext - s.sendBase
+			s.mu.Unlock()
+			if inflight < p2pWindow {
+				break
 			}
+			select {
+			case <-s.closeCh:
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+
+		n, err := local.Read(buf)
+		if n > 0 {
+			s.mu.Lock()
+			seq := s.sendNext
+			s.sendNext++
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			s.segments[seq] = &p2pSeg{seq: seq, data: data, sentAt: time.Now()}
+			ack := s.recvNext
+			s.mu.Unlock()
+
+			_ = e.sendP2PFrame(s, &p2pFrame{
+				Type:     p2pTypeDATA,
+				StreamID: s.ID,
+				Seq:      seq,
+				Ack:      ack,
+				Payload:  data,
+			})
 		}
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("[STREAM] %s 本地读错误: %v", s.ID, err)
+				log.Printf("[P2P-STREAM] %d local read: %v", s.ID, err)
 			}
-			e.closeStream(s, "local-eof")
+			s.mu.Lock()
+			finSeq := s.sendNext
+			s.sendNext++
+			s.mu.Unlock()
+			_ = e.sendP2PFrame(s, &p2pFrame{Type: p2pTypeFIN, StreamID: s.ID, Seq: finSeq})
+			s.close("local-eof")
 			return
 		}
 	}
 }
 
-func (e *Edge) closeStream(s *AppStream, reason string) {
-	if s == nil {
-		return
-	}
-	if !s.closed.CompareAndSwap(false, true) {
-		return
-	}
-	if e.streamMgr != nil {
-		e.streamMgr.remove(s.ID)
-	}
-	if s.LocalConn != nil {
-		_ = s.LocalConn.Close()
-	}
-	if e.ws != nil {
-		_ = e.ws.Send(map[string]interface{}{
-			"type":     "app_stream_close",
-			"to":       s.PeerID,
-			"streamId": s.ID,
-			"reason":   reason,
-		})
-	}
-	log.Printf("[STREAM] %s 关闭 (%s)", s.ID, reason)
-}
-
-// ============ 远端消息处理 ============
-
-// onRemoteStreamOpen 处理对端发起的应用层隧道。
-//
-// 本端作为"接收方"：dial 到 127.0.0.1:targetPort，成功回 open_ack=true，
-// 然后开始 pump。
-//
-// ★ 新增：检查对端 features，决定回发数据时用 N2NA 还是文本。
-func (e *Edge) onRemoteStreamOpen(msg map[string]interface{}) {
-	from, _ := msg["from"].(string)
-	streamID, _ := msg["streamId"].(string)
-	targetPort := 0
-	if f, ok := msg["targetPort"].(float64); ok {
-		targetPort = int(f)
-	}
-	if from == "" || streamID == "" || targetPort <= 0 || targetPort > 65535 {
-		return
-	}
-	if e.streamMgr == nil {
-		return
-	}
-
-	// ★ 新增：检查对端是否支持 N2NA
-	supportsBinary := e.peerSupportsN2NA(from)
-
-	log.Printf("[STREAM] 收到 open %s from %s targetPort=%d (peerN2NA=%v)",
-		streamID, from, targetPort, supportsBinary)
-
-	addr := fmt.Sprintf("127.0.0.1:%d", targetPort)
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		log.Printf("[STREAM] %s dial %s 失败: %v", streamID, addr, err)
-		_ = e.ws.Send(map[string]interface{}{
-			"type":     "app_stream_open_ack",
-			"to":       from,
-			"streamId": streamID,
-			"ok":       false,
-		})
-		return
-	}
-
-	s := &AppStream{
-		ID:               streamID,
-		PeerID:           from,
-		LocalConn:        conn,
-		CreatedAt:        time.Now(),
-		PeerSupportsN2NA: supportsBinary,
-		ackCh:            make(chan bool, 1),
-	}
-	e.streamMgr.add(s)
-
-	_ = e.ws.Send(map[string]interface{}{
-		"type":     "app_stream_open_ack",
-		"to":       from,
-		"streamId": streamID,
-		"ok":       true,
-	})
-
-	safeGo("app-stream-pump", func() { e.pumpLocalToRemote(s) })
-}
-
-func (e *Edge) onRemoteStreamAck(msg map[string]interface{}) {
-	if e.streamMgr == nil {
-		return
-	}
-	streamID, _ := msg["streamId"].(string)
-	ok, _ := msg["ok"].(bool)
-	s := e.streamMgr.get(streamID)
-	if s == nil {
-		return
-	}
-	s.signalAck(ok)
-}
-
-// onRemoteStreamData 处理文本 app_stream_data（旧协议）
-//
-// N2NA 二进制路径由 handleN2NAFrame 处理，不经过这里。
-func (e *Edge) onRemoteStreamData(msg map[string]interface{}) {
-	if e.streamMgr == nil {
-		return
-	}
-	streamID, _ := msg["streamId"].(string)
-	dataB64, _ := msg["data"].(string)
-	if streamID == "" || dataB64 == "" {
-		return
-	}
-
-	s := e.streamMgr.get(streamID)
-	if s == nil || s.closed.Load() {
-		return
-	}
-
-	data, err := base64.StdEncoding.DecodeString(dataB64)
-	if err != nil {
-		log.Printf("[STREAM] %s base64 解码失败: %v", streamID, err)
-		return
-	}
-
-	if _, err := s.LocalConn.Write(data); err != nil {
-		log.Printf("[STREAM] %s 本地写失败: %v", streamID, err)
-		e.closeStream(s, "local-write-fail")
-	}
-}
-
-func (e *Edge) onRemoteStreamClose(msg map[string]interface{}) {
-	if e.streamMgr == nil {
-		return
-	}
-	streamID, _ := msg["streamId"].(string)
-	reason, _ := msg["reason"].(string)
-	s := e.streamMgr.remove(streamID)
-	if s == nil {
-		return
-	}
-	if s.closed.CompareAndSwap(false, true) {
-		if s.LocalConn != nil {
-			_ = s.LocalConn.Close()
+func (s *P2PStream) retransmitLoop(e *Edge) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[P2P-STREAM] %d retransmit panic: %v", s.ID, r)
 		}
-		log.Printf("[STREAM] %s 对端关闭 (%s)", streamID, reason)
+	}()
+	t := time.NewTicker(p2pResendMs * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-t.C:
+		}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return
+		}
+		now := time.Now()
+		var toResend []*p2pSeg
+		var kill bool
+		for seq := s.sendBase; seq < s.sendNext; seq++ {
+			seg, ok := s.segments[seq]
+			if !ok {
+				continue
+			}
+			if now.Sub(seg.sentAt) < p2pResendMs*time.Millisecond {
+				continue
+			}
+			if seg.retries >= p2pMaxRetries {
+				kill = true
+				break
+			}
+			seg.retries++
+			seg.sentAt = now
+			toResend = append(toResend, seg)
+		}
+		ack := s.recvNext
+		s.mu.Unlock()
+
+		if kill {
+			log.Printf("[P2P-STREAM] %d 重传耗尽（对端无响应）", s.ID)
+			s.close("retransmit-exhausted")
+			return
+		}
+		for _, seg := range toResend {
+			var ft uint8 = p2pTypeDATA
+			if seg.isSyn {
+				if seg.isSynAck {
+					ft = p2pTypeSYNACK
+				} else {
+					ft = p2pTypeSYN
+				}
+			}
+			_ = e.sendP2PFrame(s, &p2pFrame{
+				Type:     ft,
+				StreamID: s.ID,
+				Seq:      seg.seq,
+				Ack:      ack,
+				Payload:  seg.data,
+			})
+		}
 	}
 }
 
-// ============ N2NA 二进制帧 ============
-//
-// 帧格式（客户端 ↔ 服务端）：
-//
-//   offset  len  字段
-//   0       4    "N2NA"           magic
-//   4       1    flags            保留，当前 0
-//   5       1    peerIdLen        peerId 字节长度（1-255）
-//   6       N    peerId           发送时填目标 clientId；服务端重写为发送方
-//   6+N     1    streamIdLen      streamId 字节长度（1-255）
-//   7+N     M    streamId         app_stream 的 streamId
-//   7+N+M   ...  rawTCPData       TCP 原始字节
-//
-// 与 N2NW 的差异：
-//   - N2NW（IPv4 数据面）：无状态，服务端按目标 peer 直接转发裸 IPv4 包
-//   - N2NA（app_stream 数据面）：有 streamId，服务端不解析、原样转发
-//
-// 服务端 features 协商：
-//   - 目标 features 含 "n2na" → 二进制转发
-//   - 目标不含 → 解码转 app_stream_data 文本（旧客户端兼容）
+func (s *P2PStream) close(reason string) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	local := s.localConn
+	owns := s.ownsConn
+	s.localConn = nil
+	s.mu.Unlock()
+
+	close(s.closeCh)
+	if local != nil && owns {
+		_ = local.Close()
+	}
+	log.Printf("[P2P-STREAM] %d 关闭 (%s)", s.ID, reason)
+}
+
+// ============ N2NW / N2NA 二进制帧（WS 中继数据面） ============
 
 const (
-	n2naHdrMin    = 7
-	n2naPeerMax   = 255
-	n2naStreamMax = 255
+	n2nwHdrMin  = 6
+	n2nwPeerMax = 255
 )
 
-// buildN2NAFrame 构造 N2NA 帧。targetID 是目标 peer 的 clientId，
-// 服务端会把它重写为发送方 ID 后再转发给对端。
-//
-// 编码失败（ID 过长等）返回 nil，调用方应回退文本路径。
-func buildN2NAFrame(targetID, streamID string, payload []byte) []byte {
-	peerBytes := []byte(targetID)
-	streamBytes := []byte(streamID)
-	if len(peerBytes) == 0 || len(peerBytes) > n2naPeerMax {
-		return nil
+func buildN2NWFrame(targetID string, payload []byte) []byte {
+	idBytes := []byte(targetID)
+	if len(idBytes) > n2nwPeerMax {
+		idBytes = idBytes[:n2nwPeerMax]
 	}
-	if len(streamBytes) == 0 || len(streamBytes) > n2naStreamMax {
-		return nil
-	}
-
-	frame := make([]byte, n2naHdrMin+len(peerBytes)+len(streamBytes)+len(payload))
+	frame := make([]byte, n2nwHdrMin+len(idBytes)+len(payload))
 	frame[0] = 'N'
 	frame[1] = '2'
 	frame[2] = 'N'
-	frame[3] = 'A'
-	frame[4] = 0 // flags
-	frame[5] = byte(len(peerBytes))
-	copy(frame[6:], peerBytes)
-	frame[6+len(peerBytes)] = byte(len(streamBytes))
-	copy(frame[7+len(peerBytes):], streamBytes)
-	copy(frame[7+len(peerBytes)+len(streamBytes):], payload)
+	frame[3] = 'W'
+	frame[4] = 0
+	frame[5] = byte(len(idBytes))
+	copy(frame[n2nwHdrMin:], idBytes)
+	copy(frame[n2nwHdrMin+len(idBytes):], payload)
 	return frame
 }
 
-// isN2NAFrame 快速判断是否是 N2NA 帧
-func isN2NAFrame(data []byte) bool {
-	return len(data) >= n2naHdrMin &&
-		data[0] == 'N' && data[1] == '2' && data[2] == 'N' && data[3] == 'A'
-}
-
-// handleN2NAFrame 处理服务端转发来的 N2NA 帧（binary app_stream_data）。
+// handleAppStreamBinary 处理服务端转发来的 WS 二进制帧。
 //
-// 帧头 peerId 是发送方 clientId（服务端重写后），payload 是 TCP 原始字节。
-// 不校验对端 features —— 收到 N2NA 说明对端已经确认我们支持（服务端协商）。
-func (e *Edge) handleN2NAFrame(data []byte) {
-	if len(data) < n2naHdrMin {
-		return
-	}
-	if data[0] != 'N' || data[1] != '2' || data[2] != 'N' || data[3] != 'A' {
+// ★ Termux 特有：N2NW 的 IPv4 payload 交给 packet_forwarder.HandlePacket，
+// 由 packet_forwarder 在用户态解析 IP/TCP/UDP/ICMP 头，转发到 127.0.0.1。
+//
+// ★ 修复：N2NW 分支收到数据时用 RecordWSFrame（5 秒内 ≥5 帧才降级），
+// 避免单帧就 ForceFallback 导致震荡。
+func (e *Edge) handleAppStreamBinary(data []byte) {
+	// ★ N2NA 分支
+	if isN2NAFrame(data) {
+		e.handleN2NAFrame(data)
 		return
 	}
 
+	// N2NW 分支
+	if len(data) < n2nwHdrMin {
+		return
+	}
+	if data[0] != 'N' || data[1] != '2' || data[2] != 'N' || data[3] != 'W' {
+		return
+	}
+
+	flags := data[4]
 	peerLen := int(data[5])
-	if peerLen <= 0 || peerLen > n2naPeerMax {
+	if peerLen <= 0 || peerLen > n2nwPeerMax {
 		return
 	}
-	if len(data) < 6+peerLen+1 {
-		return
-	}
-
-	senderID := string(data[6 : 6+peerLen])
-	streamIdLen := int(data[6+peerLen])
-	if streamIdLen <= 0 || streamIdLen > n2naStreamMax {
-		return
-	}
-	if len(data) < 7+peerLen+streamIdLen {
+	if len(data) < n2nwHdrMin+peerLen {
 		return
 	}
 
-	streamID := string(data[7+peerLen : 7+peerLen+streamIdLen])
-	payload := data[7+peerLen+streamIdLen:]
+	senderID := string(data[n2nwHdrMin : n2nwHdrMin+peerLen])
+	payload := data[n2nwHdrMin+peerLen:]
+	if len(payload) < 20 || payload[0]>>4 != 4 {
+		log.Printf("[WS-BIN] %s → 非 IPv4 payload (len=%d flags=%d)",
+			senderID, len(payload), flags)
+		return
+	}
 
 	// 更新发送方 peer 的活跃时间
 	now := time.Now().UnixMilli()
@@ -493,18 +958,16 @@ func (e *Edge) handleN2NAFrame(data []byte) {
 	}
 	e.peersMu.Unlock()
 
-	if e.streamMgr == nil {
-		return
-	}
-	s := e.streamMgr.get(streamID)
-	if s == nil || s.closed.Load() {
-		return
+	// ★ 新增：WS 帧降级保护（5 秒内 ≥5 帧才降级）
+	if e.relayMgr != nil {
+		st := e.relayMgr.GetState(senderID)
+		if st == ConnP2P || st == ConnP2PAvailable {
+			e.relayMgr.RecordWSFrame(senderID)
+		}
 	}
 
-	if len(payload) > 0 {
-		if _, err := s.LocalConn.Write(payload); err != nil {
-			log.Printf("[STREAM] %s N2NA 本地写失败: %v", streamID, err)
-			e.closeStream(s, "local-write-fail")
-		}
+	// ★ Termux 特有：走 packet_forwarder 而非 TUN
+	if e.pktFwd != nil {
+		e.pktFwd.HandlePacket(payload)
 	}
 }
