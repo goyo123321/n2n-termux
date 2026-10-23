@@ -96,6 +96,7 @@ func (e *Edge) applyNetworkChanged(networkType string) {
 		p.UDPAddr = nil
 		p.lastLANRecvAt = 0
 		p.lastRecvAt = 0
+		p.lastP2PRecvAt = 0 // ★ 新增：清 P2P 真实数据时间
 		p.LanEndpoints = nil
 		p.TurnRelayAddr = ""
 	}
