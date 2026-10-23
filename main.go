@@ -123,7 +123,7 @@ type Edge struct {
 	virtualCIDR string
 	roomId      string
 
-	// ★ 网络变化去抖 / 合并延迟（见 edge_network.go）
+	// ★ 网络变化去抖 / 合并延迟
 	lastNetworkChangedAt int64
 	lastNetworkType      string
 	pendingNetChangeMu   sync.Mutex
@@ -159,8 +159,7 @@ type Edge struct {
 	tunStateLogMu sync.Mutex
 
 	lastMetadataReportAt int64
-
-	lastDataFrameAt int64
+	lastDataFrameAt      int64
 
 	p2pStatusReported   map[string]bool
 	p2pStatusReportedMu sync.Mutex
@@ -747,7 +746,7 @@ func main() {
 	edge.startKeepalive()
 	edge.startP2PKeepalive()
 
-	// ★ 启动网络变化探测（Termux 没有 ConnectivityManager，定时探测出口 IP）
+	// ★ 启动网络变化探测（Termux 没有 ConnectivityManager，10s 定时探测）
 	edge.startNetworkMonitor()
 
 	edge.socks5Srv = NewSocks5Server(edge, socks5Listen)
@@ -1293,9 +1292,6 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 	case "connection_status":
 		return
 
-	// ★ 新增：peer_network_changed
-	//   - reason == "ws-reconnected"：只刷新 lastRecvAt，保留 P2P 状态
-	//   - 其他 reason：清 UDPAddr / LanEndpoints / TurnRelayAddr
 	case "peer_network_changed":
 		reason, _ := msg["reason"].(string)
 		log.Printf("[Network] %s 网络变化 (%s)，重置与其相关的状态", from, reason)
@@ -1420,13 +1416,6 @@ func (e *Edge) maybeResetFailCountForPeer(peerID, newPubIP string, newPubPort in
 // maybeResetOwnFailCounts 本机出口 IP 变化时重置失败计数。
 //
 // ★ 修复：oldIP == "" 时不 return，而是更新 PublicEndpoint。
-//
-// 场景：A 换网络 → OnNetworkChanged 清空 natMeta.PublicEndpoint
-//   → 首次 STUN 响应到达 → oldIP = "" → 旧版直接 return
-//   → PublicEndpoint 永远为空 → reportMetadata 上报空地址
-//   → 服务端 peer.pubSocket = "" → 不生成打洞指令 → 永远卡在 Unknown
-//
-// 修复：oldIP == "" 时不 return，直接更新 PublicEndpoint。
 func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 	if newEndpoint == "" {
 		return
@@ -1446,7 +1435,6 @@ func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 
 	oldIP := extractIPFromEndpoint(oldEndpoint)
 
-	// ★ 修复：只有相同 IP 才 return；oldIP == ""（换网络后首次）继续更新
 	if oldIP == newIP {
 		return
 	}
@@ -1458,8 +1446,6 @@ func (e *Edge) maybeResetOwnFailCounts(newEndpoint string) {
 	}
 	e.mu.Unlock()
 
-	// ★ 修复：oldIP == "" 时说明是换网络后首次，只更新地址，不清 failCounts
-	//   （failCounts 已在 OnNetworkChanged 清空，无需重复清）
 	if oldIP != "" {
 		natHoleActiveMu.Lock()
 		count := len(failCounts)
@@ -1946,13 +1932,6 @@ func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 // addAssistedEndpoint 添加 STUN 探测到的辅助端点。
 //
 // ★ 修复：wasEmpty || ipChanged 都立即上报，绕过 30 秒节流。
-//
-// 场景：
-//   - wasEmpty：换网络后首次 STUN 响应，PublicEndpoint 从空变非空
-//   - ipChanged：WSS 重连时 _reconnected 先上报了旧地址（natMeta.PublicEndpoint
-//     是旧值），随后 STUN 响应带回新 IP。旧版 wasEmpty=false 走 30 秒节流，
-//     B 有 30 秒用旧 UDPAddr 丢包。新版 ipChanged=true 立即上报，把窗口压到
-//     STUN 一个周期（~5 秒，配合 _reconnected 主动探测更快）。
 func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	if ip == "" || port <= 0 {
 		return
@@ -1994,7 +1973,6 @@ func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	log.Printf("[NAT] +assisted: %s (total=%d, wasEmpty=%v, ipChanged=%v, %s→%s)",
 		ep, count, wasEmpty, ipChanged, oldPubIP, newPubIP)
 
-	// ★ 修复：wasEmpty OR ipChanged 都立即上报
 	if wasEmpty || ipChanged {
 		atomic.StoreInt64(&e.lastMetadataReportAt, 0)
 		e.reportMetadata()
