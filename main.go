@@ -107,6 +107,7 @@ type PeerInfo struct {
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
 	lastLANRecvAt     int64
+	lastP2PRecvAt     int64 // ★ 新增：P2P 直连真实数据帧时间（viaTURN=false 且 isRealData=true）
 	loggedReady       bool
 	hasRealData       bool
 	probeReplied      bool
@@ -123,7 +124,7 @@ type Edge struct {
 	virtualCIDR string
 	roomId      string
 
-	// ★ 网络变化去抖 / 合并延迟
+	// ★ 网络变化去抖 / 合并延迟（见 edge_network.go）
 	lastNetworkChangedAt int64
 	lastNetworkType      string
 	pendingNetChangeMu   sync.Mutex
@@ -316,6 +317,16 @@ func (e *Edge) sendP2PKeepalive() {
 	}
 }
 
+// sendP2PIdleKeepalive 2 秒循环：P2P 状态发 probe + 30s 无 P2P 真实数据降级检测。
+//
+// ★ 修复：只检查 lastP2PRecvAt（P2P 直连真实数据时间），不检查 lastRecvAt。
+//
+//   旧版用 lastRecvAt，对端通过 TURN/WS 发的包也会刷新 lastRecvAt，
+//   单向 P2P 丢包（B→A 丢，A→B 走 TURN）永远不会被发现 → 卡在 ConnP2P
+//   但实际数据走 TURN，面板显示不准。
+//
+//   新版用 lastP2PRecvAt（只在 isRealData && !viaTURN 时刷新），
+//   与 n2n-android 完全一致。
 func (e *Edge) sendP2PIdleKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -334,7 +345,10 @@ func (e *Edge) sendP2PIdleKeepalive() {
 		if st != ConnP2P && st != ConnP2PAvailable {
 			continue
 		}
-		if p.lastRecvAt > 0 && now-p.lastRecvAt > p2pIdleDeadMs {
+		// ★ 修复：ConnP2P 用 lastP2PRecvAt；ConnP2PAvailable 交给 60s 超时处理
+		if st == ConnP2P && p.lastP2PRecvAt > 0 && now-p.lastP2PRecvAt > p2pIdleDeadMs {
+			log.Printf("[P2P] %s P2P 真实数据 %ds 未更新（lastRecvAt 可能被 TURN/WS 包刷新），判定 P2P 失效",
+				id, (now-p.lastP2PRecvAt)/1000)
 			deadPeers = append(deadPeers, id)
 			continue
 		}
@@ -343,12 +357,13 @@ func (e *Edge) sendP2PIdleKeepalive() {
 	e.peersMu.RUnlock()
 
 	for _, id := range deadPeers {
-		log.Printf("[P2P] %s %ds 无任何流量，判定 P2P 失效，强制降级",
+		log.Printf("[P2P] %s %ds 无 P2P 真实数据，判定 P2P 失效，强制降级",
 			id, p2pIdleDeadMs/1000)
 		e.relayMgr.ForceFallback(id, "no-traffic-30s")
+		// 重置 lastP2PRecvAt，避免下一次 idle tick 立即重复触发
 		e.peersMu.Lock()
 		if p := e.peers[id]; p != nil {
-			p.lastRecvAt = time.Now().UnixMilli()
+			p.lastP2PRecvAt = time.Now().UnixMilli()
 		}
 		e.peersMu.Unlock()
 	}
@@ -1321,6 +1336,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			p.UDPAddr = nil
 			p.lastLANRecvAt = 0
 			p.lastRecvAt = 0
+			p.lastP2PRecvAt = 0 // ★ 新增：清 P2P 真实数据时间
 			p.PubIP = ""
 			p.PubPort = 0
 			p.TurnRelayAddr = ""
@@ -1849,6 +1865,13 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	}
 
 	best.lastRecvAt = now
+	// ★ 新增：只有 P2P 直连的真实数据才刷新 lastP2PRecvAt
+	//   对端通过 TURN 发的包（viaTURN=true）不算 P2P，不刷新
+	//   避免单向 P2P 丢包（B→A 丢，A→B 走 TURN）时 lastRecvAt 被
+	//   TURN 包持续刷新导致永远不降级
+	if isRealData && !viaTURN {
+		best.lastP2PRecvAt = now
+	}
 	if isRealData {
 		best.hasRealData = true
 	}
