@@ -307,7 +307,6 @@ func (e *Edge) collectN2NSTargets(s *P2PStream) []*net.UDPAddr {
 	return out
 }
 
-// sendP2PFrame 发送一帧到对端的所有候选地址。
 func (e *Edge) sendP2PFrame(s *P2PStream, f *p2pFrame) error {
 	s.mu.Lock()
 	viaTURN := s.viaTURN
@@ -916,8 +915,10 @@ func buildN2NWFrame(targetID string, payload []byte) []byte {
 // ★ Termux 特有：N2NW 的 IPv4 payload 交给 packet_forwarder.HandlePacket，
 // 由 packet_forwarder 在用户态解析 IP/TCP/UDP/ICMP 头，转发到 127.0.0.1。
 //
-// ★ 修复：N2NW 分支收到数据时用 RecordWSFrame（5 秒内 ≥5 帧才降级），
-// 避免单帧就 ForceFallback 导致震荡。
+// ★ 修复：N2NW 分支加 RecordWSFrame 保护，5 秒内 ≥5 帧且无 P2P 流量
+// 才降级，避免单个 WS 帧就触发 ForceFallback 导致震荡。
+//
+// ★ 新增：判断条件包含 ConnLAN（与 Android / PC 对齐）
 func (e *Edge) handleAppStreamBinary(data []byte) {
 	// ★ N2NA 分支（app_stream.go 里已加 RecordWSFrame）
 	if isN2NAFrame(data) {
@@ -958,10 +959,11 @@ func (e *Edge) handleAppStreamBinary(data []byte) {
 	}
 	e.peersMu.Unlock()
 
-	// ★ 新增：WS 帧降级保护（5 秒内 ≥5 帧才降级）
+	// ★ 新增：WS 帧降级保护（5 秒内 ≥5 帧且无 P2P 流量才降级）
+	//   判断条件包含 ConnLAN（与 Android / PC 对齐）
 	if e.relayMgr != nil {
 		st := e.relayMgr.GetState(senderID)
-		if st == ConnP2P || st == ConnP2PAvailable {
+		if st == ConnLAN || st == ConnP2P || st == ConnP2PAvailable {
 			e.relayMgr.RecordWSFrame(senderID)
 		}
 	}
