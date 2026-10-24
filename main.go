@@ -107,14 +107,14 @@ type PeerInfo struct {
 	UDPAddr           *net.UDPAddr
 	lastRecvAt        int64
 	lastLANRecvAt     int64
-	lastP2PRecvAt     int64 // ★ 新增：P2P 直连真实数据帧时间（viaTURN=false 且 isRealData=true）
+	lastP2PRecvAt     int64 // ★ P2P 直连真实数据帧时间（viaTURN=false 且 isRealData=true）
 	loggedReady       bool
 	hasRealData       bool
 	probeReplied      bool
 	AssistedEndpoints []string
 	LanEndpoints      []string
 	Features          []string
-	registeredAt      int64
+	registeredAt      int64 // peer 首次注册时间，用于 lastLANRecvAt 兜底
 }
 
 type Edge struct {
@@ -162,7 +162,8 @@ type Edge struct {
 	lastMetadataReportAt int64
 	lastDataFrameAt      int64
 
-	p2pStatusReported   map[string]bool
+	// ★ 修复：bool → int，状态变化时重新上报
+	p2pStatusReported   map[string]int
 	p2pStatusReportedMu sync.Mutex
 
 	streamMgr  *AppStreamManager
@@ -259,6 +260,9 @@ func (e *Edge) startKeepalive() {
 const p2pKeepaliveInterval     = 15 * time.Second
 const p2pIdleKeepaliveInterval = 2 * time.Second
 const p2pIdleDeadMs            = 30000
+// ★ 新增：LAN 状态专用
+const lanIdleDeadMs            = 60000
+const lanProbeIntervalMs       = 30000
 
 func (e *Edge) startP2PKeepalive() {
 	log.Printf("[P2P-Keepalive] 启动：非 P2P 通道每 %v，P2P 通道每 %v（防 WiFi 省电）",
@@ -293,6 +297,7 @@ func (e *Edge) startP2PKeepalive() {
 	})
 }
 
+// sendP2PKeepalive 15 秒循环：只对非 LAN / 非 P2P peer 发 probe
 func (e *Edge) sendP2PKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -305,7 +310,8 @@ func (e *Edge) sendP2PKeepalive() {
 			continue
 		}
 		st := e.relayMgr.GetState(id)
-		if st == ConnP2P || st == ConnP2PAvailable {
+		// ★ ConnLAN 也跳过（LAN 的 probe 由 sendP2PIdleKeepalive 处理）
+		if st == ConnLAN || st == ConnP2P || st == ConnP2PAvailable {
 			continue
 		}
 		nonP2PPeers = append(nonP2PPeers, id)
@@ -317,16 +323,11 @@ func (e *Edge) sendP2PKeepalive() {
 	}
 }
 
-// sendP2PIdleKeepalive 2 秒循环：P2P 状态发 probe + 30s 无 P2P 真实数据降级检测。
+// sendP2PIdleKeepalive 2 秒循环：P2P / LAN 状态发 probe + 无流量降级检测。
 //
-// ★ 修复：只检查 lastP2PRecvAt（P2P 直连真实数据时间），不检查 lastRecvAt。
-//
-//   旧版用 lastRecvAt，对端通过 TURN/WS 发的包也会刷新 lastRecvAt，
-//   单向 P2P 丢包（B→A 丢，A→B 走 TURN）永远不会被发现 → 卡在 ConnP2P
-//   但实际数据走 TURN，面板显示不准。
-//
-//   新版用 lastP2PRecvAt（只在 isRealData && !viaTURN 时刷新），
-//   与 n2n-android 完全一致。
+//   - LAN：30s probe（保活 + 探测），60s 无流量降级到 P2P
+//   - P2P：30s 无 P2P 真实数据降级到 TURN/WS（用 lastP2PRecvAt，不用 lastRecvAt）
+//   - P2PAvailable：交给 60s 超时处理
 func (e *Edge) sendP2PIdleKeepalive() {
 	if e.relayMgr == nil || e.p2pStreams == nil {
 		return
@@ -336,16 +337,32 @@ func (e *Edge) sendP2PIdleKeepalive() {
 
 	e.peersMu.RLock()
 	var deadPeers []string
+	var lanDeadPeers []string
+	var lanProbePeers []string
 	var p2pPeers []string
 	for id, p := range e.peers {
 		if p.UDPAddr == nil {
 			continue
 		}
 		st := e.relayMgr.GetState(id)
+
+		if st == ConnLAN {
+			// ★ LAN 每 30s 发一次 P2P probe（保活 + 探测）
+			if p.lastRecvAt > 0 && now-p.lastRecvAt > lanProbeIntervalMs {
+				lanProbePeers = append(lanProbePeers, id)
+			}
+			// ★ LAN 60s 无流量降级到公网 P2P
+			if p.lastRecvAt > 0 && now-p.lastRecvAt > lanIdleDeadMs {
+				lanDeadPeers = append(lanDeadPeers, id)
+			}
+			continue
+		}
+
 		if st != ConnP2P && st != ConnP2PAvailable {
 			continue
 		}
-		// ★ 修复：ConnP2P 用 lastP2PRecvAt；ConnP2PAvailable 交给 60s 超时处理
+
+		// ConnP2P 用 lastP2PRecvAt 判定；ConnP2PAvailable 交给 60s 超时
 		if st == ConnP2P && p.lastP2PRecvAt > 0 && now-p.lastP2PRecvAt > p2pIdleDeadMs {
 			log.Printf("[P2P] %s P2P 真实数据 %ds 未更新（lastRecvAt 可能被 TURN/WS 包刷新），判定 P2P 失效",
 				id, (now-p.lastP2PRecvAt)/1000)
@@ -356,11 +373,22 @@ func (e *Edge) sendP2PIdleKeepalive() {
 	}
 	e.peersMu.RUnlock()
 
+	// LAN 30s probe
+	for _, id := range lanProbePeers {
+		e.p2pStreams.sendP2PProbe(id)
+	}
+
+	// LAN 60s 降级到 P2P
+	for _, id := range lanDeadPeers {
+		log.Printf("[LAN] %s 60s 无流量，降级到公网 P2P", id)
+		e.relayMgr.DemoteLANToP2P(id, "no-traffic-60s")
+	}
+
+	// P2P 30s 降级到 TURN/WS
 	for _, id := range deadPeers {
 		log.Printf("[P2P] %s %ds 无 P2P 真实数据，判定 P2P 失效，强制降级",
 			id, p2pIdleDeadMs/1000)
 		e.relayMgr.ForceFallback(id, "no-traffic-30s")
-		// 重置 lastP2PRecvAt，避免下一次 idle tick 立即重复触发
 		e.peersMu.Lock()
 		if p := e.peers[id]; p != nil {
 			p.lastP2PRecvAt = time.Now().UnixMilli()
@@ -572,7 +600,7 @@ func main() {
 		p2pAvailTimers:    make(map[string]*time.Timer),
 		lastNoPeerLog:     make(map[string]int64),
 		tunStateLog:       make(map[string]ConnType),
-		p2pStatusReported: make(map[string]bool),
+		p2pStatusReported: make(map[string]int), // ★ int
 		doneCh:            make(chan struct{}),
 	}
 	edge.punchAckLimiter = newPunchAckLimiter()
@@ -636,7 +664,7 @@ func main() {
 		}
 
 		edge.p2pStatusReportedMu.Lock()
-		edge.p2pStatusReported = make(map[string]bool)
+		edge.p2pStatusReported = make(map[string]int) // ★ int
 		edge.p2pStatusReportedMu.Unlock()
 
 		edge.p2pAvailTimersMu.Lock()
@@ -1020,7 +1048,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 		}
 
 		e.p2pStatusReportedMu.Lock()
-		e.p2pStatusReported = make(map[string]bool)
+		e.p2pStatusReported = make(map[string]int) // ★ int
 		e.p2pStatusReportedMu.Unlock()
 
 		e.reportMetadata()
@@ -1336,7 +1364,7 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			p.UDPAddr = nil
 			p.lastLANRecvAt = 0
 			p.lastRecvAt = 0
-			p.lastP2PRecvAt = 0 // ★ 新增：清 P2P 真实数据时间
+			p.lastP2PRecvAt = 0
 			p.PubIP = ""
 			p.PubPort = 0
 			p.TurnRelayAddr = ""
@@ -1666,6 +1694,8 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 
 	p2pStatus := 0
 	switch e.relayMgr.GetState(instr.TargetMac) {
+	case ConnLAN: // ★ 新增
+		p2pStatus = 3
 	case ConnP2P:
 		p2pStatus = 3
 	case ConnP2PAvailable:
@@ -1690,18 +1720,44 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 	})
 }
 
+// reportP2PStatus 上报 p2pStatus 给服务端。
+//
+// ★ 修复：map[string]bool → map[string]int，状态变化时重新上报。
+//
+// 根据 status 传不同 state：
+//   status=3（P2P/LAN）    → state=3（成功）
+//   status=2（P2PAvailable）→ state=1（InProgress）
+//   status=0（降级到 TURN/WS）→ state=2（失败，服务端清 anySucceeded）
 func (e *Edge) reportP2PStatus(peerID string, status int) {
 	if e.ws == nil || peerID == "" {
 		return
 	}
 
 	e.p2pStatusReportedMu.Lock()
-	if e.p2pStatusReported[peerID] {
+	last, exists := e.p2pStatusReported[peerID]
+	if exists && last == status {
 		e.p2pStatusReportedMu.Unlock()
 		return
 	}
-	e.p2pStatusReported[peerID] = true
+	e.p2pStatusReported[peerID] = status
 	e.p2pStatusReportedMu.Unlock()
+
+	var state int
+	var detail string
+	switch status {
+	case 3:
+		state = 3
+		detail = "already-p2p"
+	case 2:
+		state = 1
+		detail = "already-p2p-avail"
+	case 0:
+		state = 2
+		detail = "degraded"
+	default:
+		state = 1
+		detail = "unknown-status"
+	}
 
 	_ = e.ws.Send(map[string]interface{}{
 		"type": "p2p_state_info",
@@ -1710,9 +1766,9 @@ func (e *Edge) reportP2PStatus(peerID string, status int) {
 				{
 					"macAddr": peerID,
 					"punchResult": map[string]interface{}{
-						"state":    3,
+						"state":    state,
 						"attempts": 0,
-						"detail":   "already-p2p",
+						"detail":   detail,
 					},
 					"punchResultPeerMac": peerID,
 					"p2pStatus":          status,
@@ -1865,10 +1921,7 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	}
 
 	best.lastRecvAt = now
-	// ★ 新增：只有 P2P 直连的真实数据才刷新 lastP2PRecvAt
-	//   对端通过 TURN 发的包（viaTURN=true）不算 P2P，不刷新
-	//   避免单向 P2P 丢包（B→A 丢，A→B 走 TURN）时 lastRecvAt 被
-	//   TURN 包持续刷新导致永远不降级
+	// ★ 只有 P2P 直连的真实数据才刷新 lastP2PRecvAt
 	if isRealData && !viaTURN {
 		best.lastP2PRecvAt = now
 	}
@@ -1884,32 +1937,52 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 	}
 
 	if isRealData {
-		if e.relayMgr.GetState(clientID) != ConnP2P {
-			log.Printf("[P2P] 从 %s (%s) 收到真实数据帧 → P2P 直连", clientID, ip)
-			e.relayMgr.MarkP2P(clientID)
+		// ★ 区分 LAN / 公网 P2P
+		if newIsLAN {
+			if e.relayMgr.GetState(clientID) != ConnLAN {
+				log.Printf("[LAN] 从 %s (%s) 收到真实数据帧 → LAN 直连", clientID, ip)
+				e.relayMgr.MarkLAN(clientID)
+			}
+		} else {
+			if e.relayMgr.GetState(clientID) != ConnP2P {
+				log.Printf("[P2P] 从 %s (%s) 收到真实数据帧 → P2P 直连", clientID, ip)
+				e.relayMgr.MarkP2P(clientID)
+			}
 		}
 		return
 	}
 
 	curState := e.relayMgr.GetState(clientID)
-	justUpgraded := false
-	if curState != ConnP2P && curState != ConnP2PAvailable {
-		kind := "Punch"
-		if isAck {
-			kind = "ACK"
-		}
-		log.Printf("[P2P] 从 %s (%s) 收到 %s → P2PAvailable（等待数据帧验证）", clientID, ip, kind)
-		e.relayMgr.MarkP2PAvailable(clientID)
-		justUpgraded = true
-	}
 
-	if justUpgraded {
-		if e.p2pStreams != nil {
-			safeGo("p2p-probe", func() {
-				e.p2pStreams.sendP2PProbe(clientID)
-			})
+	if newIsLAN {
+		if curState != ConnLAN {
+			kind := "Punch"
+			if isAck {
+				kind = "ACK"
+			}
+			log.Printf("[LAN] 从 %s (%s) 收到 %s → LAN 直连", clientID, ip, kind)
+			e.relayMgr.MarkLAN(clientID)
 		}
-		e.scheduleP2PAvailTimeout(clientID)
+	} else {
+		justUpgraded := false
+		if curState != ConnLAN && curState != ConnP2P && curState != ConnP2PAvailable {
+			kind := "Punch"
+			if isAck {
+				kind = "ACK"
+			}
+			log.Printf("[P2P] 从 %s (%s) 收到 %s → P2PAvailable（等待数据帧验证）", clientID, ip, kind)
+			e.relayMgr.MarkP2PAvailable(clientID)
+			justUpgraded = true
+		}
+
+		if justUpgraded {
+			if e.p2pStreams != nil {
+				safeGo("p2p-probe", func() {
+					e.p2pStreams.sendP2PProbe(clientID)
+				})
+			}
+			e.scheduleP2PAvailTimeout(clientID)
+		}
 	}
 
 	if isAck {
@@ -1952,9 +2025,6 @@ func (e *Edge) sendProbeTo(addr *net.UDPAddr) {
 
 // ============ 多 STUN 端点收集 ============
 
-// addAssistedEndpoint 添加 STUN 探测到的辅助端点。
-//
-// ★ 修复：wasEmpty || ipChanged 都立即上报，绕过 30 秒节流。
 func (e *Edge) addAssistedEndpoint(ip string, port int) {
 	if ip == "" || port <= 0 {
 		return
