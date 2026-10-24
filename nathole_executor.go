@@ -80,6 +80,9 @@ func buildTiers(halfWidth int) []int {
 	return tiers
 }
 
+// extractPortFromEndpoint 从 "ip:port" 提取端口号。
+//
+// 依赖 main.go 里的 lastIndexByte（同 package 直接调用）。
 func extractPortFromEndpoint(ep string) int {
 	if ep == "" {
 		return 0
@@ -94,8 +97,6 @@ func extractPortFromEndpoint(ep string) int {
 	}
 	return port
 }
-
-// lastIndexByte 定义在 main.go 里，同 package 直接调用
 
 func (e *Edge) startFailCountResetLoop() {
 	safeGo("fail-count-reset", func() {
