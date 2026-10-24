@@ -660,52 +660,15 @@ func main() {
 	log.Printf("已连接信令，Client ID: %s，节点名: %s", clientId, nodeName)
 	ws.StartHeartbeat(20 * time.Second)
 
-	ws.onReconnect = func() {
-		log.Printf("[信令] WebSocket 重连成功，清空所有连接状态")
-
-		if edge.relayMgr != nil {
-			edge.relayMgr.ClearAll()
-		}
-		if edge.p2pStreams != nil {
-			edge.p2pStreams.closeAll()
-		}
-		if edge.punchAckLimiter != nil {
-			edge.punchAckLimiter.clear()
-		}
-		if edge.streamMgr != nil {
-			edge.streamMgr.closeAll()
-		}
-
-		edge.p2pStatusReportedMu.Lock()
-		edge.p2pStatusReported = make(map[string]int) // ★ int
-		edge.p2pStatusReportedMu.Unlock()
-
-		edge.p2pAvailTimersMu.Lock()
-		for _, t := range edge.p2pAvailTimers {
-			t.Stop()
-		}
-		edge.p2pAvailTimers = make(map[string]*time.Timer)
-		edge.p2pAvailTimersMu.Unlock()
-
-		natHoleActiveMu.Lock()
-		failCount := len(failCounts)
-		if failCount > 0 {
-			failCounts = make(map[string]int)
-		}
-		nActive := len(natHoleActive)
-		if nActive > 0 {
-			natHoleActive = make(map[string]bool)
-		}
-		natHoleActiveMu.Unlock()
-		if failCount > 0 || nActive > 0 {
-			log.Printf("[NAT-HOLE] WS 重连，清空 %d 个失败计数 / %d 个 in-flight 标记",
-				failCount, nActive)
-		}
-
-		if edge.getVirtualIPLocked() != "" {
-			edge.reportMetadata()
-		}
-	}
+	// ★ 修复：删除 ws.onReconnect 回调，避免与 _reconnected 消息双重清理
+	//
+	// 旧版同时有 onReconnect 回调和 _reconnected 消息：
+	//   1. readLoop 重连成功 → onReconnect() → ClearAll + reportMetadata
+	//   2. readLoop 再发 routeText({"_reconnected"}) → handleSignaling → ClearAll + reportMetadata
+	// 导致重复清理和重复上报。
+	//
+	// 现在只靠 _reconnected 消息触发清理（handleSignaling 里已有完整逻辑，
+	// 且多了 network_changed 补发 + 主动 STUN 探测）。
 
 	edge.turnClient = NewTURNClient(signalingURL, connectToken, edge)
 	edge.turnClient.onMessage = func(data []byte, addr net.Addr) {
@@ -805,8 +768,21 @@ func main() {
 	// ★ 启动网络变化探测（Termux 没有 ConnectivityManager，10s 定时探测）
 	edge.startNetworkMonitor()
 
-	edge.socks5Srv = NewSocks5Server(edge, socks5Listen)
-	safeGo("socks5-server", func() { edge.socks5Srv.Serve() })
+	// ★ 修复：SOCKS5 拆成 Listen() / Serve()，端口冲突时立即报错
+	//
+	// 旧版直接 Serve()，Serve 里 net.Listen 失败时静默 return，
+	// 用户看到"启动成功"但 SOCKS5 没起来。
+	//
+	// Termux 的 SOCKS5 是唯一主动访问入口，端口冲突时 fatal 退出，
+	// 避免用户以为启动了但 curl --socks5 不通。
+	if socks5Listen != "" {
+		edge.socks5Srv = NewSocks5Server(edge, socks5Listen)
+		if err := edge.socks5Srv.Listen(); err != nil {
+			log.Printf("[SOCKS5] %v", err)
+			log.Fatalf("[SOCKS5] SOCKS5 是 Termux 唯一的数据面入口，无法启动")
+		}
+		safeGo("socks5-server", func() { edge.socks5Srv.Serve() })
+	}
 
 	safeGo("turn-init", func() {
 		time.Sleep(2 * time.Second)
