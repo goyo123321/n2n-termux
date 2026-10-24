@@ -593,17 +593,8 @@ func (f *PacketForwarder) sendTCPInternal(
 	f.sendToPeer(clientIP4, pkt)
 }
 
-// ★ P0 修复：sendToPeer 的 ICMP 分支加 selfIsOnTargetLAN 判断
-//
-// 旧版问题：WriteToUDP 返回 nil 只表示"写到本地 socket"，不表示"对方收到"。
-// 跨网络场景下，target.LanEndpoints 是旧 LAN 地址（对端已切走），
-// 写进去就是黑洞，ping 100% 丢包。
-//
-// 新版逻辑：
-//   1. LAN 优先：只有本机也在 target 的 LAN 上才走
-//   2. UDPAddr：只有不是"本机不可达的私网"时才写
-//   3. TURN 兜底（必做）
-//   4. WS 兜底（必做）
+// ============ sendToPeer 统一入口 ============
+
 func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 	if f.edge == nil {
 		return
@@ -627,55 +618,7 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 	isICMP := len(pkt) >= 10 && pkt[9] == protoICMP
 
 	if isICMP {
-		selfOnLAN := f.edge.selfIsOnTargetLAN(target)
-
-		// 1. LAN 优先：只有本机也在该 LAN 上
-		if selfOnLAN && len(target.LanEndpoints) > 0 && f.edge.udpConn != nil {
-			for _, lan := range target.LanEndpoints {
-				ra, err := net.ResolveUDPAddr("udp", lan)
-				if err != nil || ra == nil || ra.IP == nil {
-					continue
-				}
-				if _, err := f.edge.udpConn.WriteToUDP(pkt, ra); err == nil {
-					atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
-					return
-				}
-			}
-		}
-
-		// 2. UDPAddr：只有不是"本机不可达的私网"时，才写
-		if target.UDPAddr != nil && f.edge.udpConn != nil {
-			skip := false
-			if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
-				skip = true
-				log.Printf("[FWD-ICMP] %s UDPAddr=%s 是私网且本机不在该 LAN，跳过（避免黑洞）",
-					target.ClientID, target.UDPAddr)
-			}
-			if !skip {
-				if _, err := f.edge.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
-					atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
-					return
-				}
-			}
-		}
-
-		// 3. TURN 兜底
-		if target.TurnRelayAddr != "" && f.edge.turnClient != nil && f.edge.turnClient.IsReady() {
-			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
-			if err == nil {
-				if sendErr := f.edge.turnClient.Send(pkt, relayAddr); sendErr == nil {
-					atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
-					return
-				}
-			}
-		}
-
-		// 4. WS 兜底（ICMP 走 WS 中继，牺牲延迟换可靠）
-		if f.edge.ws != nil {
-			frame := buildN2NWFrame(target.ClientID, pkt)
-			_ = f.edge.ws.SendBinary(frame)
-			atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
-		}
+		f.sendICMP(target, pkt)
 		return
 	}
 
@@ -690,6 +633,196 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 	}
 
 	if !sent && f.edge.ws != nil {
+		frame := buildN2NWFrame(target.ClientID, pkt)
+		_ = f.edge.ws.SendBinary(frame)
+		atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+	}
+}
+
+// ============ ICMP 发送（严格按状态机走） ============
+//
+// ★ 修复：与 TCP/UDP 一致，ICMP 严格按 relayMgr 状态走。
+//
+//   - ConnTURN:       TURN relay → 失败走 WS
+//   - ConnRelay:      WS
+//   - ConnLAN:        LAN → 私网 UDPAddr → 公网 UDPAddr → WS（不降级状态）
+//   - ConnP2P/avail:  selfOnLAN 时优先 LAN → UDPAddr → WS
+//   - ConnUnknown:    兜底 LAN → UDPAddr → TURN → WS（不改状态）
+//
+// 与 TCP/UDP 的差异：ICMP 不参与 failCounts 降级。它是应答包，单次
+// 发送失败不应影响 TCP/UDP 的状态。LAN 状态下 LAN 失败也不主动降级
+// 到 P2PAvailable——让 sendP2PIdleKeepalive 的 60s 无流量检测去降级。
+func (f *PacketForwarder) sendICMP(target *PeerInfo, pkt []byte) {
+	if f.edge == nil || target == nil {
+		return
+	}
+
+	if f.edge.relayMgr == nil {
+		f.sendICMPBestEffort(target, pkt)
+		return
+	}
+
+	state := f.edge.relayMgr.GetState(target.ClientID)
+
+	switch state {
+	case ConnTURN:
+		// 与 TCP/UDP 一致：TURN relay，失败走 WS
+		if target.TurnRelayAddr != "" && f.edge.turnClient != nil && f.edge.turnClient.IsReady() {
+			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
+			if err == nil {
+				if sendErr := f.edge.turnClient.Send(pkt, relayAddr); sendErr == nil {
+					atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+					return
+				}
+			}
+		}
+		if f.edge.ws != nil {
+			frame := buildN2NWFrame(target.ClientID, pkt)
+			_ = f.edge.ws.SendBinary(frame)
+			atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+		}
+
+	case ConnRelay:
+		if f.edge.ws != nil {
+			frame := buildN2NWFrame(target.ClientID, pkt)
+			_ = f.edge.ws.SendBinary(frame)
+			atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+		}
+
+	case ConnLAN:
+		// LAN 优先（与 TCP/UDP 一致，但不降级状态）
+		sent := false
+		if f.edge.udpConn != nil && len(target.LanEndpoints) > 0 {
+			for _, lan := range target.LanEndpoints {
+				ra, err := net.ResolveUDPAddr("udp", lan)
+				if err != nil || ra == nil || ra.IP == nil {
+					continue
+				}
+				if _, err := f.edge.udpConn.WriteToUDP(pkt, ra); err == nil {
+					sent = true
+					break
+				}
+			}
+		}
+		// 私网 UDPAddr（TCP/UDP 里也有这一步）
+		if !sent && target.UDPAddr != nil && isPrivateIPv4(target.UDPAddr.IP) && f.edge.udpConn != nil {
+			if _, err := f.edge.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
+				sent = true
+			}
+		}
+		if sent {
+			atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+			return
+		}
+		// 公网 UDPAddr 兜底（不降级状态）
+		if target.UDPAddr != nil && !isPrivateIPv4(target.UDPAddr.IP) && f.edge.udpConn != nil {
+			if _, err := f.edge.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
+				atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+				return
+			}
+		}
+		// WS 兜底
+		if f.edge.ws != nil {
+			frame := buildN2NWFrame(target.ClientID, pkt)
+			_ = f.edge.ws.SendBinary(frame)
+			atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+		}
+
+	case ConnP2P, ConnP2PAvailable:
+		// selfOnLAN 时优先 LAN（与 TCP/UDP 一致）
+		selfOnLAN := f.edge.selfIsOnTargetLAN(target)
+		sent := false
+		if selfOnLAN && f.edge.udpConn != nil && len(target.LanEndpoints) > 0 {
+			for _, lan := range target.LanEndpoints {
+				ra, err := net.ResolveUDPAddr("udp", lan)
+				if err != nil || ra == nil || ra.IP == nil {
+					continue
+				}
+				if _, err := f.edge.udpConn.WriteToUDP(pkt, ra); err == nil {
+					sent = true
+					break
+				}
+			}
+		}
+		if !sent && target.UDPAddr != nil && f.edge.udpConn != nil {
+			skip := false
+			if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
+				skip = true
+			}
+			if !skip {
+				if _, err := f.edge.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
+					sent = true
+				}
+			}
+		}
+		if sent {
+			atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+			return
+		}
+		// WS 兜底（ICMP 不走 failCounts 降级，避免误伤 TCP/UDP）
+		if f.edge.ws != nil {
+			frame := buildN2NWFrame(target.ClientID, pkt)
+			_ = f.edge.ws.SendBinary(frame)
+			atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+		}
+
+	default:
+		// ConnUnknown 及其他：走兜底最优路径（不改状态）
+		f.sendICMPBestEffort(target, pkt)
+	}
+}
+
+// sendICMPBestEffort ICMP 兜底发送（状态 Unknown 或 relayMgr 未就绪时）。
+//
+// 按 LAN → UDPAddr → TURN → WS 顺序尝试，不改 relayMgr 状态。
+func (f *PacketForwarder) sendICMPBestEffort(target *PeerInfo, pkt []byte) {
+	if f.edge == nil || target == nil {
+		return
+	}
+
+	selfOnLAN := f.edge.selfIsOnTargetLAN(target)
+
+	// 1. LAN
+	if selfOnLAN && f.edge.udpConn != nil && len(target.LanEndpoints) > 0 {
+		for _, lan := range target.LanEndpoints {
+			ra, err := net.ResolveUDPAddr("udp", lan)
+			if err != nil || ra == nil || ra.IP == nil {
+				continue
+			}
+			if _, err := f.edge.udpConn.WriteToUDP(pkt, ra); err == nil {
+				atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+				return
+			}
+		}
+	}
+
+	// 2. UDPAddr（私网跳过，除非本机也在该 LAN）
+	if target.UDPAddr != nil && f.edge.udpConn != nil {
+		skip := false
+		if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
+			skip = true
+		}
+		if !skip {
+			if _, err := f.edge.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
+				atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+				return
+			}
+		}
+	}
+
+	// 3. TURN
+	if target.TurnRelayAddr != "" && f.edge.turnClient != nil && f.edge.turnClient.IsReady() {
+		relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
+		if err == nil {
+			if sendErr := f.edge.turnClient.Send(pkt, relayAddr); sendErr == nil {
+				atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
+				return
+			}
+		}
+	}
+
+	// 4. WS
+	if f.edge.ws != nil {
 		frame := buildN2NWFrame(target.ClientID, pkt)
 		_ = f.edge.ws.SendBinary(frame)
 		atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
