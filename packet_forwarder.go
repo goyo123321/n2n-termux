@@ -622,7 +622,6 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 		return
 	}
 
-	// 非 ICMP：走 relayMgr 状态机
 	if f.edge.relayMgr == nil {
 		return
 	}
@@ -640,18 +639,7 @@ func (f *PacketForwarder) sendToPeer(dstIP net.IP, pkt []byte) {
 }
 
 // ============ ICMP 发送（严格按状态机走） ============
-//
-// ★ 修复：与 TCP/UDP 一致，ICMP 严格按 relayMgr 状态走。
-//
-//   - ConnTURN:       TURN relay → 失败走 WS
-//   - ConnRelay:      WS
-//   - ConnLAN:        LAN → 私网 UDPAddr → 公网 UDPAddr → WS（不降级状态）
-//   - ConnP2P/avail:  selfOnLAN 时优先 LAN → UDPAddr → WS
-//   - ConnUnknown:    兜底 LAN → UDPAddr → TURN → WS（不改状态）
-//
-// 与 TCP/UDP 的差异：ICMP 不参与 failCounts 降级。它是应答包，单次
-// 发送失败不应影响 TCP/UDP 的状态。LAN 状态下 LAN 失败也不主动降级
-// 到 P2PAvailable——让 sendP2PIdleKeepalive 的 60s 无流量检测去降级。
+
 func (f *PacketForwarder) sendICMP(target *PeerInfo, pkt []byte) {
 	if f.edge == nil || target == nil {
 		return
@@ -666,7 +654,6 @@ func (f *PacketForwarder) sendICMP(target *PeerInfo, pkt []byte) {
 
 	switch state {
 	case ConnTURN:
-		// 与 TCP/UDP 一致：TURN relay，失败走 WS
 		if target.TurnRelayAddr != "" && f.edge.turnClient != nil && f.edge.turnClient.IsReady() {
 			relayAddr, err := net.ResolveUDPAddr("udp", target.TurnRelayAddr)
 			if err == nil {
@@ -690,7 +677,6 @@ func (f *PacketForwarder) sendICMP(target *PeerInfo, pkt []byte) {
 		}
 
 	case ConnLAN:
-		// LAN 优先（与 TCP/UDP 一致，但不降级状态）
 		sent := false
 		if f.edge.udpConn != nil && len(target.LanEndpoints) > 0 {
 			for _, lan := range target.LanEndpoints {
@@ -704,7 +690,6 @@ func (f *PacketForwarder) sendICMP(target *PeerInfo, pkt []byte) {
 				}
 			}
 		}
-		// 私网 UDPAddr（TCP/UDP 里也有这一步）
 		if !sent && target.UDPAddr != nil && isPrivateIPv4(target.UDPAddr.IP) && f.edge.udpConn != nil {
 			if _, err := f.edge.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
 				sent = true
@@ -714,14 +699,12 @@ func (f *PacketForwarder) sendICMP(target *PeerInfo, pkt []byte) {
 			atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
 			return
 		}
-		// 公网 UDPAddr 兜底（不降级状态）
 		if target.UDPAddr != nil && !isPrivateIPv4(target.UDPAddr.IP) && f.edge.udpConn != nil {
 			if _, err := f.edge.udpConn.WriteToUDP(pkt, target.UDPAddr); err == nil {
 				atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
 				return
 			}
 		}
-		// WS 兜底
 		if f.edge.ws != nil {
 			frame := buildN2NWFrame(target.ClientID, pkt)
 			_ = f.edge.ws.SendBinary(frame)
@@ -729,10 +712,15 @@ func (f *PacketForwarder) sendICMP(target *PeerInfo, pkt []byte) {
 		}
 
 	case ConnP2P, ConnP2PAvailable:
-		// selfOnLAN 时优先 LAN（与 TCP/UDP 一致）
-		selfOnLAN := f.edge.selfIsOnTargetLAN(target)
+		// ★ 修复：先试 LAN（不检查 selfOnLAN），再走 UDPAddr
+		//
+		// 旧版要求 selfOnLAN=true 才走 LAN，但 selfOnLAN 依赖 localPrefixes，
+		// Termux 上 iface.Addrs() 可能返回 *net.IPAddr，localPrefixes 空
+		// → selfOnLAN=false → 跳过 LAN 走公网 → 延迟高
+		//
+		// 新版：LanEndpoints 有值就尝试，对端上报的 LAN 端点可达概率高。
 		sent := false
-		if selfOnLAN && f.edge.udpConn != nil && len(target.LanEndpoints) > 0 {
+		if f.edge.udpConn != nil && len(target.LanEndpoints) > 0 {
 			for _, lan := range target.LanEndpoints {
 				ra, err := net.ResolveUDPAddr("udp", lan)
 				if err != nil || ra == nil || ra.IP == nil {
@@ -744,7 +732,9 @@ func (f *PacketForwarder) sendICMP(target *PeerInfo, pkt []byte) {
 				}
 			}
 		}
+
 		if !sent && target.UDPAddr != nil && f.edge.udpConn != nil {
+			selfOnLAN := f.edge.selfIsOnTargetLAN(target)
 			skip := false
 			if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
 				skip = true
@@ -755,11 +745,12 @@ func (f *PacketForwarder) sendICMP(target *PeerInfo, pkt []byte) {
 				}
 			}
 		}
+
 		if sent {
 			atomic.StoreInt64(&f.edge.lastDataFrameAt, time.Now().UnixMilli())
 			return
 		}
-		// WS 兜底（ICMP 不走 failCounts 降级，避免误伤 TCP/UDP）
+
 		if f.edge.ws != nil {
 			frame := buildN2NWFrame(target.ClientID, pkt)
 			_ = f.edge.ws.SendBinary(frame)
@@ -767,23 +758,25 @@ func (f *PacketForwarder) sendICMP(target *PeerInfo, pkt []byte) {
 		}
 
 	default:
-		// ConnUnknown 及其他：走兜底最优路径（不改状态）
 		f.sendICMPBestEffort(target, pkt)
 	}
 }
 
 // sendICMPBestEffort ICMP 兜底发送（状态 Unknown 或 relayMgr 未就绪时）。
 //
-// 按 LAN → UDPAddr → TURN → WS 顺序尝试，不改 relayMgr 状态。
+// ★ 修复：直接遍历 LanEndpoints，不依赖 selfOnLAN。
+//
+// 旧版要求 selfOnLAN=true 才走 LAN，但 selfOnLAN 依赖 localPrefixes，
+// 可能返回空 → 跳过 LAN 走公网 → 延迟高。
+//
+// 新版：LAN 端点有值就尝试，失败再走 UDPAddr → TURN → WS。
 func (f *PacketForwarder) sendICMPBestEffort(target *PeerInfo, pkt []byte) {
 	if f.edge == nil || target == nil {
 		return
 	}
 
-	selfOnLAN := f.edge.selfIsOnTargetLAN(target)
-
-	// 1. LAN
-	if selfOnLAN && f.edge.udpConn != nil && len(target.LanEndpoints) > 0 {
+	// 1. LAN 直接尝试
+	if f.edge.udpConn != nil && len(target.LanEndpoints) > 0 {
 		for _, lan := range target.LanEndpoints {
 			ra, err := net.ResolveUDPAddr("udp", lan)
 			if err != nil || ra == nil || ra.IP == nil {
@@ -799,7 +792,7 @@ func (f *PacketForwarder) sendICMPBestEffort(target *PeerInfo, pkt []byte) {
 	// 2. UDPAddr（私网跳过，除非本机也在该 LAN）
 	if target.UDPAddr != nil && f.edge.udpConn != nil {
 		skip := false
-		if isPrivateIPv4(target.UDPAddr.IP) && !selfOnLAN {
+		if isPrivateIPv4(target.UDPAddr.IP) && !f.edge.selfIsOnTargetLAN(target) {
 			skip = true
 		}
 		if !skip {
