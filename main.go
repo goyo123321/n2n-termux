@@ -260,9 +260,9 @@ func (e *Edge) startKeepalive() {
 const p2pKeepaliveInterval     = 15 * time.Second
 const p2pIdleKeepaliveInterval = 2 * time.Second
 const p2pIdleDeadMs            = 30000
-// ★ 新增：LAN 状态专用
-const lanIdleDeadMs            = 60000
-const lanProbeIntervalMs       = 30000
+// ★ LAN 状态专用
+const lanIdleDeadMs      = 60000
+const lanProbeIntervalMs = 30000
 
 func (e *Edge) startP2PKeepalive() {
 	log.Printf("[P2P-Keepalive] 启动：非 P2P 通道每 %v，P2P 通道每 %v（防 WiFi 省电）",
@@ -537,6 +537,19 @@ func extractIPFromEndpoint(ep string) string {
 		return ep
 	}
 	return ep[:i]
+}
+
+// lastIndexByte 查找字节 c 在字符串 s 中最后一次出现的位置。
+//
+// 与 strings.LastIndexByte 等价，保持与 n2n-android / n2n-go-client
+// 一致的签名（nathole_executor.go 里的 extractPortFromEndpoint 依赖它）。
+func lastIndexByte(s string, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
 }
 
 // ============ 主函数 ============
@@ -1723,11 +1736,6 @@ func (e *Edge) runNatHole(instr *NatHoleInstruction) {
 // reportP2PStatus 上报 p2pStatus 给服务端。
 //
 // ★ 修复：map[string]bool → map[string]int，状态变化时重新上报。
-//
-// 根据 status 传不同 state：
-//   status=3（P2P/LAN）    → state=3（成功）
-//   status=2（P2PAvailable）→ state=1（InProgress）
-//   status=0（降级到 TURN/WS）→ state=2（失败，服务端清 anySucceeded）
 func (e *Edge) reportP2PStatus(peerID string, status int) {
 	if e.ws == nil || peerID == "" {
 		return
