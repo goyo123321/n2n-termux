@@ -13,8 +13,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// 读超时：客户端每 20 秒发一次 ping，服务端立即回 pong。
-// 90 秒内没收到任何消息（包括 pong）→ 认为下行通道已死 → 主动重连。
 const wsReadTimeout = 90 * time.Second
 
 type WSTransport struct {
@@ -153,9 +151,10 @@ func maskToken(u string) string {
 
 // readLoop 断线自动重连。
 //
-// ★ 修复：每次读之前设置 90 秒读超时，检测下行僵死。
-// ★ P1 修复：重连成功后显式发送 _reconnected 消息，
-//   触发 handleSignaling 里的清理分支，消除死代码。
+// ★ 修复：
+//   1. 每次读之前设置 90 秒读超时
+//   2. 读错误 / 读超时后主动 Close() 旧连接
+//   3. 重连成功后发送 _reconnected 消息
 func (ws *WSTransport) readLoop() {
 	backoff := 1 * time.Second
 	const maxBackoff = 5 * time.Minute
@@ -197,8 +196,6 @@ func (ws *WSTransport) readLoop() {
 			if ws.onReconnect != nil {
 				ws.onReconnect()
 			}
-			// ★ P1 修复：显式发送 _reconnected 消息，触发 handleSignaling 的清理分支
-			//   与 Android 端 tryReconnect 的行为对齐，消除死代码
 			ws.routeText(map[string]interface{}{"type": "_reconnected"})
 			continue
 		}
@@ -219,6 +216,8 @@ func (ws *WSTransport) readLoop() {
 			ws.mu.Lock()
 			ws.conn = nil
 			ws.mu.Unlock()
+			// ★ 修复：主动关闭旧连接
+			_ = conn.Close()
 			continue
 		}
 
@@ -289,9 +288,11 @@ func (ws *WSTransport) StartHeartbeat(interval time.Duration) {
 func (ws *WSTransport) Close() error {
 	ws.once.Do(func() { close(ws.closed) })
 	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	if ws.conn != nil {
-		return ws.conn.Close()
+	conn := ws.conn
+	ws.conn = nil
+	ws.mu.Unlock()
+	if conn != nil {
+		return conn.Close()
 	}
 	return nil
 }
