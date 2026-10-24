@@ -2,11 +2,19 @@ package main
 
 // WS 应用层隧道（app_stream）。
 //
-// 与 n2n-go-client / n2n-android 完全一致。
+// 与 n2n-termux / n2n-android 完全一致。
 //
 // 使用场景：三级降级到 WS 中继时，对端主动向本机上的服务发起连接。
-// 此时数据面无法走 TUN（Termux 没有 TUN，只有 SOCKS5），改用
+// 此时数据面无法走 TUN（因为 WS 中继是双向文本协议），改用
 // app_stream_* 消息把 TCP 字节流封装成 base64 隧道。
+//
+// 消息：
+//   app_stream_open      → 发起方 → 接收方，携带 targetPort
+//   app_stream_open_ack  ← 接收方 → 发起方，携带 ok
+//   app_stream_data      → 双向，携带 base64 编码的 TCP 数据
+//   app_stream_close     → 双向，携带 reason
+//
+// ★ 新增：N2NA 二进制数据面（与文本 app_stream_data 并存）
 
 import (
 	"encoding/base64"
@@ -378,7 +386,7 @@ func buildN2NAFrame(targetID, streamID string, payload []byte) []byte {
 	frame[1] = '2'
 	frame[2] = 'N'
 	frame[3] = 'A'
-	frame[4] = 0 // flags
+	frame[4] = 0
 	frame[5] = byte(len(peerBytes))
 	copy(frame[6:], peerBytes)
 	frame[6+len(peerBytes)] = byte(len(streamBytes))
@@ -396,6 +404,8 @@ func isN2NAFrame(data []byte) bool {
 //
 // ★ 修复：更新 lastRecvAt 后调用 RecordWSFrame，让 N2NA 也参与
 // WS 帧降级判断（与 N2NW 对齐）。5 秒内 ≥5 帧且无 P2P 流量才降级。
+//
+// ★ 新增：判断条件包含 ConnLAN（与 Android / PC 对齐）
 func (e *Edge) handleN2NAFrame(data []byte) {
 	if len(data) < n2naHdrMin {
 		return
@@ -424,7 +434,6 @@ func (e *Edge) handleN2NAFrame(data []byte) {
 	streamID := string(data[7+peerLen : 7+peerLen+streamIdLen])
 	payload := data[7+peerLen+streamIdLen:]
 
-	// 更新发送方 peer 的活跃时间
 	now := time.Now().UnixMilli()
 	e.peersMu.Lock()
 	if p, ok := e.peers[senderID]; ok {
@@ -433,9 +442,10 @@ func (e *Edge) handleN2NAFrame(data []byte) {
 	e.peersMu.Unlock()
 
 	// ★ 新增：N2NA 也参与 WS 帧降级保护（与 N2NW 对齐）
+	//   判断条件包含 ConnLAN（与 Android / PC 对齐）
 	if e.relayMgr != nil {
 		st := e.relayMgr.GetState(senderID)
-		if st == ConnP2P || st == ConnP2PAvailable {
+		if st == ConnLAN || st == ConnP2P || st == ConnP2PAvailable {
 			e.relayMgr.RecordWSFrame(senderID)
 		}
 	}
