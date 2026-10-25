@@ -625,8 +625,6 @@ func main() {
 	log.Printf("已连接信令，Client ID: %s，节点名: %s", clientId, nodeName)
 	ws.StartHeartbeat(20 * time.Second)
 
-	// 不再使用 ws.onReconnect（避免与 _reconnected 双重清理）
-
 	edge.turnClient = NewTURNClient(signalingURL, connectToken, edge)
 	edge.turnClient.onMessage = func(data []byte, addr net.Addr) {
 		ua, ok := addr.(*net.UDPAddr)
@@ -646,6 +644,15 @@ func main() {
 			return
 		}
 		if len(data) > 0 && data[0]>>4 == 4 {
+			// ★ P0-1：先驱动状态机（与 n2n-android 的 turnClient.onMessage 完全一致）
+			//
+			// 对端通过 TURN 中继发来真实 IPv4 帧，说明对端已降级。
+			// notePeerTrafficTURN 内部会走 notePeerCommon(viaTURN=true, isRealData=true)
+			//   - 若本机还在 LAN/P2P → ForceFallback("peer-via-turn")
+			//   - 若本机 Unknown → MarkFallback（面板不再显示 --）
+			// 然后再交给 packet_forwarder 解析 TCP/UDP/ICMP，走"数据去哪"。
+			edge.notePeerTrafficTURN(ua)
+
 			if edge.pktFwd != nil {
 				edge.pktFwd.HandlePacket(data)
 			}
@@ -984,6 +991,14 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			e.streamMgr.closeAll()
 		}
 
+		// ★ P1-1：清理 pending 的 P2PAvailable 60s 超时 timer（与 n2n-android 一致）
+		e.p2pAvailTimersMu.Lock()
+		for _, tt := range e.p2pAvailTimers {
+			tt.Stop()
+		}
+		e.p2pAvailTimers = make(map[string]*time.Timer)
+		e.p2pAvailTimersMu.Unlock()
+
 		e.p2pStatusReportedMu.Lock()
 		e.p2pStatusReported = make(map[string]int)
 		e.p2pStatusReportedMu.Unlock()
@@ -1237,7 +1252,13 @@ func (e *Edge) handleSignaling(msg map[string]interface{}) {
 			if e.relayMgr == nil {
 				continue
 			}
-			if e.relayMgr.GetState(peerID) == ConnP2P {
+			// ★ P1-3：与 n2n-android 对齐
+			//   ConnLAN / ConnP2P 都跳过，并主动上报 p2p_status=3
+			//   否则服务端 punchState 一直是旧值，每 15s 重发 force_fallback
+			st := e.relayMgr.GetState(peerID)
+			if st == ConnLAN || st == ConnP2P {
+				log.Printf("[信令] %s 已 %s，忽略 force_fallback，上报 p2p_status=3", peerID, st)
+				e.reportP2PStatus(peerID, 3)
 				continue
 			}
 			e.relayMgr.ForceFallback(peerID, reason)
@@ -1748,6 +1769,19 @@ func (e *Edge) notePeerTrafficTURN(addr *net.UDPAddr) {
 	e.notePeerCommon(addr, true, true, false)
 }
 
+// notePeerCommon 统一处理所有来源的 UDP 包。
+//
+// ★ P0-1' 修复：TURN 场景下 addr 是对端的 relay 地址（TURN Data Indication
+//   的 XOR-PEER-ADDRESS），不在该 peer 的 UDPAddr / LanEndpoints /
+//   AssistedEndpoints 里。加一个 TurnRelayAddr 反向匹配分支，否则
+//   TURN 场景下 best == nil，P0-1 / P0-2 全部空转。
+//
+// ★ P0-2 修复：isRealData 分支加 viaTURN 处理，与 n2n-android 的
+//   notePeerCommon 完全一致。
+//
+//   旧版：不管 viaTURN 是 true 还是 false，只要是非 LAN 地址就 MarkP2P。
+//   后果：对端通过 TURN 发来的真实数据帧会被误判成"P2P 直连成功"
+//   → 状态机反向固化 → 数据面继续往不通的 P2P 地址发包。
 func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, isAck bool) {
 	now := time.Now().UnixMilli()
 
@@ -1805,6 +1839,26 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 			bestScore = score
 		}
 	}
+
+	// ★ P0-1'：TURN 场景下 addr 是对端 relay 地址，按 TurnRelayAddr 反查
+	//
+	// 场景：A 已降级到 TURN，通过 TURN 服务器给 B 发数据帧。
+	// B 的 turnClient.onMessage 收到的 addr 是 A 的 TURN relay 地址
+	// （TURN Data Indication 的 XOR-PEER-ADDRESS），
+	// 它不在 A 的 UDPAddr / LanEndpoints / AssistedEndpoints 里。
+	//
+	// 不加这段的话，P0-1 在 TURN 场景下匹配失败，状态机不更新，
+	// B 会继续往 A 的旧 P2P 地址发包 → 丢包 → ping 卡住。
+	if best == nil && viaTURN {
+		addrStr := addr.String()
+		for _, p := range e.peers {
+			if p.TurnRelayAddr != "" && p.TurnRelayAddr == addrStr {
+				best = p
+				break
+			}
+		}
+	}
+
 	if best == nil {
 		e.peersMu.Unlock()
 		return
@@ -1857,14 +1911,30 @@ func (e *Edge) notePeerCommon(addr *net.UDPAddr, isRealData bool, viaTURN bool, 
 		return
 	}
 
+	// ★ P0-2：isRealData 分支加 viaTURN 处理（与 n2n-android 完全一致）
 	if isRealData {
+		cur := e.relayMgr.GetState(clientID)
+
+		if viaTURN {
+			if cur == ConnLAN || cur == ConnP2P {
+				log.Printf("[TURN] 从 %s (%s) 收到真实数据帧（via TURN）→ 对端已降级，本机跟进",
+					clientID, ip)
+				e.relayMgr.ForceFallback(clientID, "peer-via-turn")
+			} else if cur == ConnUnknown {
+				log.Printf("[TURN] 从 %s (%s) 收到真实数据帧（Unknown → TURN）",
+					clientID, ip)
+				e.relayMgr.MarkFallback(clientID)
+			}
+			return
+		}
+
 		if newIsLAN {
-			if e.relayMgr.GetState(clientID) != ConnLAN {
+			if cur != ConnLAN {
 				log.Printf("[LAN] 从 %s (%s) 收到真实数据帧 → LAN 直连", clientID, ip)
 				e.relayMgr.MarkLAN(clientID)
 			}
 		} else {
-			if e.relayMgr.GetState(clientID) != ConnP2P {
+			if cur != ConnP2P {
 				log.Printf("[P2P] 从 %s (%s) 收到真实数据帧 → P2P 直连", clientID, ip)
 				e.relayMgr.MarkP2P(clientID)
 			}
@@ -2236,15 +2306,11 @@ func isCGNATOverlay(ip net.IP) bool {
 	return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
 }
 
-// ★ 修复：同时处理 *net.IPNet 和 *net.IPAddr
+// localPrefixes 返回本机所有可能是 LAN 前缀的网段。
 //
-// Android/Termux 的 iface.Addrs() 有时返回 *net.IPAddr（不带 mask），
-// 旧版只处理 *net.IPNet，导致 localPrefixes 返回空：
-//   - selfOnLAN 永远 false → ICMP 走公网 → ping 延迟 100ms
-//   - lanSubnets 不上报 → 服务端 shouldShareLan 失效 → 同 WiFi 不走 LAN
-//   - sortLANByAffinity 返回原序 → LAN 亲和度失效
-//
-// 新版：*net.IPAddr 用 /24 兜底 mask（实际 LAN 前缀通常不超过 /24）。
+// ★ 注意：当前只遍历 net.Interfaces()，未加 detectOutboundIP 兜底。
+//   这是 Termux 有意保留的差异——packet_forwarder.go 的 sendICMP /
+//   sendICMPBestEffort 不依赖 selfOnLAN 也能正确发包（LAN 端点有值就试）。
 func localPrefixes(selfVIP string) []*net.IPNet {
 	var result []*net.IPNet
 	ifaces, err := net.Interfaces()
