@@ -13,7 +13,7 @@ type ConnType string
 const (
 	ConnUnknown      ConnType = "unknown"
 	ConnP2PAvailable ConnType = "p2p-avail"
-	ConnLAN          ConnType = "lan"  // ★ 新增
+	ConnLAN          ConnType = "lan"
 	ConnP2P          ConnType = "p2p"
 	ConnTURN         ConnType = "turn"
 	ConnRelay        ConnType = "relay"
@@ -126,6 +126,17 @@ func (rm *RelayManager) MarkP2P(peerId string) {
 	}
 }
 
+// MarkFallback 从 Unknown 状态降级到 TURN/WS。
+//
+// ★ P0-3 修复：删除 "lastRecvAt < 10s 就跳过降级" 的早退逻辑，与 n2n-android 对齐。
+//
+// 旧版问题：8s fallback timer 触发时，如果刚好收到一个 punch（lastRecvAt 被刷新），
+// 本函数早退 → 状态卡 Unknown → 后续 punch 又刷新 → 永远进不了 TURN 状态
+// → 面板状态在 unknown / p2p / turn 之间反复跳 → ping 状态不稳定。
+//
+// 正确做法：8s timer 到点就降级，不在 MarkFallback 里妥协。
+// 如果希望"最近有包就延长 fallback"，应该重排 timer（scheduleFallbackTimer），
+// 而不是在 MarkFallback 里吞掉降级。
 func (rm *RelayManager) MarkFallback(peerId string) {
 	rm.mu.Lock()
 
@@ -144,24 +155,7 @@ func (rm *RelayManager) MarkFallback(peerId string) {
 	}
 	rm.mu.Unlock()
 
-	if rm.edge != nil {
-		rm.edge.peersMu.RLock()
-		p, ok := rm.edge.peers[peerId]
-		var lastRecv int64 = 0
-		if ok {
-			lastRecv = p.lastRecvAt
-		}
-		rm.edge.peersMu.RUnlock()
-
-		if lastRecv > 0 {
-			idleMs := time.Now().UnixMilli() - lastRecv
-			if idleMs < 10000 {
-				log.Printf("[连接] %s 最近 %dms 收到过 UDP 包，跳过降级", peerId, idleMs)
-				return
-			}
-		}
-	}
-
+	// 双重检查：unlock 到 re-lock 之间状态可能已被别的 goroutine 改了
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
